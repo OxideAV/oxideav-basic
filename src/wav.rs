@@ -5,7 +5,8 @@
 use oxideav_codec as _;
 use oxideav_container::{ContainerRegistry, Demuxer, Muxer, ReadSeek, WriteSeek};
 use oxideav_core::{
-    CodecId, CodecParameters, Error, MediaType, Packet, Result, SampleFormat, StreamInfo, TimeBase,
+    CodecId, CodecParameters, CodecResolver, Error, MediaType, Packet, Result, SampleFormat,
+    StreamInfo, TimeBase,
 };
 use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -43,7 +44,10 @@ const GUID_IEEE_FLOAT: [u8; 16] = [
 
 // --- Demuxer ---------------------------------------------------------------
 
-fn open_demuxer(mut input: Box<dyn ReadSeek>) -> Result<Box<dyn Demuxer>> {
+fn open_demuxer(
+    mut input: Box<dyn ReadSeek>,
+    _codecs: &dyn CodecResolver,
+) -> Result<Box<dyn Demuxer>> {
     let mut hdr = [0u8; 12];
     input.read_exact(&mut hdr)?;
     if &hdr[0..4] != b"RIFF" || &hdr[8..12] != b"WAVE" {
@@ -535,7 +539,7 @@ mod tests {
             mux.write_trailer().unwrap();
         }
         let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&tmp).unwrap());
-        let mut dmx = open_demuxer(rs).unwrap();
+        let mut dmx = open_demuxer(rs, &oxideav_core::NullCodecResolver).unwrap();
         assert_eq!(dmx.format_name(), "wav");
         assert_eq!(dmx.streams().len(), 1);
         assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));

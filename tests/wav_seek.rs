@@ -68,7 +68,9 @@ fn seek_to_half_second_lands_at_exact_sample() {
     // Open the demuxer and seek to 0.5 s.
     let f = std::fs::File::open(&tmp).unwrap();
     let rs: Box<dyn ReadSeek> = Box::new(f);
-    let mut dmx = reg.open_demuxer("wav", rs).expect("open wav demuxer");
+    let mut dmx = reg
+        .open_demuxer("wav", rs, &oxideav_core::NullCodecResolver)
+        .expect("open wav demuxer");
     let target = (sample_rate / 2) as i64; // 24000
     let landed = dmx.seek_to(0, target).expect("seek_to");
     assert_eq!(

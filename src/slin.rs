@@ -26,7 +26,8 @@ use oxideav_container::{
     ContainerRegistry, Demuxer, Muxer, ProbeData, ReadSeek, WriteSeek, PROBE_SCORE_EXTENSION,
 };
 use oxideav_core::{
-    CodecId, CodecParameters, Error, MediaType, Packet, Result, SampleFormat, StreamInfo, TimeBase,
+    CodecId, CodecParameters, CodecResolver, Error, MediaType, Packet, Result, SampleFormat,
+    StreamInfo, TimeBase,
 };
 use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -96,7 +97,7 @@ fn sample_rate_for_ext(ext: &str) -> Option<u32> {
 /// sample-rate-bearing extension.
 const DEFAULT_SAMPLE_RATE: u32 = 8_000;
 
-fn open_demuxer(input: Box<dyn ReadSeek>) -> Result<Box<dyn Demuxer>> {
+fn open_demuxer(input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
     open_demuxer_with_rate(input, DEFAULT_SAMPLE_RATE)
 }
 
