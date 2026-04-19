@@ -19,40 +19,137 @@
 //!   surrounding headerless `.sln*` container (see `slin.rs`); as a codec
 //!   they are indistinguishable from `pcm_s16le`.
 
-use oxideav_codec::{CodecRegistry, Decoder, Encoder};
+use oxideav_codec::{CodecInfo, CodecRegistry, Decoder, Encoder};
 use oxideav_core::{
-    AudioFrame, CodecCapabilities, CodecId, CodecParameters, Error, Frame, MediaType, Packet,
-    Result, SampleFormat, TimeBase,
+    AudioFrame, CodecCapabilities, CodecId, CodecParameters, CodecTag, Error, Frame, MediaType,
+    Packet, ProbeContext, Result, SampleFormat, TimeBase,
 };
 
 pub fn register(reg: &mut CodecRegistry) {
-    for id in CODEC_IDS {
-        let cid = CodecId::new(*id);
+    // WAVEFORMATEX tags handled by this crate:
+    //   0x0001 WAVE_FORMAT_PCM — integer PCM, bit-depth disambiguation
+    //     by bits_per_sample.
+    //   0x0003 WAVE_FORMAT_IEEE_FLOAT — float PCM, same idea.
+    let wf_int = CodecTag::wave_format(0x0001);
+    let wf_flt = CodecTag::wave_format(0x0003);
+    for (id, bits, tag, probe) in [
+        (
+            "pcm_u8",
+            8u16,
+            Some(&wf_int),
+            probe_pcm_u8 as oxideav_core::ProbeFn,
+        ),
+        ("pcm_s8", 8, None, probe_pcm_s8 as oxideav_core::ProbeFn),
+        (
+            "pcm_s16le",
+            16,
+            Some(&wf_int),
+            probe_pcm_s16le as oxideav_core::ProbeFn,
+        ),
+        (
+            "pcm_s24le",
+            24,
+            Some(&wf_int),
+            probe_pcm_s24le as oxideav_core::ProbeFn,
+        ),
+        (
+            "pcm_s32le",
+            32,
+            Some(&wf_int),
+            probe_pcm_s32le as oxideav_core::ProbeFn,
+        ),
+        (
+            "pcm_f32le",
+            32,
+            Some(&wf_flt),
+            probe_pcm_f32le as oxideav_core::ProbeFn,
+        ),
+        (
+            "pcm_f64le",
+            64,
+            Some(&wf_flt),
+            probe_pcm_f64le as oxideav_core::ProbeFn,
+        ),
+    ] {
+        let _ = bits;
         let caps = CodecCapabilities::audio(format!("{id}_sw"))
             .with_lossless(true)
             .with_intra_only(true);
-        reg.register_both(cid, caps, make_decoder, make_encoder);
+        let mut info = CodecInfo::new(CodecId::new(id))
+            .capabilities(caps)
+            .decoder(make_decoder)
+            .encoder(make_encoder);
+        if let Some(t) = tag {
+            info = info.probe(probe).tag(t.clone());
+        }
+        reg.register(info);
     }
+
     for id in SLIN_ALIASES {
-        let cid = CodecId::new(*id);
         let caps = CodecCapabilities::audio(format!("{id}_sw"))
             .with_lossless(true)
             .with_intra_only(true);
         // Same factories as pcm_s16le — `sample_format_for` maps all the
-        // slin aliases to SampleFormat::S16 below.
-        reg.register_both(cid, caps, make_decoder, make_encoder);
+        // slin aliases to SampleFormat::S16 below. No WAVEFORMATEX claim.
+        reg.register(
+            CodecInfo::new(CodecId::new(*id))
+                .capabilities(caps)
+                .decoder(make_decoder)
+                .encoder(make_encoder),
+        );
     }
 }
 
-const CODEC_IDS: &[&str] = &[
-    "pcm_u8",
-    "pcm_s8",
-    "pcm_s16le",
-    "pcm_s24le",
-    "pcm_s32le",
-    "pcm_f32le",
-    "pcm_f64le",
-];
+// --- Per-variant PCM probes -----------------------------------------------
+// Each probe is selected by the WAVEFORMATEX tag at the call site; here we
+// only need to disambiguate by bit depth. `bits_per_sample = None` returns
+// 0.0 so the registry resolves nothing — the AVI demuxer then falls back
+// to its static table which picks a sensible default.
+
+fn match_bits(ctx: &ProbeContext, expected: u16) -> f32 {
+    match ctx.bits_per_sample {
+        Some(b) if b == expected => 1.0,
+        _ => 0.0,
+    }
+}
+
+fn probe_pcm_u8(ctx: &ProbeContext) -> f32 {
+    match_bits(ctx, 8)
+}
+fn probe_pcm_s8(_ctx: &ProbeContext) -> f32 {
+    // pcm_s8 has no canonical WAVEFORMATEX mapping; probe is unused but
+    // required by the ProbeFn type alias in the register() table.
+    0.0
+}
+fn probe_pcm_s16le(ctx: &ProbeContext) -> f32 {
+    match ctx.bits_per_sample {
+        // bits_per_sample == 0 occasionally means "unspecified" in the
+        // wild — WAV files tagged as PCM that omit the depth. Treat
+        // that as s16le (the most common default) with middling
+        // confidence so a specific claimant (e.g. pcm_s24le with
+        // bits=24) still wins if the depth is actually set.
+        Some(0) => 0.5,
+        Some(16) => 1.0,
+        _ => 0.0,
+    }
+}
+fn probe_pcm_s24le(ctx: &ProbeContext) -> f32 {
+    match_bits(ctx, 24)
+}
+fn probe_pcm_s32le(ctx: &ProbeContext) -> f32 {
+    match_bits(ctx, 32)
+}
+fn probe_pcm_f32le(ctx: &ProbeContext) -> f32 {
+    match ctx.bits_per_sample {
+        // IEEE float defaults to f32 when depth unspecified.
+        None | Some(0) => 0.5,
+        Some(32) => 1.0,
+        _ => 0.0,
+    }
+}
+fn probe_pcm_f64le(ctx: &ProbeContext) -> f32 {
+    match_bits(ctx, 64)
+}
 
 /// Asterisk "signed linear" codec-id aliases. All are S16LE; the trailing
 /// digits only matter at the container layer (see `slin.rs`).
