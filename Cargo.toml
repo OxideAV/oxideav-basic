@@ -14,6 +14,6 @@ keywords = ["multimedia", "audio", "wav", "pcm", "pure-rust"]
 categories = ["multimedia::encoding"]
 
 [dependencies]
-oxideav-core = "0.0"
-oxideav-codec = "0.0"
+oxideav-core = "0.1"
+oxideav-codec = "0.1"
 oxideav-container = "0.0"
