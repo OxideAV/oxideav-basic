@@ -19,11 +19,11 @@
 //!   surrounding headerless `.sln*` container (see `slin.rs`); as a codec
 //!   they are indistinguishable from `pcm_s16le`.
 
-use oxideav_codec::{CodecInfo, CodecRegistry, Decoder, Encoder};
 use oxideav_core::{
     AudioFrame, CodecCapabilities, CodecId, CodecParameters, CodecTag, Error, Frame, MediaType,
     Packet, ProbeContext, Result, SampleFormat, TimeBase,
 };
+use oxideav_core::{CodecInfo, CodecRegistry, Decoder, Encoder};
 
 pub fn register(reg: &mut CodecRegistry) {
     // WAVEFORMATEX tags handled by this crate:

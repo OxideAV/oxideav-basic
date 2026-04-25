@@ -2,12 +2,11 @@
 //!
 //! Supports reading and writing linear PCM streams via the `pcm_*` codecs.
 
-use oxideav_codec as _;
-use oxideav_container::{ContainerRegistry, Demuxer, Muxer, ReadSeek, WriteSeek};
 use oxideav_core::{
     CodecId, CodecParameters, CodecResolver, Error, MediaType, Packet, Result, SampleFormat,
     StreamInfo, TimeBase,
 };
+use oxideav_core::{ContainerRegistry, Demuxer, Muxer, ReadSeek, WriteSeek};
 use std::io::{Read, Seek, SeekFrom, Write};
 
 pub fn register(reg: &mut ContainerRegistry) {
@@ -19,7 +18,7 @@ pub fn register(reg: &mut ContainerRegistry) {
 }
 
 /// `RIFF....WAVE` — unambiguous when present.
-fn probe(p: &oxideav_container::ProbeData) -> u8 {
+fn probe(p: &oxideav_core::ProbeData) -> u8 {
     if p.buf.len() < 12 {
         return 0;
     }

@@ -5,8 +5,8 @@ pub mod pcm;
 pub mod slin;
 pub mod wav;
 
-use oxideav_codec::CodecRegistry;
-use oxideav_container::ContainerRegistry;
+use oxideav_core::CodecRegistry;
+use oxideav_core::ContainerRegistry;
 
 /// Register every codec provided by `oxideav-basic` in a [`CodecRegistry`].
 pub fn register_codecs(reg: &mut CodecRegistry) {

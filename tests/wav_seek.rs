@@ -5,10 +5,10 @@
 //! start at that sample boundary with matching payload bytes.
 
 use oxideav_basic::register_containers;
-use oxideav_container::{ContainerRegistry, ReadSeek, WriteSeek};
 use oxideav_core::{
     CodecId, CodecParameters, MediaType, Packet, SampleFormat, StreamInfo, TimeBase,
 };
+use oxideav_core::{ContainerRegistry, ReadSeek, WriteSeek};
 
 fn mono_s16_stream(sample_rate: u32) -> StreamInfo {
     let mut params = CodecParameters::audio(CodecId::new("pcm_s16le"));
