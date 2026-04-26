@@ -270,12 +270,8 @@ impl Decoder for PcmDecoder {
         }
         let samples = (pkt.data.len() / block) as u32;
         Ok(Frame::Audio(AudioFrame {
-            format: self.format,
-            channels: self.channels,
-            sample_rate: self.sample_rate,
             samples,
             pts: pkt.pts,
-            time_base: pkt.time_base,
             data: vec![pkt.data],
         }))
     }
@@ -307,15 +303,10 @@ impl Encoder for PcmEncoder {
         let Frame::Audio(a) = frame else {
             return Err(Error::invalid("PCM encoder requires audio frames"));
         };
-        if a.format != self.format
-            || a.channels != self.channels
-            || a.sample_rate != self.sample_rate
-        {
-            return Err(Error::invalid(
-                "PCM encoder frame parameters do not match encoder configuration",
-            ));
-        }
-        if a.format.is_planar() {
+        // Per-frame format/channels/sample_rate are no longer carried on
+        // AudioFrame — the encoder enforces its configured layout via the
+        // stored fields and the byte-count check below.
+        if self.format.is_planar() {
             return Err(Error::unsupported(
                 "PCM encoder takes interleaved input; convert planar → interleaved first",
             ));
@@ -325,12 +316,16 @@ impl Encoder for PcmEncoder {
             .first()
             .ok_or_else(|| Error::invalid("empty audio frame"))?
             .clone();
-        let bps = a.format.bytes_per_sample() * a.channels as usize;
+        let bps = self.format.bytes_per_sample() * self.channels as usize;
         let expected = bps * a.samples as usize;
         if data.len() != expected {
             return Err(Error::invalid("audio frame data length mismatch"));
         }
-        let mut pkt = Packet::new(0, a.time_base, data);
+        let mut pkt = Packet::new(
+            0,
+            oxideav_core::TimeBase::new(1, self.sample_rate as i64),
+            data,
+        );
         pkt.pts = a.pts;
         pkt.dts = a.pts;
         pkt.duration = Some(a.samples as i64);
