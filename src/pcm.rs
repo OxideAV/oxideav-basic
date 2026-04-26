@@ -197,14 +197,13 @@ fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     let channels = params
         .channels
         .ok_or_else(|| Error::invalid("PCM decoder requires channels"))?;
-    let sample_rate = params
+    params
         .sample_rate
         .ok_or_else(|| Error::invalid("PCM decoder requires sample_rate"))?;
     Ok(Box::new(PcmDecoder {
         id: params.codec_id.clone(),
         format,
         channels,
-        sample_rate,
         pending: None,
         eof: false,
     }))
@@ -235,7 +234,6 @@ struct PcmDecoder {
     id: CodecId,
     format: SampleFormat,
     channels: u16,
-    sample_rate: u32,
     pending: Option<Packet>,
     eof: bool,
 }
