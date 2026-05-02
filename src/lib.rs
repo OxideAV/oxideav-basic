@@ -4,6 +4,7 @@
 pub mod pcm;
 pub mod slin;
 pub mod wav;
+pub mod y4m;
 
 use oxideav_core::CodecRegistry;
 use oxideav_core::ContainerRegistry;
@@ -17,4 +18,5 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
 pub fn register_containers(reg: &mut ContainerRegistry) {
     wav::register(reg);
     slin::register(reg);
+    y4m::register(reg);
 }

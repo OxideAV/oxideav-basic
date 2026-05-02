@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Y4M (YUV4MPEG2) raw-video demuxer + muxer (`y4m` module). Handles
+  4:2:0 / 4:2:2 / 4:4:4 / mono at 8/10/12-bit, preserves header
+  `X<key>=<val>` extensions in `Demuxer::metadata`, and probes on the
+  `YUV4MPEG2 ` magic. Frames are emitted as `rawvideo` packets.
+
 ## [0.0.5](https://github.com/OxideAV/oxideav-basic/compare/v0.0.4...v0.0.5) - 2026-04-25
 
 ### Other
