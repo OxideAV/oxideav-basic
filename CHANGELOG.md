@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/OxideAV/oxideav-basic/compare/v0.0.5...v0.0.6) - 2026-05-03
+
+### Other
+
+- replace never-match regex with semver_check = false
+- migrate to centralized OxideAV/.github reusable workflows
+- add YUV4MPEG2 demuxer + muxer
+- drop unused PcmDecoder.sample_rate field (slim-frame leftover)
+- adopt slim AudioFrame shape
+- pin release-plz to patch-only bumps
+
 ### Added
 
 - Y4M (YUV4MPEG2) raw-video demuxer + muxer (`y4m` module). Handles
