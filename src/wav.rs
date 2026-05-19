@@ -511,7 +511,7 @@ impl WavDemuxer {
     /// codec identifier when `format_tag == WAVE_FORMAT_EXTENSIBLE`).
     /// Returned in on-wire byte order (first three groups
     /// little-endian, trailing two groups big-endian); use
-    /// [`subformat_text`] for the canonical text representation.
+    /// [`Self::subformat_text`] for the canonical text representation.
     pub fn subformat(&self) -> Option<&[u8; 16]> {
         self.subformat.as_ref()
     }
@@ -671,7 +671,7 @@ impl WavMuxOptions {
     }
 
     /// Override `wValidBitsPerSample` for an extensible stream. Has no
-    /// effect unless [`with_extensible`] was also called.
+    /// effect unless [`Self::with_extensible`] was also called.
     pub fn with_valid_bits_per_sample(mut self, valid_bps: u16) -> Self {
         if let Some(opts) = self.extensible.as_mut() {
             opts.valid_bits_per_sample = Some(valid_bps);
@@ -680,7 +680,7 @@ impl WavMuxOptions {
     }
 
     /// Override the 16-byte SubFormat GUID. Has no effect unless
-    /// [`with_extensible`] was also called.
+    /// [`Self::with_extensible`] was also called.
     pub fn with_subformat(mut self, guid: [u8; 16]) -> Self {
         if let Some(opts) = self.extensible.as_mut() {
             opts.subformat = Some(guid);
