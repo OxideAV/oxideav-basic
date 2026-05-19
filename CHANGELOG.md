@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- WAV demuxer dispatches `WAVE_FORMAT_ALAW (0x0006)` and
+  `WAVE_FORMAT_MULAW (0x0007)` streams to the `pcm_alaw` / `pcm_mulaw`
+  codecs (host runtime applies G.711 decode through `oxideav-g711`).
+  Decoded `SampleFormat` hint surfaces as `S16`; `bit_rate` reflects
+  the on-wire 8-bit rate (not the post-decode S16 rate).
+- WAV `WAVE_FORMAT_EXTENSIBLE (0xFFFE)` end-to-end handling per
+  `docs/container/riff/waveformatextensible/README.md`: the 22-byte
+  extension's `wValidBitsPerSample`, `dwChannelMask` and SubFormat
+  GUID are parsed and exposed both through typed accessors on
+  `WavDemuxer` (`format_tag`, `valid_bits_per_sample`, `channel_mask`,
+  `subformat`, `subformat_text`) and through `Demuxer::metadata`
+  under the keys `wav:fmt.valid_bits_per_sample` /
+  `wav:fmt.channel_mask` / `wav:fmt.subformat`. Well-known
+  `KSDATAFORMAT_SUBTYPE_*` GUIDs (PCM, IEEE_FLOAT, ALAW, MULAW)
+  resolve to the legacy codec ids; unknown GUIDs synthesise a
+  `wav:guid_<canonical-text>` id so downstream `make_decoder`
+  failures name the actual GUID rather than the opaque `0xFFFE` tag.
+- WAV muxer `open_muxer_with` + `WavMuxOptions::with_extensible(mask)`
+  emits a 40-byte `WAVEFORMATEXTENSIBLE` `fmt ` chunk with caller-
+  supplied `dwChannelMask`. `wValidBitsPerSample` defaults to the
+  container `wBitsPerSample` and SubFormat defaults to the well-known
+  GUID for the codec; both can be overridden via
+  `with_valid_bits_per_sample` / `with_subformat`.
+- New public constants `WAVE_FORMAT_PCM` / `WAVE_FORMAT_IEEE_FLOAT` /
+  `WAVE_FORMAT_ALAW` / `WAVE_FORMAT_MULAW` / `WAVE_FORMAT_EXTENSIBLE`
+  in the `wav` module for muxer callers.
+
+### Fixed
+
+- WAV demuxer rejects `WAVE_FORMAT_EXTENSIBLE` streams whose
+  `cbSize < 22` (the spec mandates a 22-byte extension; previously
+  the demuxer silently dropped the extension fields).
+- WAV demuxer stamps the on-wire `wFormatTag` onto
+  `CodecParameters.tag` so consumers can distinguish legacy
+  `WAVEFORMATEX` from EXTENSIBLE round-trips without reparsing.
+
 ## [0.0.7](https://github.com/OxideAV/oxideav-basic/compare/v0.0.6...v0.0.7) - 2026-05-06
 
 ### Other

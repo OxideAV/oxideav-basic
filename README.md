@@ -9,7 +9,17 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework â€
 - **PCM codecs**: `pcm_u8`, `pcm_s16le`, `pcm_s24le`, `pcm_s32le`, `pcm_f32le`,
   `pcm_f64le`.
 - **WAV** container: RIFF/WAVE demuxer + muxer with `fmt`, `data`, and
-  `LIST/INFO` metadata support.
+  `LIST/INFO` metadata. Dispatches `WAVE_FORMAT_ALAW (0x0006)` /
+  `WAVE_FORMAT_MULAW (0x0007)` to the `pcm_alaw` / `pcm_mulaw` codecs
+  (host runtime applies G.711 decode). `WAVE_FORMAT_EXTENSIBLE (0xFFFE)`
+  is parsed end-to-end â€” the 22-byte extension's `wValidBitsPerSample`,
+  `dwChannelMask` and SubFormat GUID are surfaced through both
+  `wav:fmt.*` metadata keys and typed accessors on the concrete
+  `WavDemuxer`. Well-known `KSDATAFORMAT_SUBTYPE_*` GUIDs (PCM,
+  IEEE_FLOAT, ALAW, MULAW) resolve to the same codec ids the legacy
+  `WAVEFORMATEX` path would have produced; unknown GUIDs synthesise a
+  `wav:guid_<canonical-text>` id. `WavMuxOptions::with_extensible(mask)`
+  opts the muxer into writing a 40-byte EXTENSIBLE `fmt ` chunk.
 - **slin** container: Asterisk-style headerless `.sln*` / `.slin*` raw
   S16LE PCM (extension drives the sample rate).
 - **Y4M (YUV4MPEG2)** container: rawvideo demuxer + muxer for `.y4m` files,
