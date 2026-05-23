@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- WAV demuxer parses the `bext` Broadcast Audio Extension chunk per
+  `docs/container/riff/metadata/ebu-tech3285-bwf.pdf` (EBU Tech 3285 v2
+  §2.3 `BROADCAST_EXT`). The 602-byte fixed struct plus variable
+  `CodingHistory` is surfaced through `Demuxer::metadata` under
+  `wav:bext.description` / `.originator` / `.originator_reference` /
+  `.origination_date` / `.origination_time` / `.time_reference` (64-bit
+  sample count reassembled from the low/high `DWORD`s) / `.version` /
+  `.umid` (hex-encoded SMPTE-330M UMID, v1+ only when non-zero) /
+  `.coding_history`. For BWF v2 the five loudness `WORD`s are decoded
+  from the §2.4 `round(100 × value)` fixed-point to two decimals under
+  `.loudness_value` / `.loudness_range` / `.max_true_peak_level` /
+  `.max_momentary_loudness` / `.max_short_term_loudness`. Loudness and
+  UMID keys are omitted for v0/v1 streams that leave those fields zero;
+  a `bext` chunk shorter than 602 bytes is skipped as opaque.
 - WAV demuxer dispatches `WAVE_FORMAT_ALAW (0x0006)` and
   `WAVE_FORMAT_MULAW (0x0007)` streams to the `pcm_alaw` / `pcm_mulaw`
   codecs (host runtime applies G.711 decode through `oxideav-g711`).

@@ -160,6 +160,14 @@ fn open_demuxer(
                     input.seek(SeekFrom::Current(1))?;
                 }
             }
+            b"bext" => {
+                let mut buf = vec![0u8; size as usize];
+                input.read_exact(&mut buf)?;
+                parse_bext_chunk(&buf, &mut metadata);
+                if size % 2 == 1 {
+                    input.seek(SeekFrom::Current(1))?;
+                }
+            }
             b"data" => {
                 data_offset = input.stream_position()?;
                 data_size = size;
@@ -296,6 +304,144 @@ fn info_id_to_key(id: &[u8; 4]) -> Option<&'static str> {
         b"ISBJ" => Some("subject"),
         b"ITRK" => Some("track"),
         _ => None,
+    }
+}
+
+/// Fixed (pre-`CodingHistory`) size of the BWF `bext` struct, in bytes.
+///
+/// Sum of the field widths from EBU Tech 3285 v2 §2.3 `BROADCAST_EXT`:
+/// `Description[256] + Originator[32] + OriginatorReference[32] +
+/// OriginationDate[10] + OriginationTime[8] + TimeReferenceLow(4) +
+/// TimeReferenceHigh(4) + Version(2) + UMID[64] + LoudnessValue(2) +
+/// LoudnessRange(2) + MaxTruePeakLevel(2) + MaxMomentaryLoudness(2) +
+/// MaxShortTermLoudness(2) + Reserved[180]` = 602.
+const BEXT_FIXED_LEN: usize = 602;
+
+/// Trim a fixed-width ASCII field to its value: cut at the first NUL
+/// (EBU Tech 3285 v2 §2.3 mandates a NUL terminator for under-length
+/// strings) and strip surrounding whitespace.
+fn bext_field(raw: &[u8]) -> String {
+    let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+    String::from_utf8_lossy(&raw[..end]).trim().to_string()
+}
+
+/// Parse a BWF `bext` (Broadcast Audio Extension) chunk body and append
+/// its fields to `out` under `wav:bext.*` keys.
+///
+/// Layout per `docs/container/riff/metadata/ebu-tech3285-bwf.pdf`
+/// (EBU Tech 3285 v2 §2.3, `BROADCAST_EXT` struct). All multi-byte
+/// integers are little-endian (RIFF convention). The loudness fields
+/// (`LoudnessValue` … `MaxShortTermLoudness`) are signed 16-bit values
+/// equal to `round(100 × value)` per §2.4, so they are surfaced divided
+/// by 100 with two decimal places.
+///
+/// The `Version` field selects which fields are meaningful: v0 has none
+/// of the UMID/loudness fields populated, v1 adds the SMPTE-330M UMID,
+/// v2 adds the five loudness values (§1.1). The fixed struct is always
+/// 602 bytes regardless of version, so this parser reads every field
+/// unconditionally and lets the version key tell the caller which ones
+/// to trust. `TimeReference` is reassembled as a 64-bit sample count.
+fn parse_bext_chunk(buf: &[u8], out: &mut Vec<(String, String)>) {
+    if buf.len() < BEXT_FIXED_LEN {
+        return;
+    }
+    let description = bext_field(&buf[0..256]);
+    let originator = bext_field(&buf[256..288]);
+    let originator_ref = bext_field(&buf[288..320]);
+    let origination_date = bext_field(&buf[320..330]);
+    let origination_time = bext_field(&buf[330..338]);
+    let time_ref_low = u32::from_le_bytes([buf[338], buf[339], buf[340], buf[341]]);
+    let time_ref_high = u32::from_le_bytes([buf[342], buf[343], buf[344], buf[345]]);
+    let time_reference = ((time_ref_high as u64) << 32) | (time_ref_low as u64);
+    let version = u16::from_le_bytes([buf[346], buf[347]]);
+
+    // UMID[64] at [348..412]; only meaningful for v1+. Surface it as a
+    // hex string only when non-zero so v0 files don't carry a bogus
+    // all-zero UMID key.
+    let umid = &buf[348..412];
+
+    // Loudness WORDs at [412..422]; signed, ×100. Only meaningful for v2.
+    let loudness_value = i16::from_le_bytes([buf[412], buf[413]]);
+    let loudness_range = i16::from_le_bytes([buf[414], buf[415]]);
+    let max_true_peak = i16::from_le_bytes([buf[416], buf[417]]);
+    let max_momentary = i16::from_le_bytes([buf[418], buf[419]]);
+    let max_short_term = i16::from_le_bytes([buf[420], buf[421]]);
+
+    // CodingHistory: everything past the 602-byte fixed struct.
+    let coding_history = if buf.len() > BEXT_FIXED_LEN {
+        bext_field(&buf[BEXT_FIXED_LEN..])
+    } else {
+        String::new()
+    };
+
+    let push = |out: &mut Vec<(String, String)>, key: &str, value: String| {
+        if !value.is_empty() {
+            out.push((key.to_string(), value));
+        }
+    };
+
+    push(out, "wav:bext.description", description);
+    push(out, "wav:bext.originator", originator);
+    push(out, "wav:bext.originator_reference", originator_ref);
+    push(out, "wav:bext.origination_date", origination_date);
+    push(out, "wav:bext.origination_time", origination_time);
+    out.push((
+        "wav:bext.time_reference".to_string(),
+        time_reference.to_string(),
+    ));
+    out.push(("wav:bext.version".to_string(), version.to_string()));
+
+    // v1+ : the SMPTE-330M UMID (64 bytes; a 32-byte "basic UMID"
+    // zero-pads the trailing half per §2.3). Emit only when present.
+    if umid.iter().any(|&b| b != 0) {
+        let mut hex = String::with_capacity(umid.len() * 2);
+        for b in umid {
+            hex.push_str(&format!("{b:02x}"));
+        }
+        out.push(("wav:bext.umid".to_string(), hex));
+    }
+
+    // v2 : loudness metadata (×100 fixed-point → two decimals). Emitted
+    // only for v2 files since v0/v1 leave these WORDs zero by spec.
+    if version >= 2 {
+        out.push((
+            "wav:bext.loudness_value".to_string(),
+            fmt_loudness(loudness_value),
+        ));
+        out.push((
+            "wav:bext.loudness_range".to_string(),
+            fmt_loudness(loudness_range),
+        ));
+        out.push((
+            "wav:bext.max_true_peak_level".to_string(),
+            fmt_loudness(max_true_peak),
+        ));
+        out.push((
+            "wav:bext.max_momentary_loudness".to_string(),
+            fmt_loudness(max_momentary),
+        ));
+        out.push((
+            "wav:bext.max_short_term_loudness".to_string(),
+            fmt_loudness(max_short_term),
+        ));
+    }
+
+    push(out, "wav:bext.coding_history", coding_history);
+}
+
+/// Render a BWF loudness WORD (signed 16-bit, `round(100 × value)` per
+/// EBU Tech 3285 v2 §2.4) back to its two-decimal value, e.g. `-2264`
+/// → `"-22.64"`. The sign is carried on the integer part so values in
+/// `(-1, 0)` keep their leading minus (`-50` → `"-0.50"`).
+fn fmt_loudness(v: i16) -> String {
+    let neg = v < 0;
+    let abs = (v as i32).unsigned_abs();
+    let whole = abs / 100;
+    let frac = abs % 100;
+    if neg {
+        format!("-{whole}.{frac:02}")
+    } else {
+        format!("{whole}.{frac:02}")
     }
 }
 
@@ -1278,6 +1424,220 @@ mod tests {
             matches!(err, Some(Error::InvalidData(_))),
             "short cbSize must yield Error::InvalidData, got {err:?}"
         );
+    }
+
+    /// Build a minimal valid PCM WAV with a caller-supplied raw `bext`
+    /// chunk body inserted between `fmt ` and `data`. Returns the file
+    /// bytes ready for `open_demux_from_bytes`. RIFF size is left at 0
+    /// (the demuxer doesn't validate it).
+    fn wav_with_bext(bext_body: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"RIFF");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(b"WAVE");
+        // fmt : 16-byte PCM s16 mono 8000 Hz.
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&16u32.to_le_bytes());
+        buf.extend_from_slice(&FMT_PCM.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes()); // channels
+        buf.extend_from_slice(&8_000u32.to_le_bytes()); // sample_rate
+        buf.extend_from_slice(&16_000u32.to_le_bytes()); // byte_rate
+        buf.extend_from_slice(&2u16.to_le_bytes()); // block_align
+        buf.extend_from_slice(&16u16.to_le_bytes()); // bits_per_sample
+                                                     // bext chunk.
+        buf.extend_from_slice(b"bext");
+        buf.extend_from_slice(&(bext_body.len() as u32).to_le_bytes());
+        buf.extend_from_slice(bext_body);
+        if bext_body.len() % 2 == 1 {
+            buf.push(0); // RIFF word-alignment pad
+        }
+        // empty data chunk.
+        buf.extend_from_slice(b"data");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf
+    }
+
+    /// Assemble a 602-byte BWF v2 `bext` fixed struct plus a coding
+    /// history string. Field offsets follow EBU Tech 3285 v2 §2.3.
+    #[allow(clippy::too_many_arguments)]
+    fn make_bext_v2(
+        description: &str,
+        originator: &str,
+        originator_ref: &str,
+        date: &str,
+        time: &str,
+        time_reference: u64,
+        umid: &[u8; 64],
+        loudness: [i16; 5],
+        coding_history: &str,
+    ) -> Vec<u8> {
+        fn put_ascii(buf: &mut Vec<u8>, s: &str, width: usize) {
+            let bytes = s.as_bytes();
+            let n = bytes.len().min(width);
+            buf.extend_from_slice(&bytes[..n]);
+            buf.resize(buf.len() + (width - n), 0);
+        }
+        let mut b = Vec::new();
+        put_ascii(&mut b, description, 256);
+        put_ascii(&mut b, originator, 32);
+        put_ascii(&mut b, originator_ref, 32);
+        put_ascii(&mut b, date, 10);
+        put_ascii(&mut b, time, 8);
+        b.extend_from_slice(&(time_reference as u32).to_le_bytes()); // low
+        b.extend_from_slice(&((time_reference >> 32) as u32).to_le_bytes()); // high
+        b.extend_from_slice(&2u16.to_le_bytes()); // Version = 2
+        b.extend_from_slice(umid);
+        for v in &loudness {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        b.resize(BEXT_FIXED_LEN, 0); // Reserved[180] zero-fill to 602
+        assert_eq!(b.len(), BEXT_FIXED_LEN);
+        b.extend_from_slice(coding_history.as_bytes());
+        b
+    }
+
+    /// `fmt_loudness` mirrors the EBU Tech 3285 v2 §2.4 round-to-nearest
+    /// fixed-point: the stored WORD is `round(100 × value)`, so dividing
+    /// by 100 with two decimals recovers the displayed value. The §2.4
+    /// negative-number examples (`-22.64` / `-22.65` / `-22.66` stored
+    /// as `-2264` / `-2265` / `-2265`) are exercised in reverse here.
+    #[test]
+    fn bext_loudness_formatting() {
+        assert_eq!(fmt_loudness(-2264), "-22.64");
+        assert_eq!(fmt_loudness(-2265), "-22.65");
+        assert_eq!(fmt_loudness(0), "0.00");
+        assert_eq!(fmt_loudness(2300), "23.00");
+        assert_eq!(fmt_loudness(-50), "-0.50"); // sub-unity negative keeps the sign
+        assert_eq!(fmt_loudness(7), "0.07");
+        assert_eq!(fmt_loudness(-1), "-0.01");
+    }
+
+    /// Full BWF v2 `bext` round-trip: every field surfaces under its
+    /// `wav:bext.*` metadata key, loudness fields decode to two
+    /// decimals, the 64-bit TimeReference reassembles, and the UMID is
+    /// hex-encoded.
+    #[test]
+    fn bext_v2_full_metadata() {
+        let mut umid = [0u8; 64];
+        umid[0] = 0x06;
+        umid[1] = 0x0a;
+        umid[63] = 0xff;
+        let body = make_bext_v2(
+            "Scene 1 take 3",
+            "OxideAV Recorder",
+            "USABC2400001",
+            "2026-05-23",
+            "14:30:00",
+            // 48000 samples/s × 90061 s ≈ a value that spans 32 bits.
+            0x0000_0001_2345_6789,
+            &umid,
+            [-2305, 700, -120, -1850, -2010],
+            "A=PCM,F=48000,W=24,M=stereo,T=OxideAV\r\n",
+        );
+        let bytes = wav_with_bext(&body);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+
+        assert_eq!(
+            md.get("wav:bext.description"),
+            Some(&"Scene 1 take 3".to_string())
+        );
+        assert_eq!(
+            md.get("wav:bext.originator"),
+            Some(&"OxideAV Recorder".to_string())
+        );
+        assert_eq!(
+            md.get("wav:bext.originator_reference"),
+            Some(&"USABC2400001".to_string())
+        );
+        assert_eq!(
+            md.get("wav:bext.origination_date"),
+            Some(&"2026-05-23".to_string())
+        );
+        assert_eq!(
+            md.get("wav:bext.origination_time"),
+            Some(&"14:30:00".to_string())
+        );
+        assert_eq!(
+            md.get("wav:bext.time_reference"),
+            Some(&0x0000_0001_2345_6789u64.to_string())
+        );
+        assert_eq!(md.get("wav:bext.version"), Some(&"2".to_string()));
+        assert_eq!(
+            md.get("wav:bext.loudness_value"),
+            Some(&"-23.05".to_string())
+        );
+        assert_eq!(md.get("wav:bext.loudness_range"), Some(&"7.00".to_string()));
+        assert_eq!(
+            md.get("wav:bext.max_true_peak_level"),
+            Some(&"-1.20".to_string())
+        );
+        assert_eq!(
+            md.get("wav:bext.max_momentary_loudness"),
+            Some(&"-18.50".to_string())
+        );
+        assert_eq!(
+            md.get("wav:bext.max_short_term_loudness"),
+            Some(&"-20.10".to_string())
+        );
+        // UMID hex begins with the bytes we set and ends with 0xff.
+        let umid_hex = md.get("wav:bext.umid").expect("umid present");
+        assert!(umid_hex.starts_with("060a"), "umid hex {umid_hex:?}");
+        assert!(umid_hex.ends_with("ff"), "umid hex {umid_hex:?}");
+        assert_eq!(umid_hex.len(), 128); // 64 bytes × 2 hex chars
+        assert_eq!(
+            md.get("wav:bext.coding_history"),
+            Some(&"A=PCM,F=48000,W=24,M=stereo,T=OxideAV".to_string())
+        );
+    }
+
+    /// BWF v0 `bext`: no UMID, no loudness fields. Version = 0 so the
+    /// loudness keys must be absent and the (all-zero) UMID suppressed,
+    /// while the text + TimeReference fields still surface.
+    #[test]
+    fn bext_v0_omits_umid_and_loudness() {
+        // 602-byte fixed struct, version 0, all UMID/loudness zero.
+        let mut body = vec![0u8; BEXT_FIXED_LEN];
+        // Description "Field recording".
+        let desc = b"Field recording";
+        body[..desc.len()].copy_from_slice(desc);
+        // TimeReferenceLow = 12345 (offset 338).
+        body[338..342].copy_from_slice(&12_345u32.to_le_bytes());
+        // Version = 0 (offset 346) — already zero.
+        let bytes = wav_with_bext(&body);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+
+        assert_eq!(
+            md.get("wav:bext.description"),
+            Some(&"Field recording".to_string())
+        );
+        assert_eq!(md.get("wav:bext.version"), Some(&"0".to_string()));
+        assert_eq!(
+            md.get("wav:bext.time_reference"),
+            Some(&"12345".to_string())
+        );
+        // v0 must not emit loudness or UMID.
+        assert!(!md.contains_key("wav:bext.umid"));
+        assert!(!md.contains_key("wav:bext.loudness_value"));
+        assert!(!md.contains_key("wav:bext.max_true_peak_level"));
+    }
+
+    /// A `bext` chunk shorter than the 602-byte fixed struct is
+    /// malformed; the parser must skip it without panicking and the
+    /// stream must still open (the chunk is treated as opaque).
+    #[test]
+    fn bext_truncated_is_skipped() {
+        let body = vec![0u8; 100]; // < 602
+        let bytes = wav_with_bext(&body);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert!(md.keys().all(|k| !k.starts_with("wav:bext.")));
+        // Stream still resolves to PCM s16.
+        assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
     }
 
     /// `fmt_guid` produces the canonical text form: first three groups

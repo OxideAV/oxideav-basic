@@ -19,7 +19,14 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework �
   IEEE_FLOAT, ALAW, MULAW) resolve to the same codec ids the legacy
   `WAVEFORMATEX` path would have produced; unknown GUIDs synthesise a
   `wav:guid_<canonical-text>` id. `WavMuxOptions::with_extensible(mask)`
-  opts the muxer into writing a 40-byte EXTENSIBLE `fmt ` chunk.
+  opts the muxer into writing a 40-byte EXTENSIBLE `fmt ` chunk. The
+  `bext` Broadcast Audio Extension chunk (EBU Tech 3285) is parsed and
+  surfaced through `wav:bext.*` metadata keys — description, originator,
+  origination date/time, 64-bit `TimeReference`, BWF version, SMPTE-330M
+  UMID (v1+) and the v2 loudness fields (`LoudnessValue`,
+  `LoudnessRange`, `MaxTruePeakLevel`, `MaxMomentaryLoudness`,
+  `MaxShortTermLoudness`, each ×100 fixed-point rendered to two
+  decimals) plus `CodingHistory`.
 - **slin** container: Asterisk-style headerless `.sln*` / `.slin*` raw
   S16LE PCM (extension drives the sample rate).
 - **Y4M (YUV4MPEG2)** container: rawvideo demuxer + muxer for `.y4m` files,
