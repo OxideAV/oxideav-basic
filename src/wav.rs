@@ -168,6 +168,14 @@ fn open_demuxer(
                     input.seek(SeekFrom::Current(1))?;
                 }
             }
+            b"cue " => {
+                let mut buf = vec![0u8; size as usize];
+                input.read_exact(&mut buf)?;
+                parse_cue_chunk(&buf, &mut metadata);
+                if size % 2 == 1 {
+                    input.seek(SeekFrom::Current(1))?;
+                }
+            }
             b"data" => {
                 data_offset = input.stream_position()?;
                 data_size = size;
@@ -255,17 +263,25 @@ fn open_demuxer(
     }))
 }
 
-/// Parse a RIFF LIST chunk body. If the list type is `INFO`, map its
-/// `IART`/`INAM`/... subchunks to standard key names (`artist`, `title`,
-/// …) and append to `out`.
+/// Parse a RIFF LIST chunk body. Dispatches by the 4-byte list type:
+/// `INFO` maps `IART`/`INAM`/... sub-chunks to standard key names
+/// (`artist`, `title`, ...); `adtl` (Associated Data List, per
+/// `docs/container/riff/metadata/microsoft-riffmci.pdf` §3 "Associated
+/// Data Chunk") maps `labl`/`note`/`ltxt` sub-chunks to
+/// `wav:adtl.<id>.<dwName>` keys carrying the cue-point text.
 fn parse_list_chunk(buf: &[u8], out: &mut Vec<(String, String)>) {
     if buf.len() < 4 {
         return;
     }
-    if &buf[0..4] != b"INFO" {
-        return;
+    match &buf[0..4] {
+        b"INFO" => parse_info_list(&buf[4..], out),
+        b"adtl" => parse_adtl_list(&buf[4..], out),
+        _ => {}
     }
-    let mut i = 4usize;
+}
+
+fn parse_info_list(buf: &[u8], out: &mut Vec<(String, String)>) {
+    let mut i = 0usize;
     while i + 8 <= buf.len() {
         let id: [u8; 4] = [buf[i], buf[i + 1], buf[i + 2], buf[i + 3]];
         let size = u32::from_le_bytes([buf[i + 4], buf[i + 5], buf[i + 6], buf[i + 7]]) as usize;
@@ -286,6 +302,172 @@ fn parse_list_chunk(buf: &[u8], out: &mut Vec<(String, String)>) {
         if size % 2 == 1 {
             i += 1;
         }
+    }
+}
+
+/// Parse a `LIST adtl` (Associated Data List) body and emit
+/// `wav:adtl.<sub-id>.<dwName>` keys carrying the text payload of each
+/// sub-chunk. Per `docs/container/riff/metadata/microsoft-riffmci.pdf`
+/// §3 "Associated Data Chunk":
+///
+/// * `labl(<dwName:DWORD> <data:ZSTR>)` — title text for cue `dwName`.
+/// * `note(<dwName:DWORD> <data:ZSTR>)` — comment text for cue `dwName`.
+/// * `ltxt(<dwName> <dwSampleLength> <dwPurpose> <wCountry> <wLanguage>
+///   <wDialect> <wCodePage> <data:BYTE>...)` — text covering a
+///   `dwSampleLength`-sample segment starting at cue `dwName`. The
+///   parser surfaces the segment length under `.ltxt.<dwName>.length`,
+///   the FOURCC purpose under `.ltxt.<dwName>.purpose`, and the text
+///   payload (trimmed at the first NUL) under `.ltxt.<dwName>.text`.
+/// * `file(...)` — embedded media file; skipped (binary, no useful
+///   metadata key without a reader for the inner format type).
+///
+/// Sub-chunks shorter than the minimum required header are skipped.
+fn parse_adtl_list(buf: &[u8], out: &mut Vec<(String, String)>) {
+    let mut i = 0usize;
+    while i + 8 <= buf.len() {
+        let id: [u8; 4] = [buf[i], buf[i + 1], buf[i + 2], buf[i + 3]];
+        let size = u32::from_le_bytes([buf[i + 4], buf[i + 5], buf[i + 6], buf[i + 7]]) as usize;
+        i += 8;
+        if i + size > buf.len() {
+            break;
+        }
+        let body = &buf[i..i + size];
+        match &id {
+            b"labl" | b"note" if body.len() >= 4 => {
+                let dw_name = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+                let raw = &body[4..];
+                let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+                let text = String::from_utf8_lossy(&raw[..end]).trim().to_string();
+                if !text.is_empty() {
+                    let sub = if &id == b"labl" { "labl" } else { "note" };
+                    out.push((format!("wav:adtl.{sub}.{dw_name}"), text));
+                }
+            }
+            // 4 dwName + 4 dwSampleLength + 4 dwPurpose + 2 wCountry
+            // + 2 wLanguage + 2 wDialect + 2 wCodePage = 20 bytes
+            // fixed header.
+            b"ltxt" if body.len() >= 20 => {
+                let dw_name = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+                let dw_length = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+                let purpose = &body[8..12];
+                out.push((
+                    format!("wav:adtl.ltxt.{dw_name}.length"),
+                    dw_length.to_string(),
+                ));
+                // Render purpose as a FOURCC when printable, hex otherwise.
+                let purpose_str = if purpose.iter().all(|&b| (0x20..=0x7E).contains(&b)) {
+                    String::from_utf8_lossy(purpose).to_string()
+                } else {
+                    format!(
+                        "0x{:02X}{:02X}{:02X}{:02X}",
+                        purpose[0], purpose[1], purpose[2], purpose[3]
+                    )
+                };
+                out.push((format!("wav:adtl.ltxt.{dw_name}.purpose"), purpose_str));
+                let raw = &body[20..];
+                // The text payload may or may not be NUL-terminated
+                // per the spec ("<data:BYTE>..."); trim at the first
+                // NUL if present and strip surrounding whitespace.
+                let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+                let text = String::from_utf8_lossy(&raw[..end]).trim().to_string();
+                if !text.is_empty() {
+                    out.push((format!("wav:adtl.ltxt.{dw_name}.text"), text));
+                }
+            }
+            // `file` sub-chunks carry an embedded media file; we don't
+            // surface their bytes through the string-typed metadata API.
+            // Truncated `labl`/`note`/`ltxt` (under the fixed-header
+            // minimum) are likewise skipped as opaque.
+            _ => {}
+        }
+        i += size;
+        if size % 2 == 1 {
+            i += 1;
+        }
+    }
+}
+
+/// Parse a `cue ` chunk body and emit `wav:cue.count` + per-point
+/// `wav:cue.<dwName>.position` / `.fcc_chunk` / `.chunk_start` /
+/// `.block_start` / `.sample_offset` keys. Layout per
+/// `docs/container/riff/metadata/microsoft-riffmci.pdf` §3 "Cue-Points
+/// Chunk":
+///
+/// ```text
+/// <cue-ck> -> cue( <dwCuePoints:DWORD> <cue-point>... )
+/// <cue-point> -> struct {
+///     DWORD dwName;        // unique id, referenced by plst/adtl
+///     DWORD dwPosition;    // sample position in the play order
+///     FOURCC fccChunk;     // 'data' or 'slnt' (for wavl LIST forms)
+///     DWORD dwChunkStart;  // byte offset of fccChunk within wavl LIST
+///     DWORD dwBlockStart;  // byte offset of enclosing block
+///     DWORD dwSampleOffset;// sample offset within block
+/// }
+/// ```
+///
+/// A truncated chunk (count > body) is treated as opaque and skipped.
+/// Each cue-point record is 24 bytes; the function consumes as many
+/// records as the body actually carries even if `dwCuePoints` claims
+/// more (defensive vs. writers that lie about the count).
+fn parse_cue_chunk(buf: &[u8], out: &mut Vec<(String, String)>) {
+    if buf.len() < 4 {
+        return;
+    }
+    let count_claimed = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    let body = &buf[4..];
+    const REC_LEN: usize = 24;
+    let count_actual = (body.len() / REC_LEN) as u32;
+    let count = count_claimed.min(count_actual);
+    out.push(("wav:cue.count".to_string(), count.to_string()));
+    for i in 0..count as usize {
+        let off = i * REC_LEN;
+        let dw_name = u32::from_le_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]);
+        let dw_position =
+            u32::from_le_bytes([body[off + 4], body[off + 5], body[off + 6], body[off + 7]]);
+        let fcc_chunk = &body[off + 8..off + 12];
+        let dw_chunk_start = u32::from_le_bytes([
+            body[off + 12],
+            body[off + 13],
+            body[off + 14],
+            body[off + 15],
+        ]);
+        let dw_block_start = u32::from_le_bytes([
+            body[off + 16],
+            body[off + 17],
+            body[off + 18],
+            body[off + 19],
+        ]);
+        let dw_sample_offset = u32::from_le_bytes([
+            body[off + 20],
+            body[off + 21],
+            body[off + 22],
+            body[off + 23],
+        ]);
+        let fcc_str = if fcc_chunk.iter().all(|&b| (0x20..=0x7E).contains(&b)) {
+            String::from_utf8_lossy(fcc_chunk).to_string()
+        } else {
+            format!(
+                "0x{:02X}{:02X}{:02X}{:02X}",
+                fcc_chunk[0], fcc_chunk[1], fcc_chunk[2], fcc_chunk[3]
+            )
+        };
+        out.push((
+            format!("wav:cue.{dw_name}.position"),
+            dw_position.to_string(),
+        ));
+        out.push((format!("wav:cue.{dw_name}.fcc_chunk"), fcc_str));
+        out.push((
+            format!("wav:cue.{dw_name}.chunk_start"),
+            dw_chunk_start.to_string(),
+        ));
+        out.push((
+            format!("wav:cue.{dw_name}.block_start"),
+            dw_block_start.to_string(),
+        ));
+        out.push((
+            format!("wav:cue.{dw_name}.sample_offset"),
+            dw_sample_offset.to_string(),
+        ));
     }
 }
 
@@ -1638,6 +1820,207 @@ mod tests {
         assert!(md.keys().all(|k| !k.starts_with("wav:bext.")));
         // Stream still resolves to PCM s16.
         assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
+    }
+
+    /// Build a minimal valid PCM WAV with a caller-supplied raw `cue `
+    /// chunk and optional `LIST adtl` body inserted between `fmt ` and
+    /// `data`. Returns the file bytes ready for `open_demux_from_bytes`.
+    fn wav_with_cue_and_adtl(cue_body: &[u8], adtl_body: Option<&[u8]>) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"RIFF");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(b"WAVE");
+        // fmt : 16-byte PCM s16 mono 8000 Hz.
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&16u32.to_le_bytes());
+        buf.extend_from_slice(&FMT_PCM.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&8_000u32.to_le_bytes());
+        buf.extend_from_slice(&16_000u32.to_le_bytes());
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(&16u16.to_le_bytes());
+        // cue chunk
+        buf.extend_from_slice(b"cue ");
+        buf.extend_from_slice(&(cue_body.len() as u32).to_le_bytes());
+        buf.extend_from_slice(cue_body);
+        if cue_body.len() % 2 == 1 {
+            buf.push(0);
+        }
+        // optional LIST adtl chunk
+        if let Some(adtl) = adtl_body {
+            // LIST chunk wraps a 4-byte form-type 'adtl' + sub-chunks.
+            buf.extend_from_slice(b"LIST");
+            buf.extend_from_slice(&((adtl.len() + 4) as u32).to_le_bytes());
+            buf.extend_from_slice(b"adtl");
+            buf.extend_from_slice(adtl);
+            if (adtl.len() + 4) % 2 == 1 {
+                buf.push(0);
+            }
+        }
+        // empty data chunk
+        buf.extend_from_slice(b"data");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf
+    }
+
+    /// Build a single 24-byte `<cue-point>` record per
+    /// `docs/container/riff/metadata/microsoft-riffmci.pdf` §3.
+    fn cue_point(
+        dw_name: u32,
+        dw_position: u32,
+        fcc_chunk: &[u8; 4],
+        dw_chunk_start: u32,
+        dw_block_start: u32,
+        dw_sample_offset: u32,
+    ) -> Vec<u8> {
+        let mut b = Vec::with_capacity(24);
+        b.extend_from_slice(&dw_name.to_le_bytes());
+        b.extend_from_slice(&dw_position.to_le_bytes());
+        b.extend_from_slice(fcc_chunk);
+        b.extend_from_slice(&dw_chunk_start.to_le_bytes());
+        b.extend_from_slice(&dw_block_start.to_le_bytes());
+        b.extend_from_slice(&dw_sample_offset.to_le_bytes());
+        b
+    }
+
+    /// Build a `labl` or `note` sub-chunk body (without the chunk
+    /// header) per RIFF MCI §3 "Label and Note Information".
+    fn adtl_text_subchunk(id: &[u8; 4], dw_name: u32, text: &str) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(id);
+        // Body = 4-byte dwName + ZSTR (text + NUL terminator).
+        let body_len = 4 + text.len() + 1;
+        b.extend_from_slice(&(body_len as u32).to_le_bytes());
+        b.extend_from_slice(&dw_name.to_le_bytes());
+        b.extend_from_slice(text.as_bytes());
+        b.push(0);
+        if body_len % 2 == 1 {
+            b.push(0);
+        }
+        b
+    }
+
+    /// Full `cue ` + `LIST adtl` round-trip: two cue points, each with
+    /// a `labl` and a `note`, surface under the documented metadata
+    /// keys.
+    #[test]
+    fn cue_and_adtl_full_metadata() {
+        // Two cue points (id=1 at sample 0, id=2 at sample 12345).
+        let mut cue_body = Vec::new();
+        cue_body.extend_from_slice(&2u32.to_le_bytes()); // dwCuePoints
+        cue_body.extend(cue_point(1, 0, b"data", 0, 0, 0));
+        cue_body.extend(cue_point(2, 12_345, b"data", 0, 0, 12_345));
+
+        // LIST adtl with labl + note for each cue point.
+        let mut adtl = Vec::new();
+        adtl.extend(adtl_text_subchunk(b"labl", 1, "Intro"));
+        adtl.extend(adtl_text_subchunk(b"note", 1, "Fade-in"));
+        adtl.extend(adtl_text_subchunk(b"labl", 2, "Verse"));
+        adtl.extend(adtl_text_subchunk(b"note", 2, "Vocal entry"));
+
+        let bytes = wav_with_cue_and_adtl(&cue_body, Some(&adtl));
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+
+        assert_eq!(md.get("wav:cue.count"), Some(&"2".to_string()));
+        assert_eq!(md.get("wav:cue.1.position"), Some(&"0".to_string()));
+        assert_eq!(md.get("wav:cue.1.fcc_chunk"), Some(&"data".to_string()));
+        assert_eq!(md.get("wav:cue.1.chunk_start"), Some(&"0".to_string()));
+        assert_eq!(md.get("wav:cue.1.block_start"), Some(&"0".to_string()));
+        assert_eq!(md.get("wav:cue.1.sample_offset"), Some(&"0".to_string()));
+        assert_eq!(md.get("wav:cue.2.position"), Some(&"12345".to_string()));
+        assert_eq!(
+            md.get("wav:cue.2.sample_offset"),
+            Some(&"12345".to_string())
+        );
+
+        assert_eq!(md.get("wav:adtl.labl.1"), Some(&"Intro".to_string()));
+        assert_eq!(md.get("wav:adtl.note.1"), Some(&"Fade-in".to_string()));
+        assert_eq!(md.get("wav:adtl.labl.2"), Some(&"Verse".to_string()));
+        assert_eq!(md.get("wav:adtl.note.2"), Some(&"Vocal entry".to_string()));
+    }
+
+    /// `ltxt` sub-chunk surfaces dwSampleLength, FOURCC purpose, and
+    /// text under `wav:adtl.ltxt.<dwName>.*`.
+    #[test]
+    fn adtl_ltxt_segment_metadata() {
+        // Single cue point so the ltxt reference is meaningful.
+        let mut cue_body = Vec::new();
+        cue_body.extend_from_slice(&1u32.to_le_bytes());
+        cue_body.extend(cue_point(7, 1000, b"data", 0, 0, 1000));
+
+        // ltxt chunk for cue 7: 4410-sample segment, 'scrp' (script) text.
+        let mut ltxt_body = Vec::new();
+        ltxt_body.extend_from_slice(&7u32.to_le_bytes()); // dwName
+        ltxt_body.extend_from_slice(&4410u32.to_le_bytes()); // dwSampleLength
+        ltxt_body.extend_from_slice(b"scrp"); // dwPurpose
+        ltxt_body.extend_from_slice(&0u16.to_le_bytes()); // wCountry
+        ltxt_body.extend_from_slice(&0u16.to_le_bytes()); // wLanguage
+        ltxt_body.extend_from_slice(&0u16.to_le_bytes()); // wDialect
+        ltxt_body.extend_from_slice(&0u16.to_le_bytes()); // wCodePage
+        ltxt_body.extend_from_slice(b"Hello world");
+        ltxt_body.push(0);
+
+        let mut adtl = Vec::new();
+        adtl.extend_from_slice(b"ltxt");
+        adtl.extend_from_slice(&(ltxt_body.len() as u32).to_le_bytes());
+        adtl.extend_from_slice(&ltxt_body);
+        if ltxt_body.len() % 2 == 1 {
+            adtl.push(0);
+        }
+
+        let bytes = wav_with_cue_and_adtl(&cue_body, Some(&adtl));
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+
+        assert_eq!(md.get("wav:adtl.ltxt.7.length"), Some(&"4410".to_string()));
+        assert_eq!(md.get("wav:adtl.ltxt.7.purpose"), Some(&"scrp".to_string()));
+        assert_eq!(
+            md.get("wav:adtl.ltxt.7.text"),
+            Some(&"Hello world".to_string())
+        );
+    }
+
+    /// A `cue ` chunk whose `dwCuePoints` count exceeds the body length
+    /// must not panic — the parser surfaces only the records that
+    /// actually fit in the body.
+    #[test]
+    fn cue_truncated_count_is_clamped() {
+        // Claim 5 points, ship 1.
+        let mut cue_body = Vec::new();
+        cue_body.extend_from_slice(&5u32.to_le_bytes());
+        cue_body.extend(cue_point(42, 100, b"data", 0, 0, 100));
+        let bytes = wav_with_cue_and_adtl(&cue_body, None);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:cue.count"), Some(&"1".to_string()));
+        assert_eq!(md.get("wav:cue.42.position"), Some(&"100".to_string()));
+        // Stream still opens cleanly.
+        assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
+    }
+
+    /// An `adtl` list without a matching `cue ` chunk still emits its
+    /// `wav:adtl.*` keys — the spec doesn't require the cue chunk to
+    /// precede the adtl list, and downstream consumers can cross-
+    /// reference dwName values themselves.
+    #[test]
+    fn adtl_without_cue_still_surfaces() {
+        let mut adtl = Vec::new();
+        adtl.extend(adtl_text_subchunk(b"labl", 99, "Orphan label"));
+        // cue body with zero points exercises the count=0 path.
+        let cue_body = 0u32.to_le_bytes().to_vec();
+        let bytes = wav_with_cue_and_adtl(&cue_body, Some(&adtl));
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:cue.count"), Some(&"0".to_string()));
+        assert_eq!(
+            md.get("wav:adtl.labl.99"),
+            Some(&"Orphan label".to_string())
+        );
     }
 
     /// `fmt_guid` produces the canonical text form: first three groups

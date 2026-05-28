@@ -26,7 +26,14 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework �
   UMID (v1+) and the v2 loudness fields (`LoudnessValue`,
   `LoudnessRange`, `MaxTruePeakLevel`, `MaxMomentaryLoudness`,
   `MaxShortTermLoudness`, each ×100 fixed-point rendered to two
-  decimals) plus `CodingHistory`.
+  decimals) plus `CodingHistory`. The `cue ` chunk and `LIST adtl`
+  (Associated Data List) sub-chunks are parsed per Microsoft RIFF MCI
+  §3 — cue points surface as `wav:cue.count` plus per-point
+  `wav:cue.<dwName>.position` / `.fcc_chunk` / `.chunk_start` /
+  `.block_start` / `.sample_offset`; `labl` / `note` text sub-chunks
+  surface as `wav:adtl.labl.<dwName>` / `wav:adtl.note.<dwName>`; the
+  `ltxt` (text-with-segment-length) sub-chunk surfaces as
+  `wav:adtl.ltxt.<dwName>.length` / `.purpose` (FOURCC) / `.text`.
 - **slin** container: Asterisk-style headerless `.sln*` / `.slin*` raw
   S16LE PCM (extension drives the sample rate).
 - **Y4M (YUV4MPEG2)** container: rawvideo demuxer + muxer for `.y4m` files,

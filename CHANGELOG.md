@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- WAV demuxer parses the `cue ` chunk and the `LIST adtl` (Associated
+  Data List) sub-chunks per
+  `docs/container/riff/metadata/microsoft-riffmci.pdf` §3
+  ("Cue-Points Chunk" + "Playlist Chunk" + "Associated Data Chunk").
+  The cue-point table surfaces under `wav:cue.count` plus per-point
+  `wav:cue.<dwName>.position` / `.fcc_chunk` / `.chunk_start` /
+  `.block_start` / `.sample_offset` (all values as decimal strings;
+  `fcc_chunk` rendered as a 4-byte ASCII FOURCC when printable). The
+  `LIST adtl` body's `labl` / `note` / `ltxt` sub-chunks surface
+  under `wav:adtl.labl.<dwName>` / `wav:adtl.note.<dwName>` /
+  `wav:adtl.ltxt.<dwName>.{length,purpose,text}`. `file` sub-chunks
+  (embedded media files) are skipped — their bytes do not fit the
+  string-typed metadata API. A `dwCuePoints` count that exceeds the
+  chunk body is clamped to the records that actually fit so a writer
+  that lies about the count cannot panic the parser; `labl` / `note`
+  shorter than the 4-byte `dwName` header and `ltxt` shorter than the
+  20-byte fixed header are treated as opaque and skipped.
 - WAV demuxer parses the `bext` Broadcast Audio Extension chunk per
   `docs/container/riff/metadata/ebu-tech3285-bwf.pdf` (EBU Tech 3285 v2
   §2.3 `BROADCAST_EXT`). The 602-byte fixed struct plus variable
