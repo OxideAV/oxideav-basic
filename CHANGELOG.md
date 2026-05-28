@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-basic/compare/v0.0.7...v0.0.8) - 2026-05-28
+
+### Other
+
+- parse cue and LIST adtl chunks per RIFF MCI ch. 3
+- parse bext Broadcast Audio Extension chunk (EBU Tech 3285)
+- fix intra-doc links to WavMuxOptions / WavDemuxer methods
+- A-law/μ-law tag 6/7 + WAVEFORMATEXTENSIBLE end-to-end
+
 ### Added
 
 - WAV demuxer parses the `cue ` (cue-points) chunk per
