@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- WAV demuxer parses the `cue ` (cue-points) chunk per
+  `docs/container/riff/metadata/microsoft-riffmci.pdf` chapter 3
+  §"Cue-Points Chunk". Each 24-byte `<cue-point>` record's `dwName`
+  (unique cue-point ID), `dwPosition`, `fccChunk`, `dwSampleOffset`,
+  and the optional `dwChunkStart` / `dwBlockStart` fields are surfaced
+  through `Demuxer::metadata` under `wav:cue.<dwName>.*` keys (record
+  count under `wav:cue.count`). The cross-reference `dwName` is
+  preserved verbatim — never re-indexed by array position — so it
+  matches the IDs the `LIST adtl` sub-chunks use to attach labels and
+  notes. Zero `dwChunkStart` / `dwBlockStart` fields are elided to keep
+  the key set small for the common single-`data`-chunk PCM case.
+- `LIST adtl` (associated-data list) sub-chunks per the same spec
+  §"Associated Data Chunk": `labl` and `note` `(dwName, ZSTR)` records
+  surface as `wav:cue.<dwName>.label` / `wav:cue.<dwName>.note`; the
+  `ltxt` (text-with-data-length) record surfaces its 20-byte fixed
+  header (`dwName + dwSampleLength + dwPurpose` FOURCC + four locale
+  WORDs) plus the trailing text as `wav:cue.<dwName>.ltxt.length` /
+  `wav:cue.<dwName>.ltxt.purpose` / `wav:cue.<dwName>.ltxt.text`. The
+  `file` (embedded media) sub-chunk is binary-opaque and is silently
+  skipped per the RIFF MCI Chap. 2 "ignore unknown sub-chunks" rule.
 - WAV demuxer parses the `bext` Broadcast Audio Extension chunk per
   `docs/container/riff/metadata/ebu-tech3285-bwf.pdf` (EBU Tech 3285 v2
   §2.3 `BROADCAST_EXT`). The 602-byte fixed struct plus variable

@@ -168,6 +168,14 @@ fn open_demuxer(
                     input.seek(SeekFrom::Current(1))?;
                 }
             }
+            b"cue " => {
+                let mut buf = vec![0u8; size as usize];
+                input.read_exact(&mut buf)?;
+                parse_cue_chunk(&buf, &mut metadata);
+                if size % 2 == 1 {
+                    input.seek(SeekFrom::Current(1))?;
+                }
+            }
             b"data" => {
                 data_offset = input.stream_position()?;
                 data_size = size;
@@ -255,17 +263,34 @@ fn open_demuxer(
     }))
 }
 
-/// Parse a RIFF LIST chunk body. If the list type is `INFO`, map its
-/// `IART`/`INAM`/... subchunks to standard key names (`artist`, `title`,
-/// …) and append to `out`.
+/// Parse a RIFF LIST chunk body and dispatch by list type.
+///
+/// Recognised list types per `docs/container/riff/metadata/microsoft-riffmci.pdf`:
+///
+/// - `INFO` — standard text-tag namespace; map well-known sub-IDs
+///   (`INAM`/`IART`/…) to canonical key names (`title`/`artist`/…).
+/// - `adtl` — associated-data list; `labl` / `note` sub-chunks carry a
+///   `dwName` (cue-point ID) plus a NUL-terminated string. Surfaced as
+///   `wav:cue.<id>.label` / `wav:cue.<id>.note`. The `ltxt` sub-chunk
+///   carries the same ID plus a sample length, a purpose FOURCC, and a
+///   text payload — surfaced as `wav:cue.<id>.ltxt.length` /
+///   `wav:cue.<id>.ltxt.purpose` / `wav:cue.<id>.ltxt.text`. The `file`
+///   sub-chunk is treated as opaque (binary embedded media — caller would
+///   need the raw bytes, which `Demuxer::metadata` cannot carry).
 fn parse_list_chunk(buf: &[u8], out: &mut Vec<(String, String)>) {
     if buf.len() < 4 {
         return;
     }
-    if &buf[0..4] != b"INFO" {
-        return;
+    let list_type: [u8; 4] = [buf[0], buf[1], buf[2], buf[3]];
+    match &list_type {
+        b"INFO" => parse_list_info(&buf[4..], out),
+        b"adtl" => parse_list_adtl(&buf[4..], out),
+        _ => {}
     }
-    let mut i = 4usize;
+}
+
+fn parse_list_info(buf: &[u8], out: &mut Vec<(String, String)>) {
+    let mut i = 0usize;
     while i + 8 <= buf.len() {
         let id: [u8; 4] = [buf[i], buf[i + 1], buf[i + 2], buf[i + 3]];
         let size = u32::from_le_bytes([buf[i + 4], buf[i + 5], buf[i + 6], buf[i + 7]]) as usize;
@@ -287,6 +312,92 @@ fn parse_list_chunk(buf: &[u8], out: &mut Vec<(String, String)>) {
             i += 1;
         }
     }
+}
+
+/// `LIST adtl` parser. Each sub-chunk's first DWORD is the cue-point
+/// `dwName` (matching one of the IDs in the `cue ` chunk). Per the
+/// 1991 RIFF MCI spec §3 "Associated Data Chunk", recognised sub-IDs
+/// are `labl` (label), `note` (comment text) — both `(dwName, ZSTR)`
+/// shape — and `ltxt` (text-with-data-length, with `dwName +
+/// dwSampleLength + dwPurpose + wCountry + wLanguage + wDialect +
+/// wCodePage + ZSTR` shape). The `file` sub-chunk is binary-opaque and
+/// not surfaced through the string-typed metadata channel.
+fn parse_list_adtl(buf: &[u8], out: &mut Vec<(String, String)>) {
+    let mut i = 0usize;
+    while i + 8 <= buf.len() {
+        let id: [u8; 4] = [buf[i], buf[i + 1], buf[i + 2], buf[i + 3]];
+        let size = u32::from_le_bytes([buf[i + 4], buf[i + 5], buf[i + 6], buf[i + 7]]) as usize;
+        i += 8;
+        if i + size > buf.len() {
+            break;
+        }
+        let body = &buf[i..i + size];
+        match &id {
+            b"labl" | b"note" if body.len() >= 4 => {
+                let name = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+                let text = adtl_zstr(&body[4..]);
+                if !text.is_empty() {
+                    let kind = if &id == b"labl" { "label" } else { "note" };
+                    out.push((format!("wav:cue.{name}.{kind}"), text));
+                }
+            }
+            // ltxt: dwName + dwSampleLength + dwPurpose + wCountry +
+            // wLanguage + wDialect + wCodePage + variable text. Fixed
+            // header is 20 bytes; tolerate body lengths >= 20.
+            b"ltxt" if body.len() >= 20 => {
+                let name = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+                let sample_length = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+                let purpose: [u8; 4] = [body[8], body[9], body[10], body[11]];
+                let purpose_text = fourcc_text(&purpose);
+                out.push((
+                    format!("wav:cue.{name}.ltxt.length"),
+                    sample_length.to_string(),
+                ));
+                if !purpose_text.is_empty() {
+                    out.push((format!("wav:cue.{name}.ltxt.purpose"), purpose_text));
+                }
+                let text = adtl_zstr(&body[20..]);
+                if !text.is_empty() {
+                    out.push((format!("wav:cue.{name}.ltxt.text"), text));
+                }
+            }
+            // Unrecognised / under-length sub-chunks (`file`, malformed
+            // labl/note/ltxt) are silently skipped per RIFF MCI Chap. 2
+            // §"Defining and Registering" ("programs must expect — and
+            // ignore — any unknown chunks").
+            _ => {}
+        }
+        i += size;
+        if size % 2 == 1 {
+            i += 1;
+        }
+    }
+}
+
+/// Trim a ZSTR (NUL-terminated string) payload from a `labl` / `note` /
+/// `ltxt` body, falling back to the full slice if no NUL is present.
+fn adtl_zstr(raw: &[u8]) -> String {
+    let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+    String::from_utf8_lossy(&raw[..end]).trim().to_string()
+}
+
+/// Render a FOURCC as printable ASCII; returns the empty string if the
+/// FOURCC is all-NUL (cue-point spec sentinel for "no chunk ID").
+fn fourcc_text(id: &[u8; 4]) -> String {
+    if id.iter().all(|&b| b == 0) {
+        return String::new();
+    }
+    let s: String = id
+        .iter()
+        .map(|&b| {
+            if (0x20..=0x7e).contains(&b) {
+                b as char
+            } else {
+                '.'
+            }
+        })
+        .collect();
+    s.trim().to_string()
 }
 
 fn info_id_to_key(id: &[u8; 4]) -> Option<&'static str> {
@@ -442,6 +553,85 @@ fn fmt_loudness(v: i16) -> String {
         format!("-{whole}.{frac:02}")
     } else {
         format!("{whole}.{frac:02}")
+    }
+}
+
+/// Size of a single `<cue-point>` record per the 1991 RIFF MCI spec
+/// §"Cue-Points Chunk": `dwName(4) + dwPosition(4) + fccChunk(4) +
+/// dwChunkStart(4) + dwBlockStart(4) + dwSampleOffset(4)` = 24 bytes.
+const CUE_POINT_LEN: usize = 24;
+
+/// Parse a WAV `cue ` (cue-points) chunk body and surface its records as
+/// `wav:cue.<id>.*` keys.
+///
+/// Layout per `docs/container/riff/metadata/microsoft-riffmci.pdf`
+/// chapter 3 §"Cue-Points Chunk":
+///
+/// ```text
+/// DWORD  dwCuePoints       // count of records
+/// <cue-point> × dwCuePoints
+///
+/// <cue-point> := struct {
+///     DWORD  dwName;          // unique cue-point ID
+///     DWORD  dwPosition;      // sample position in the play order
+///     FOURCC fccChunk;        // ID of the chunk containing the cue
+///     DWORD  dwChunkStart;    // file offset within the wavl data section
+///     DWORD  dwBlockStart;    // block offset within the wavl data section
+///     DWORD  dwSampleOffset;  // sample offset within the block
+/// }
+/// ```
+///
+/// All fields are little-endian. `dwName` is the cross-reference key
+/// used by `LIST adtl` `labl` / `note` / `ltxt` sub-chunks to attach
+/// labels and comments to cue points, so the parser preserves it
+/// verbatim under `wav:cue.<dwName>.position` rather than re-indexing
+/// from the record's array offset.
+fn parse_cue_chunk(buf: &[u8], out: &mut Vec<(String, String)>) {
+    if buf.len() < 4 {
+        return;
+    }
+    let count = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    // Bound the record count by the chunk body to defend against a
+    // crafted `dwCuePoints` that overflows the chunk.
+    let available = (buf.len() - 4) / CUE_POINT_LEN;
+    let count = count.min(available);
+    out.push(("wav:cue.count".to_string(), count.to_string()));
+    for i in 0..count {
+        let off = 4 + i * CUE_POINT_LEN;
+        let name = u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
+        let position = u32::from_le_bytes([buf[off + 4], buf[off + 5], buf[off + 6], buf[off + 7]]);
+        let fcc: [u8; 4] = [buf[off + 8], buf[off + 9], buf[off + 10], buf[off + 11]];
+        let chunk_start =
+            u32::from_le_bytes([buf[off + 12], buf[off + 13], buf[off + 14], buf[off + 15]]);
+        let block_start =
+            u32::from_le_bytes([buf[off + 16], buf[off + 17], buf[off + 18], buf[off + 19]]);
+        let sample_offset =
+            u32::from_le_bytes([buf[off + 20], buf[off + 21], buf[off + 22], buf[off + 23]]);
+        out.push((format!("wav:cue.{name}.position"), position.to_string()));
+        let fcc_text = fourcc_text(&fcc);
+        if !fcc_text.is_empty() {
+            out.push((format!("wav:cue.{name}.fcc_chunk"), fcc_text));
+        }
+        // Per the spec, for a single-`data`-chunk PCM file `dwChunkStart`
+        // and `dwBlockStart` are both zero and only `dwSampleOffset`
+        // carries the position. Emit the non-zero ones to keep the
+        // metadata footprint small for the common case.
+        if chunk_start != 0 {
+            out.push((
+                format!("wav:cue.{name}.chunk_start"),
+                chunk_start.to_string(),
+            ));
+        }
+        if block_start != 0 {
+            out.push((
+                format!("wav:cue.{name}.block_start"),
+                block_start.to_string(),
+            ));
+        }
+        out.push((
+            format!("wav:cue.{name}.sample_offset"),
+            sample_offset.to_string(),
+        ));
     }
 }
 
