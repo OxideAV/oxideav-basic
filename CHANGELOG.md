@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- WAV demuxer parses the `smpl` (Sampler) and `inst` (Instrument)
+  chunks per `docs/container/riff/metadata/exiftool-riff-tags.html` §
+  "RIFF Sampler Tags" / "RIFF Instrument Tags" and summarised in
+  `docs/container/riff/metadata/README.md` § "Sampler / Instrument
+  chunks". `smpl` is a 36-byte fixed header (`Manufacturer`,
+  `Product`, `SamplePeriod`, `MIDIUnityNote`, `MIDIPitchFraction`,
+  `SMPTEFormat`, `SMPTEOffset`, `cSampleLoops`, `cbSamplerData`)
+  followed by N × 24-byte loop records (`dwCuePointID`, `dwType`,
+  `dwStart`, `dwEnd`, `dwFraction`, `dwPlayCount`). `inst` is a
+  7-byte fixed struct (`UnshiftedNote`, `FineTune`, `Gain`, `LowNote`,
+  `HighNote`, `LowVelocity`, `HighVelocity`). Both surface through
+  `Demuxer::metadata` under `wav:smpl.*` / `wav:inst.*` keys; the
+  `SMPTEOffset` `DWORD` is rendered as canonical `HH:MM:SS:FF`, and
+  `FineTune` / `Gain` are decoded as signed `i8` (so `-3` cents shows
+  as `-3`, not `253`). A `cSampleLoops` count exceeding what the chunk
+  body actually carries is clamped to the records that fit; bodies
+  shorter than the 36-byte (`smpl`) or 7-byte (`inst`) fixed header
+  are treated as opaque and skipped.
 - WAV demuxer parses the `cue ` chunk and the `LIST adtl` (Associated
   Data List) sub-chunks per
   `docs/container/riff/metadata/microsoft-riffmci.pdf` §3

@@ -33,7 +33,17 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework â€
   `.block_start` / `.sample_offset`; `labl` / `note` text sub-chunks
   surface as `wav:adtl.labl.<dwName>` / `wav:adtl.note.<dwName>`; the
   `ltxt` (text-with-segment-length) sub-chunk surfaces as
-  `wav:adtl.ltxt.<dwName>.length` / `.purpose` (FOURCC) / `.text`.
+  `wav:adtl.ltxt.<dwName>.length` / `.purpose` (FOURCC) / `.text`. The
+  `smpl` (Sampler) and `inst` (Instrument) chunks surface through
+  `wav:smpl.*` (manufacturer / product / sample_period / midi_unity_note
+  / midi_pitch_fraction / smpte_format / smpte_offset rendered as
+  `HH:MM:SS:FF` / sampler_data_len / num_sample_loops + per-loop
+  `wav:smpl.loop.<n>.{cue_point_id,type,start,end,fraction,play_count}`)
+  and `wav:inst.{unshifted_note,fine_tune,gain,low_note,high_note,
+  low_velocity,high_velocity}` (signed `fine_tune` / `gain` decoded as
+  `i8`). Loop counts that exceed the chunk body are clamped; bodies
+  shorter than the 36-byte `smpl` / 7-byte `inst` fixed header are
+  treated as opaque.
 - **slin** container: Asterisk-style headerless `.sln*` / `.slin*` raw
   S16LE PCM (extension drives the sample rate).
 - **Y4M (YUV4MPEG2)** container: rawvideo demuxer + muxer for `.y4m` files,
