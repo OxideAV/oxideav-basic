@@ -136,6 +136,12 @@ fn open_demuxer(
     // Walk chunks until we hit "data"; parse "fmt " and "LIST" along the way.
     let mut fmt: Option<WaveFmt> = None;
     let mut metadata: Vec<(String, String)> = Vec::new();
+    // `fact` chunk's `dwFileSize` (per-channel sample count) when present.
+    // Required for non-PCM / `wavl LIST` waveform data per
+    // `docs/container/riff/metadata/microsoft-riffmci.pdf` §3 "FACT
+    // Chunk" — the only honest sample count when `block_align *
+    // total_samples != data_size`.
+    let mut fact_sample_count: Option<u32> = None;
     let data_offset: u64;
     let data_size: u64;
     loop {
@@ -148,6 +154,14 @@ fn open_demuxer(
                 let mut buf = vec![0u8; size as usize];
                 input.read_exact(&mut buf)?;
                 fmt = Some(parse_fmt(&buf)?);
+                if size % 2 == 1 {
+                    input.seek(SeekFrom::Current(1))?;
+                }
+            }
+            b"fact" => {
+                let mut buf = vec![0u8; size as usize];
+                input.read_exact(&mut buf)?;
+                fact_sample_count = parse_fact_chunk(&buf, &mut metadata);
                 if size % 2 == 1 {
                     input.seek(SeekFrom::Current(1))?;
                 }
@@ -225,7 +239,25 @@ fn open_demuxer(
 
     let time_base = TimeBase::new(1, fmt.sample_rate as i64);
     let block_align = fmt.block_align.max(1) as u64;
-    let total_samples = data_size / block_align;
+    let block_samples = data_size / block_align;
+    // Prefer the `fact` chunk's per-channel sample count when present —
+    // for compressed WAV streams (and for `wavl LIST` containers in
+    // general) the `data_size / block_align` heuristic is meaningless
+    // because one byte of payload no longer maps to one sample. For PCM
+    // the two should agree; when they don't we surface
+    // `wav:fact.mismatch` so a downstream tool can flag the file rather
+    // than silently trusting one number over the other.
+    let total_samples = if let Some(fc) = fact_sample_count {
+        if fc as u64 != block_samples {
+            metadata.push((
+                "wav:fact.mismatch".to_string(),
+                format!("block_samples={block_samples} fact_samples={fc}"),
+            ));
+        }
+        fc as u64
+    } else {
+        block_samples
+    };
     let duration_micros: i64 = if fmt.sample_rate > 0 {
         (total_samples as i128 * 1_000_000 / fmt.sample_rate as i128) as i64
     } else {
@@ -712,6 +744,50 @@ fn parse_inst_chunk(buf: &[u8], out: &mut Vec<(String, String)>) {
     ));
 }
 
+/// Parse a `fact` chunk body per
+/// `docs/container/riff/metadata/microsoft-riffmci.pdf` §3 "FACT Chunk":
+///
+/// ```text
+/// <fact-ck> -> fact( <dwFileSize:DWORD> )   // Number of samples per channel
+/// ```
+///
+/// The 1991 RIFF MCI spec defines exactly one field — `dwFileSize`,
+/// the count of *samples per channel* (the spec text uses "sample"
+/// in the per-channel sense; the field name predates the
+/// per-channel/per-frame disambiguation). The spec explicitly
+/// reserves the trailing bytes for future extension fields: any
+/// bytes past offset 4 must be tolerated, with the chunk size
+/// telling applications which fields are present.
+///
+/// The `fact` chunk is required for compressed WAV streams and for
+/// any file using the `wavl LIST` waveform container; for plain
+/// PCM `data` chunks it is optional. The parser surfaces:
+///
+/// - `wav:fact.sample_count` — `dwFileSize` as a decimal string.
+/// - `wav:fact.body_len` — total chunk-body length, present when the
+///   body exceeds the 4-byte fixed field so downstream tools can see
+///   that future-extension bytes are riding along (the bytes themselves
+///   are opaque to this parser by spec).
+///
+/// Returns the `dwFileSize` value so the demuxer can use it as the
+/// authoritative `total_samples` for the stream's duration. A body
+/// shorter than 4 bytes is treated as opaque-and-skipped (returns
+/// `None`, no metadata key emitted).
+fn parse_fact_chunk(buf: &[u8], out: &mut Vec<(String, String)>) -> Option<u32> {
+    if buf.len() < 4 {
+        return None;
+    }
+    let sample_count = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    out.push((
+        "wav:fact.sample_count".to_string(),
+        sample_count.to_string(),
+    ));
+    if buf.len() > 4 {
+        out.push(("wav:fact.body_len".to_string(), buf.len().to_string()));
+    }
+    Some(sample_count)
+}
+
 fn info_id_to_key(id: &[u8; 4]) -> Option<&'static str> {
     match id {
         b"INAM" => Some("title"),
@@ -1196,6 +1272,7 @@ fn open_muxer(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Box<
         extensible: None,
         riff_size_offset: 0,
         data_size_offset: 0,
+        fact_size_offset: None,
         data_bytes: 0,
         header_written: false,
         trailer_written: false,
@@ -1290,6 +1367,7 @@ pub fn open_muxer_with(
         extensible: opts.extensible,
         riff_size_offset: 0,
         data_size_offset: 0,
+        fact_size_offset: None,
         data_bytes: 0,
         header_written: false,
         trailer_written: false,
@@ -1372,6 +1450,14 @@ struct WavMuxer {
     extensible: Option<ExtensibleOpts>,
     riff_size_offset: u64,
     data_size_offset: u64,
+    /// Offset of the `dwFileSize` field inside the `fact` chunk we
+    /// emit ahead of `data` for non-PCM streams (G.711 A-law / μ-law,
+    /// and the EXTENSIBLE escape hatch even when the SubFormat
+    /// resolves to PCM — RIFF MCI §3 "FACT Chunk" requires it for any
+    /// `wFormatTag != WAVE_FORMAT_PCM`). `None` for PCM streams where
+    /// the chunk is optional and we skip emitting it to keep PCM
+    /// files byte-identical to the pre-r193 muxer output.
+    fact_size_offset: Option<u64>,
     data_bytes: u64,
     header_written: bool,
     trailer_written: bool,
@@ -1430,6 +1516,19 @@ impl Muxer for WavMuxer {
             self.output.write_all(&guid)?;
         }
 
+        // `fact` chunk: required for any `wFormatTag != WAVE_FORMAT_PCM`
+        // (RIFF MCI §3 "FACT Chunk"). We emit it for the
+        // EXTENSIBLE-tagged path too even when the SubFormat resolves to
+        // PCM, because compliant readers dispatch on the on-wire
+        // `wFormatTag` first. The 4-byte `dwFileSize` is patched in
+        // `write_trailer` once we know the per-channel sample count.
+        if format_tag != FMT_PCM {
+            self.output.write_all(b"fact")?;
+            self.output.write_all(&4u32.to_le_bytes())?;
+            self.fact_size_offset = Some(self.output.stream_position()?);
+            self.output.write_all(&0u32.to_le_bytes())?; // placeholder dwFileSize
+        }
+
         self.output.write_all(b"data")?;
         self.data_size_offset = self.output.stream_position()?;
         self.output.write_all(&0u32.to_le_bytes())?; // placeholder
@@ -1464,6 +1563,24 @@ impl Muxer for WavMuxer {
             .map_err(|_| Error::other("WAV data chunk exceeds 4 GiB"))?;
         self.output.seek(SeekFrom::Start(self.data_size_offset))?;
         self.output.write_all(&data_size_u32.to_le_bytes())?;
+
+        // Patch "fact" `dwFileSize` (per-channel sample count) when the
+        // chunk was emitted. For PCM/G.711 the on-wire byte rate makes
+        // `data_bytes / block_align` exact; for the EXTENSIBLE escape
+        // hatch the muxer only ships pre-framed payload so the same
+        // identity holds. Compressed bitstreams that ride EXTENSIBLE
+        // would need a caller-supplied sample count — out of scope for
+        // this muxer which only writes uncompressed shapes today.
+        if let Some(off) = self.fact_size_offset {
+            let bits_per_sample = self.shape.bits_per_sample() as u64;
+            let block_align = (bits_per_sample / 8) * self.channels as u64;
+            let sample_count = self.data_bytes.checked_div(block_align).unwrap_or(0);
+            let sample_count_u32: u32 = sample_count
+                .try_into()
+                .map_err(|_| Error::other("WAV fact sample count exceeds u32"))?;
+            self.output.seek(SeekFrom::Start(off))?;
+            self.output.write_all(&sample_count_u32.to_le_bytes())?;
+        }
 
         // Patch "RIFF" size: total file size minus 8 (RIFF + size fields).
         let riff_size_u32: u32 = (end - 8)
@@ -2623,6 +2740,244 @@ mod tests {
         assert_eq!(md.get("wav:plst.count"), Some(&"1".to_string()));
         assert_eq!(md.get("wav:plst.0.cue_id"), Some(&"5".to_string()));
         assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
+    }
+
+    /// Build a minimal valid PCM WAV with a caller-supplied raw `fact`
+    /// chunk inserted between `fmt ` and `data`. Mirrors
+    /// `wav_with_plst` but for the `fact` chunk — exercised separately
+    /// so the fact-chunk tests don't depend on the muxer also writing
+    /// one (which the muxer skips for PCM by design).
+    fn wav_with_fact(fact_body: &[u8], data_payload: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"RIFF");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(b"WAVE");
+        // fmt : 16-byte PCM s16 mono 8000 Hz.
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&16u32.to_le_bytes());
+        buf.extend_from_slice(&FMT_PCM.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&8_000u32.to_le_bytes());
+        buf.extend_from_slice(&16_000u32.to_le_bytes());
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(&16u16.to_le_bytes());
+        // fact chunk
+        buf.extend_from_slice(b"fact");
+        buf.extend_from_slice(&(fact_body.len() as u32).to_le_bytes());
+        buf.extend_from_slice(fact_body);
+        if fact_body.len() % 2 == 1 {
+            buf.push(0);
+        }
+        // data chunk with caller-supplied payload (S16 = 2 bytes/sample).
+        buf.extend_from_slice(b"data");
+        buf.extend_from_slice(&(data_payload.len() as u32).to_le_bytes());
+        buf.extend_from_slice(data_payload);
+        if data_payload.len() % 2 == 1 {
+            buf.push(0);
+        }
+        buf
+    }
+
+    /// Spec-minimum `fact` body — the 4-byte `dwFileSize` field. A PCM
+    /// file with a `fact` chunk whose sample count matches the
+    /// `data / block_align` heuristic should surface
+    /// `wav:fact.sample_count` and *no* `wav:fact.mismatch` key. This
+    /// is the well-formed case some WAV writers emit even for PCM
+    /// (libsndfile does so for files >2 GiB, many DAWs do
+    /// unconditionally).
+    #[test]
+    fn fact_minimum_body_matches_data() {
+        // 100 mono S16 samples → 200 data bytes; fact says 100 too.
+        let payload: Vec<u8> = (0..200u32).map(|i| (i & 0xFF) as u8).collect();
+        let fact_body = 100u32.to_le_bytes().to_vec();
+        let bytes = wav_with_fact(&fact_body, &payload);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:fact.sample_count"), Some(&"100".to_string()));
+        assert!(!md.contains_key("wav:fact.mismatch"));
+        assert!(!md.contains_key("wav:fact.body_len"));
+        // Duration reflects the fact-chunk sample count (here matching
+        // the heuristic, so the public Duration:sample_count is 100).
+        assert_eq!(dmx.streams()[0].duration, Some(100));
+    }
+
+    /// `fact` `dwFileSize` that disagrees with the `data / block_align`
+    /// heuristic surfaces `wav:fact.mismatch` and the duration follows
+    /// the fact value. This is the canonical compressed-WAV path
+    /// (e.g. a hypothetical ADPCM stream whose nibble-packed `data`
+    /// chunk yields fewer-than-bytes samples).
+    #[test]
+    fn fact_mismatch_surfaces_diagnostic_and_overrides_duration() {
+        // 200 data bytes, fact claims only 50 samples → mismatch.
+        let payload: Vec<u8> = (0..200u32).map(|i| (i & 0xFF) as u8).collect();
+        let fact_body = 50u32.to_le_bytes().to_vec();
+        let bytes = wav_with_fact(&fact_body, &payload);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:fact.sample_count"), Some(&"50".to_string()));
+        assert_eq!(
+            md.get("wav:fact.mismatch"),
+            Some(&"block_samples=100 fact_samples=50".to_string())
+        );
+        assert_eq!(dmx.streams()[0].duration, Some(50));
+    }
+
+    /// A `fact` chunk longer than the spec-minimum 4 bytes is
+    /// tolerated per RIFF MCI §3 ("Added fields will appear following
+    /// the `dwFileSize` field. Applications can use the chunk size
+    /// field to determine which fields are present.") — the parser
+    /// reads `dwFileSize`, surfaces `wav:fact.body_len` so callers
+    /// can see extension bytes are present, and ignores the rest. The
+    /// `data` chunk that follows must still be located correctly.
+    #[test]
+    fn fact_extension_bytes_preserved_in_body_len() {
+        // 200 data bytes; fact has 4 + 8 = 12 bytes (future-extension
+        // bytes are opaque per spec but the body_len surfaces them).
+        let payload: Vec<u8> = (0..200u32).map(|i| (i & 0xFF) as u8).collect();
+        let mut fact_body = 100u32.to_le_bytes().to_vec();
+        fact_body.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04]);
+        let bytes = wav_with_fact(&fact_body, &payload);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:fact.sample_count"), Some(&"100".to_string()));
+        assert_eq!(md.get("wav:fact.body_len"), Some(&"12".to_string()));
+        // Stream still opens cleanly — the 12-byte fact body is even
+        // so no pad byte; the data chunk that follows is intact.
+        assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
+    }
+
+    /// A `fact` chunk shorter than the 4-byte fixed `dwFileSize` field
+    /// is treated as opaque and skipped — no metadata keys emitted,
+    /// the stream still opens cleanly. The `data` chunk that follows
+    /// must still be located (validates the chunk-walk pad-byte
+    /// arithmetic for the < 4-byte case).
+    #[test]
+    fn fact_truncated_body_is_opaque() {
+        let payload: Vec<u8> = vec![0u8, 0u8];
+        let fact_body = vec![0u8, 0u8]; // < 4 bytes → opaque
+        let bytes = wav_with_fact(&fact_body, &payload);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert!(md.keys().all(|k| !k.starts_with("wav:fact.")));
+        assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
+    }
+
+    /// An odd-length `fact` body forces a pad byte; the `data` chunk
+    /// that follows must still be located correctly (regression guard
+    /// matching `plst_odd_body_padding`). RIFF MCI §2 "Chunks"
+    /// requires all chunks to be word-aligned, with an implicit pad
+    /// byte appended when the body is odd. The pad byte is NOT part
+    /// of the body length carried in the chunk header.
+    #[test]
+    fn fact_odd_body_padding() {
+        // 4-byte dwFileSize + 1 future-extension byte = 5 bytes (odd).
+        let payload: Vec<u8> = vec![0xAA, 0x55];
+        let mut fact_body = 1u32.to_le_bytes().to_vec();
+        fact_body.push(0x42);
+        let bytes = wav_with_fact(&fact_body, &payload);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:fact.sample_count"), Some(&"1".to_string()));
+        assert_eq!(md.get("wav:fact.body_len"), Some(&"5".to_string()));
+        assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
+    }
+
+    /// Round-trip via the muxer: an A-law stream must carry a `fact`
+    /// chunk per RIFF MCI §3 ("The 'fact' chunk is required ... for
+    /// all compressed audio formats"). The demuxer surfaces the
+    /// sample count under `wav:fact.sample_count` and the duration
+    /// reflects it. For G.711 mono one byte == one per-channel
+    /// sample so the value matches the heuristic — the mismatch key
+    /// must be absent.
+    #[test]
+    fn fact_chunk_round_trip_alaw_mono() {
+        let payload: Vec<u8> = (0..=255u8).collect(); // 256 mono A-law samples
+        let stream = make_g711_stream("pcm_alaw", 1, 8_000);
+        let bytes = mux_to_bytes(&stream, &payload, WavMuxOptions::default(), "alaw-fact");
+        // The muxer should have emitted a `fact` chunk between fmt and data.
+        assert!(
+            find_chunk(&bytes, b"fact").is_some(),
+            "muxer must emit fact chunk for non-PCM wFormatTag"
+        );
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:fact.sample_count"), Some(&"256".to_string()));
+        assert!(!md.contains_key("wav:fact.mismatch"));
+        assert_eq!(dmx.streams()[0].duration, Some(256));
+    }
+
+    /// Round-trip via the muxer: a plain PCM stream MUST NOT carry a
+    /// `fact` chunk (per RIFF MCI §3 "The chunk is not required for
+    /// PCM files using the 'data' chunk format") — we skip emitting
+    /// it to keep the post-r193 PCM muxer output byte-identical to
+    /// pre-r193. Regression guard against accidentally emitting it
+    /// for `wFormatTag = WAVE_FORMAT_PCM`.
+    #[test]
+    fn fact_chunk_not_emitted_for_pcm() {
+        let samples: Vec<i16> = (0..100).map(|i| (i * 100) as i16).collect();
+        let mut payload = Vec::with_capacity(samples.len() * 2);
+        for s in &samples {
+            payload.extend_from_slice(&s.to_le_bytes());
+        }
+        let stream = make_stream(SampleFormat::S16, 1, 8_000);
+        let bytes = mux_to_bytes(&stream, &payload, WavMuxOptions::default(), "pcm-no-fact");
+        assert!(
+            find_chunk(&bytes, b"fact").is_none(),
+            "PCM muxer output must not carry a fact chunk"
+        );
+    }
+
+    /// Round-trip via the muxer: an EXTENSIBLE stream carries a `fact`
+    /// chunk too — compliant readers dispatch on the on-wire
+    /// `wFormatTag` first (which is `0xFFFE`, not PCM), so the chunk
+    /// is required regardless of which SubFormat GUID the muxer
+    /// selects.
+    #[test]
+    fn fact_chunk_round_trip_extensible() {
+        let samples: Vec<i16> = (0..200).map(|i| (i * 50) as i16).collect();
+        let mut payload = Vec::with_capacity(samples.len() * 2);
+        for s in &samples {
+            payload.extend_from_slice(&s.to_le_bytes());
+        }
+        let stream = make_stream(SampleFormat::S16, 1, 8_000);
+        let opts = WavMuxOptions::default().with_extensible(0x4); // SPEAKER_FRONT_CENTER
+        let bytes = mux_to_bytes(&stream, &payload, opts, "ext-fact");
+        assert!(
+            find_chunk(&bytes, b"fact").is_some(),
+            "EXTENSIBLE muxer output must carry a fact chunk"
+        );
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:fact.sample_count"), Some(&"200".to_string()));
+        assert!(!md.contains_key("wav:fact.mismatch"));
+    }
+
+    /// Locate the first chunk with the given 4-byte FOURCC in a
+    /// freshly-muxed WAV file. Helper for the muxer-side `fact`
+    /// presence/absence assertions above — uses a naive linear scan
+    /// rather than walking the RIFF tree because the tests only need
+    /// "is this FOURCC anywhere" not "is it at the right depth".
+    /// Conservative on overlap (the FOURCC could appear inside an
+    /// `INFO` text payload) — caller chooses test inputs that avoid
+    /// false positives.
+    fn find_chunk(buf: &[u8], fourcc: &[u8; 4]) -> Option<usize> {
+        // Skip the 12-byte RIFF/WAVE header.
+        let mut i = 12usize;
+        while i + 8 <= buf.len() {
+            if &buf[i..i + 4] == fourcc {
+                return Some(i);
+            }
+            let sz = u32::from_le_bytes([buf[i + 4], buf[i + 5], buf[i + 6], buf[i + 7]]) as usize;
+            i += 8 + sz + (sz % 2);
+        }
+        None
     }
 
     /// `fmt_guid` produces the canonical text form: first three groups

@@ -20,6 +20,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- WAV demuxer parses the `fact` chunk per
+  `docs/container/riff/metadata/microsoft-riffmci.pdf` §3 ("FACT
+  Chunk"). The 4-byte `dwFileSize` field (per-channel sample
+  count) surfaces under `wav:fact.sample_count` as a decimal
+  string and becomes the authoritative `StreamInfo::duration`
+  for the open stream — important for non-PCM WAV streams where
+  the `data_size / block_align` heuristic is meaningless because
+  one byte of payload no longer maps to one sample. For PCM
+  streams the heuristic and the `fact` value should agree; when
+  they don't (compressed bitstream riding a non-PCM
+  `wFormatTag`, or a writer that lied about the count) the
+  parser additionally surfaces `wav:fact.mismatch` with both
+  numbers so a downstream tool can flag the file rather than
+  silently trusting one over the other. The spec explicitly
+  reserves trailing bytes past `dwFileSize` for future extension
+  fields, so a body longer than 4 bytes surfaces its total
+  length under `wav:fact.body_len` (the extension bytes
+  themselves are opaque to this parser by spec); a body shorter
+  than 4 bytes is treated as opaque-and-skipped without
+  panicking the parser. The WAV muxer now emits a `fact` chunk
+  between `fmt ` and `data` for every non-PCM on-wire
+  `wFormatTag` (G.711 A-law / μ-law and the EXTENSIBLE
+  `0xFFFE` escape hatch) — RIFF MCI §3 says the chunk is
+  required for any `wFormatTag != WAVE_FORMAT_PCM`; for plain
+  PCM where the chunk is optional we skip emitting it to keep
+  the post-r193 PCM muxer output byte-identical to pre-r193.
 - WAV demuxer parses the `plst` (Playlist) chunk per
   `docs/container/riff/metadata/microsoft-riffmci.pdf` §3 ("Playlist
   Chunk"). The 4-byte `dwSegments` count is followed by N × 12-byte

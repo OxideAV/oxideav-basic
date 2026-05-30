@@ -26,7 +26,17 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework �
   UMID (v1+) and the v2 loudness fields (`LoudnessValue`,
   `LoudnessRange`, `MaxTruePeakLevel`, `MaxMomentaryLoudness`,
   `MaxShortTermLoudness`, each ×100 fixed-point rendered to two
-  decimals) plus `CodingHistory`. The `cue ` chunk, `plst` (Playlist)
+  decimals) plus `CodingHistory`. The `fact` chunk (RIFF MCI §3
+  "FACT Chunk") is parsed — `dwFileSize` (per-channel sample count)
+  surfaces as `wav:fact.sample_count` and becomes the authoritative
+  `StreamInfo::duration` (matters for compressed streams where
+  `data_size / block_align` is meaningless); future-extension bytes
+  past the 4-byte fixed field surface their total under
+  `wav:fact.body_len`; a fact-vs-heuristic mismatch surfaces as
+  `wav:fact.mismatch`. The muxer emits a `fact` chunk for every
+  non-PCM `wFormatTag` (G.711 A-law/μ-law and the EXTENSIBLE escape
+  hatch) per spec, and skips it for plain PCM where it is optional.
+  The `cue ` chunk, `plst` (Playlist)
   chunk and `LIST adtl` (Associated Data List) sub-chunks are parsed
   per Microsoft RIFF MCI §3 — cue points surface as `wav:cue.count`
   plus per-point `wav:cue.<dwName>.position` / `.fcc_chunk` /
