@@ -176,6 +176,14 @@ fn open_demuxer(
                     input.seek(SeekFrom::Current(1))?;
                 }
             }
+            b"plst" => {
+                let mut buf = vec![0u8; size as usize];
+                input.read_exact(&mut buf)?;
+                parse_plst_chunk(&buf, &mut metadata);
+                if size % 2 == 1 {
+                    input.seek(SeekFrom::Current(1))?;
+                }
+            }
             b"smpl" => {
                 let mut buf = vec![0u8; size as usize];
                 input.read_exact(&mut buf)?;
@@ -484,6 +492,51 @@ fn parse_cue_chunk(buf: &[u8], out: &mut Vec<(String, String)>) {
             format!("wav:cue.{dw_name}.sample_offset"),
             dw_sample_offset.to_string(),
         ));
+    }
+}
+
+/// Parse a `plst` (Playlist) chunk body and emit `wav:plst.count` plus
+/// per-segment `wav:plst.<n>.cue_id` / `.length` / `.loops` keys. Layout
+/// per `docs/container/riff/metadata/microsoft-riffmci.pdf` §3 "Playlist
+/// Chunk":
+///
+/// ```text
+/// <plst-ck> -> plst( <dwSegments:DWORD> <play-segment>... )
+/// <play-segment> -> struct {
+///     DWORD dwName;    // cue-point id (must match a <cue-ck> entry)
+///     DWORD dwLength;  // section length in samples
+///     DWORD dwLoops;   // play count
+/// }
+/// ```
+///
+/// The segment index `<n>` is the zero-based position in the playlist,
+/// NOT `dwName` — unlike `cue ` / `smpl`-loops, multiple playlist
+/// entries can reference the same cue point (a cue replayed twice =
+/// two segments with identical `dwName`), so keying on the cue id
+/// would collide. A `dwSegments` count exceeding what the body
+/// actually carries is clamped to the records that fit (defensive
+/// against writers that lie about the count); a body shorter than the
+/// 4-byte segment-count header is treated as opaque and skipped.
+fn parse_plst_chunk(buf: &[u8], out: &mut Vec<(String, String)>) {
+    if buf.len() < 4 {
+        return;
+    }
+    let count_claimed = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    let body = &buf[4..];
+    const REC_LEN: usize = 12;
+    let count_actual = (body.len() / REC_LEN) as u32;
+    let count = count_claimed.min(count_actual);
+    out.push(("wav:plst.count".to_string(), count.to_string()));
+    for i in 0..count as usize {
+        let off = i * REC_LEN;
+        let dw_name = u32::from_le_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]);
+        let dw_length =
+            u32::from_le_bytes([body[off + 4], body[off + 5], body[off + 6], body[off + 7]]);
+        let dw_loops =
+            u32::from_le_bytes([body[off + 8], body[off + 9], body[off + 10], body[off + 11]]);
+        out.push((format!("wav:plst.{i}.cue_id"), dw_name.to_string()));
+        out.push((format!("wav:plst.{i}.length"), dw_length.to_string()));
+        out.push((format!("wav:plst.{i}.loops"), dw_loops.to_string()));
     }
 }
 
@@ -2431,6 +2484,144 @@ mod tests {
             dmx.metadata().iter().cloned().collect();
         assert_eq!(md.get("wav:smpl.midi_unity_note"), Some(&"64".to_string()));
         assert_eq!(md.get("wav:inst.unshifted_note"), Some(&"64".to_string()));
+        assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
+    }
+
+    /// Build a minimal valid PCM WAV with a caller-supplied raw `plst`
+    /// chunk inserted between `fmt ` and `data`. Mirrors
+    /// `wav_with_cue_and_adtl` but for the playlist chunk alone — the
+    /// playlist references cue ids but is parsed independently of any
+    /// preceding `cue ` chunk.
+    fn wav_with_plst(plst_body: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"RIFF");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(b"WAVE");
+        // fmt : 16-byte PCM s16 mono 8000 Hz.
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&16u32.to_le_bytes());
+        buf.extend_from_slice(&FMT_PCM.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&8_000u32.to_le_bytes());
+        buf.extend_from_slice(&16_000u32.to_le_bytes());
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(&16u16.to_le_bytes());
+        // plst chunk
+        buf.extend_from_slice(b"plst");
+        buf.extend_from_slice(&(plst_body.len() as u32).to_le_bytes());
+        buf.extend_from_slice(plst_body);
+        if plst_body.len() % 2 == 1 {
+            buf.push(0);
+        }
+        // empty data chunk
+        buf.extend_from_slice(b"data");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf
+    }
+
+    /// Build a single 12-byte `<play-segment>` record per
+    /// `docs/container/riff/metadata/microsoft-riffmci.pdf` §3.
+    fn plst_segment(dw_name: u32, dw_length: u32, dw_loops: u32) -> Vec<u8> {
+        let mut b = Vec::with_capacity(12);
+        b.extend_from_slice(&dw_name.to_le_bytes());
+        b.extend_from_slice(&dw_length.to_le_bytes());
+        b.extend_from_slice(&dw_loops.to_le_bytes());
+        b
+    }
+
+    /// Full `plst` round-trip: three play segments referencing cue ids
+    /// 1, 2, 1 (replaying cue 1) surface under index-keyed metadata.
+    /// The replay case is the reason segments are indexed by position
+    /// rather than by `dwName`.
+    #[test]
+    fn plst_full_metadata() {
+        let mut plst_body = Vec::new();
+        plst_body.extend_from_slice(&3u32.to_le_bytes()); // dwSegments
+        plst_body.extend(plst_segment(1, 4410, 1)); // 0.1s of cue 1
+        plst_body.extend(plst_segment(2, 8820, 2)); // 0.2s of cue 2, twice
+        plst_body.extend(plst_segment(1, 4410, 1)); // replay cue 1
+
+        let bytes = wav_with_plst(&plst_body);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+
+        assert_eq!(md.get("wav:plst.count"), Some(&"3".to_string()));
+        assert_eq!(md.get("wav:plst.0.cue_id"), Some(&"1".to_string()));
+        assert_eq!(md.get("wav:plst.0.length"), Some(&"4410".to_string()));
+        assert_eq!(md.get("wav:plst.0.loops"), Some(&"1".to_string()));
+        assert_eq!(md.get("wav:plst.1.cue_id"), Some(&"2".to_string()));
+        assert_eq!(md.get("wav:plst.1.length"), Some(&"8820".to_string()));
+        assert_eq!(md.get("wav:plst.1.loops"), Some(&"2".to_string()));
+        assert_eq!(md.get("wav:plst.2.cue_id"), Some(&"1".to_string()));
+        assert_eq!(md.get("wav:plst.2.length"), Some(&"4410".to_string()));
+        assert_eq!(md.get("wav:plst.2.loops"), Some(&"1".to_string()));
+    }
+
+    /// A `plst` chunk whose `dwSegments` count exceeds the body length
+    /// must not panic — the parser surfaces only the records that
+    /// actually fit in the body (defensive against writers that lie
+    /// about the count, matching the `cue ` clamp behaviour).
+    #[test]
+    fn plst_truncated_count_is_clamped() {
+        // Claim 10 segments, ship 1.
+        let mut plst_body = Vec::new();
+        plst_body.extend_from_slice(&10u32.to_le_bytes());
+        plst_body.extend(plst_segment(42, 1000, 1));
+        let bytes = wav_with_plst(&plst_body);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:plst.count"), Some(&"1".to_string()));
+        assert_eq!(md.get("wav:plst.0.cue_id"), Some(&"42".to_string()));
+        // Stream still opens cleanly.
+        assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
+    }
+
+    /// A `plst` chunk shorter than the 4-byte `dwSegments` header is
+    /// treated as opaque and skipped — no metadata keys emitted, stream
+    /// still opens.
+    #[test]
+    fn plst_truncated_header_is_opaque() {
+        let plst_body = vec![0u8, 0]; // < 4 bytes
+        let bytes = wav_with_plst(&plst_body);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert!(md.keys().all(|k| !k.starts_with("wav:plst.")));
+        assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
+    }
+
+    /// A zero-segment `plst` chunk surfaces `wav:plst.count = 0` with
+    /// no per-segment keys.
+    #[test]
+    fn plst_zero_segments() {
+        let plst_body = 0u32.to_le_bytes().to_vec();
+        let bytes = wav_with_plst(&plst_body);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:plst.count"), Some(&"0".to_string()));
+        assert!(md
+            .keys()
+            .all(|k| !k.starts_with("wav:plst.") || k == "wav:plst.count"));
+    }
+
+    /// An odd-length `plst` body forces a pad byte; the `data` chunk
+    /// that follows must still be located correctly.
+    #[test]
+    fn plst_odd_body_padding() {
+        // One 12-byte segment + an extra trailing byte → 17 bytes (odd).
+        let mut plst_body = Vec::new();
+        plst_body.extend_from_slice(&1u32.to_le_bytes());
+        plst_body.extend(plst_segment(5, 100, 1));
+        plst_body.push(0xAA);
+        let bytes = wav_with_plst(&plst_body);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:plst.count"), Some(&"1".to_string()));
+        assert_eq!(md.get("wav:plst.0.cue_id"), Some(&"5".to_string()));
         assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
     }
 

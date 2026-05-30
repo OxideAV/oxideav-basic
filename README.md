@@ -26,13 +26,17 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework �
   UMID (v1+) and the v2 loudness fields (`LoudnessValue`,
   `LoudnessRange`, `MaxTruePeakLevel`, `MaxMomentaryLoudness`,
   `MaxShortTermLoudness`, each ×100 fixed-point rendered to two
-  decimals) plus `CodingHistory`. The `cue ` chunk and `LIST adtl`
-  (Associated Data List) sub-chunks are parsed per Microsoft RIFF MCI
-  §3 — cue points surface as `wav:cue.count` plus per-point
-  `wav:cue.<dwName>.position` / `.fcc_chunk` / `.chunk_start` /
-  `.block_start` / `.sample_offset`; `labl` / `note` text sub-chunks
-  surface as `wav:adtl.labl.<dwName>` / `wav:adtl.note.<dwName>`; the
-  `ltxt` (text-with-segment-length) sub-chunk surfaces as
+  decimals) plus `CodingHistory`. The `cue ` chunk, `plst` (Playlist)
+  chunk and `LIST adtl` (Associated Data List) sub-chunks are parsed
+  per Microsoft RIFF MCI §3 — cue points surface as `wav:cue.count`
+  plus per-point `wav:cue.<dwName>.position` / `.fcc_chunk` /
+  `.chunk_start` / `.block_start` / `.sample_offset`; playlist
+  segments surface as `wav:plst.count` plus per-segment
+  `wav:plst.<n>.cue_id` / `.length` / `.loops` (zero-based segment
+  index `<n>` because a single cue id can be replayed by multiple
+  playlist entries); `labl` / `note` text sub-chunks surface as
+  `wav:adtl.labl.<dwName>` / `wav:adtl.note.<dwName>`; the `ltxt`
+  (text-with-segment-length) sub-chunk surfaces as
   `wav:adtl.ltxt.<dwName>.length` / `.purpose` (FOURCC) / `.text`. The
   `smpl` (Sampler) and `inst` (Instrument) chunks surface through
   `wav:smpl.*` (manufacturer / product / sample_period / midi_unity_note

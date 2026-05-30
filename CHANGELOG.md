@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- WAV demuxer parses the `plst` (Playlist) chunk per
+  `docs/container/riff/metadata/microsoft-riffmci.pdf` §3 ("Playlist
+  Chunk"). The 4-byte `dwSegments` count is followed by N × 12-byte
+  `<play-segment>` records (`dwName`, `dwLength`, `dwLoops`). Each
+  segment surfaces under `wav:plst.count` plus per-segment
+  `wav:plst.<n>.cue_id` / `.length` / `.loops` keys. Unlike the `cue `
+  chunk which keys by `dwName`, the playlist is keyed by zero-based
+  segment position because the spec explicitly allows a single cue
+  id to appear in multiple segments (a cue replayed N times = N
+  segments with identical `dwName`), so a `dwName`-indexed key would
+  collide. A `dwSegments` count that exceeds the chunk body is
+  clamped to the records that actually fit; bodies shorter than the
+  4-byte segment-count header are treated as opaque and skipped.
 - WAV demuxer parses the `smpl` (Sampler) and `inst` (Instrument)
   chunks per `docs/container/riff/metadata/exiftool-riff-tags.html` §
   "RIFF Sampler Tags" / "RIFF Instrument Tags" and summarised in
