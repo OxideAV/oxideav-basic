@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-basic/compare/v0.0.7...v0.0.8) - 2026-05-30
+
+### Other
+
+- parse plst (Playlist) chunk per Microsoft RIFF MCI §3
+- parse smpl (Sampler) + inst (Instrument) chunks
+- parse cue + LIST adtl per Microsoft RIFF MCI §3
+- parse bext Broadcast Audio Extension chunk (EBU Tech 3285)
+- fix intra-doc links to WavMuxOptions / WavDemuxer methods
+- A-law/μ-law tag 6/7 + WAVEFORMATEXTENSIBLE end-to-end
+
 ### Added
 
 - WAV demuxer parses the `plst` (Playlist) chunk per
