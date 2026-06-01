@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- WAV demuxer parses the `iXML` chunk (the third-party
+  production-recorder metadata block catalogued in
+  `docs/container/riff/metadata/exiftool-riff-tags.html` § `iXML`
+  and discussed in
+  `docs/container/riff/metadata/README.md` § "iXML"). The chunk
+  carries a UTF-8 XML document — `IXML_VERSION`, `PROJECT`,
+  `SCENE`, `TAKE`, `TAPE`, `NOTE`, `UBITS`, `FILE_UID`, a `BWF`
+  sub-group mirroring the `bext` fields and a `TRACK_LIST` of
+  per-track `NAME` / `FUNCTION` / `CHANNEL_INDEX` mappings. The
+  parser surfaces the text payload verbatim under `wav:ixml`
+  (trimmed at the first NUL and surrounding whitespace so writers
+  that NUL-pad the body to a fixed size for in-place editing do
+  not surface spurious trailing bytes) and always emits the raw
+  on-wire chunk-body length under `wav:ixml.body_len` whenever the
+  chunk is present — even for empty / NUL-only / whitespace-only
+  bodies — so downstream tooling can distinguish "no `iXML`
+  chunk" from "an `iXML` chunk reserved for later population". An
+  odd-length body forces the standard RIFF 1-byte pad and the
+  `data` chunk that follows is located correctly.
+
 ## [0.0.8](https://github.com/OxideAV/oxideav-basic/compare/v0.0.7...v0.0.8) - 2026-05-30
 
 ### Other

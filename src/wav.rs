@@ -214,6 +214,14 @@ fn open_demuxer(
                     input.seek(SeekFrom::Current(1))?;
                 }
             }
+            b"iXML" => {
+                let mut buf = vec![0u8; size as usize];
+                input.read_exact(&mut buf)?;
+                parse_ixml_chunk(&buf, &mut metadata);
+                if size % 2 == 1 {
+                    input.seek(SeekFrom::Current(1))?;
+                }
+            }
             b"data" => {
                 data_offset = input.stream_position()?;
                 data_size = size;
@@ -786,6 +794,40 @@ fn parse_fact_chunk(buf: &[u8], out: &mut Vec<(String, String)>) -> Option<u32> 
         out.push(("wav:fact.body_len".to_string(), buf.len().to_string()));
     }
     Some(sample_count)
+}
+
+/// Parse an `iXML` chunk body and surface its payload through the
+/// metadata table.
+///
+/// The `iXML` chunk carries a UTF-8 XML document (third-party
+/// production-recorder metadata block — `IXML_VERSION`, `PROJECT`,
+/// `SCENE`, `TAKE`, `TAPE`, `NOTE`, `UBITS`, `FILE_UID`, a `BWF`
+/// sub-group mirroring the `bext` fields and a `TRACK_LIST` of
+/// per-track name / function / channel-index mappings). The schema
+/// catalog is documented in
+/// `docs/container/riff/metadata/exiftool-riff-tags.html` § `iXML`
+/// and discussed in
+/// `docs/container/riff/metadata/README.md` § "iXML".
+///
+/// The chunk body is surfaced verbatim under `wav:ixml` (trimmed at
+/// the first NUL and stripped of surrounding whitespace so a writer
+/// that pads the body to a fixed length with NULs does not surface
+/// spurious trailing bytes). The raw chunk-body length is always
+/// surfaced under `wav:ixml.body_len` whenever the chunk is present
+/// — even when the text payload itself is empty — so downstream
+/// tooling can distinguish "no `iXML` chunk" from "an `iXML` chunk
+/// whose body is entirely NULs / whitespace".
+///
+/// An empty chunk body (zero bytes between header and pad) is treated
+/// as opaque: `wav:ixml.body_len = 0` is emitted but no `wav:ixml`
+/// text key is added.
+fn parse_ixml_chunk(buf: &[u8], out: &mut Vec<(String, String)>) {
+    out.push(("wav:ixml.body_len".to_string(), buf.len().to_string()));
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let text = String::from_utf8_lossy(&buf[..end]).trim().to_string();
+    if !text.is_empty() {
+        out.push(("wav:ixml".to_string(), text));
+    }
 }
 
 fn info_id_to_key(id: &[u8; 4]) -> Option<&'static str> {
@@ -2783,8 +2825,8 @@ mod tests {
     /// `data / block_align` heuristic should surface
     /// `wav:fact.sample_count` and *no* `wav:fact.mismatch` key. This
     /// is the well-formed case some WAV writers emit even for PCM
-    /// (libsndfile does so for files >2 GiB, many DAWs do
-    /// unconditionally).
+    /// (common for large files past the 2 GiB envelope, and emitted
+    /// unconditionally by several DAW writers).
     #[test]
     fn fact_minimum_body_matches_data() {
         // 100 mono S16 samples → 200 data bytes; fact says 100 too.
@@ -2957,6 +2999,144 @@ mod tests {
             dmx.metadata().iter().cloned().collect();
         assert_eq!(md.get("wav:fact.sample_count"), Some(&"200".to_string()));
         assert!(!md.contains_key("wav:fact.mismatch"));
+    }
+
+    /// Build a minimal valid PCM WAV with a caller-supplied raw `iXML`
+    /// chunk inserted between `fmt ` and `data`. Mirrors `wav_with_fact`
+    /// for the third-party metadata block documented in
+    /// `docs/container/riff/metadata/exiftool-riff-tags.html` § `iXML`.
+    fn wav_with_ixml(ixml_body: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"RIFF");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(b"WAVE");
+        // fmt : 16-byte PCM s16 mono 8000 Hz.
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&16u32.to_le_bytes());
+        buf.extend_from_slice(&FMT_PCM.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&8_000u32.to_le_bytes());
+        buf.extend_from_slice(&16_000u32.to_le_bytes());
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(&16u16.to_le_bytes());
+        // iXML chunk.
+        buf.extend_from_slice(b"iXML");
+        buf.extend_from_slice(&(ixml_body.len() as u32).to_le_bytes());
+        buf.extend_from_slice(ixml_body);
+        if ixml_body.len() % 2 == 1 {
+            buf.push(0);
+        }
+        // empty data chunk
+        buf.extend_from_slice(b"data");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf
+    }
+
+    /// A canonical Sound-Devices-style `iXML` document round-trips: the
+    /// XML text surfaces verbatim under `wav:ixml`, and the raw chunk-
+    /// body length surfaces under `wav:ixml.body_len`. The stream still
+    /// opens cleanly.
+    #[test]
+    fn ixml_canonical_document_round_trips() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<BWFXML>
+  <IXML_VERSION>2.10</IXML_VERSION>
+  <PROJECT>OxideAV Round 205</PROJECT>
+  <SCENE>scn-001</SCENE>
+  <TAKE>1</TAKE>
+  <NOTE>iXML canonical fixture</NOTE>
+  <TRACK_LIST>
+    <TRACK_COUNT>1</TRACK_COUNT>
+    <TRACK>
+      <CHANNEL_INDEX>1</CHANNEL_INDEX>
+      <NAME>Boom</NAME>
+      <FUNCTION>Dialog</FUNCTION>
+    </TRACK>
+  </TRACK_LIST>
+</BWFXML>"#;
+        let bytes = wav_with_ixml(xml.as_bytes());
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(
+            md.get("wav:ixml.body_len"),
+            Some(&xml.len().to_string()),
+            "raw chunk-body length must surface verbatim"
+        );
+        assert_eq!(
+            md.get("wav:ixml").map(|s| s.as_str()),
+            Some(xml.trim()),
+            "iXML text payload must round-trip"
+        );
+        assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
+    }
+
+    /// A NUL-padded `iXML` body (writers commonly reserve a fixed-size
+    /// block then NUL-fill the trailing space) surfaces only the
+    /// pre-NUL text under `wav:ixml`; the raw `body_len` still reflects
+    /// the on-wire byte count so the trailing reserved bytes are not
+    /// silently lost.
+    #[test]
+    fn ixml_trailing_nuls_trimmed_in_text_but_body_len_kept() {
+        let mut body = b"<BWFXML><PROJECT>OAV</PROJECT></BWFXML>".to_vec();
+        // Reserve another 64 bytes of NUL pad — emulates writers that
+        // size the iXML region for in-place editing.
+        body.resize(body.len() + 64, 0);
+        let bytes = wav_with_ixml(&body);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(
+            md.get("wav:ixml"),
+            Some(&"<BWFXML><PROJECT>OAV</PROJECT></BWFXML>".to_string())
+        );
+        assert_eq!(md.get("wav:ixml.body_len"), Some(&body.len().to_string()));
+    }
+
+    /// An `iXML` chunk whose body is empty (zero bytes between the
+    /// 8-byte header and the next chunk) surfaces `wav:ixml.body_len = 0`
+    /// but no `wav:ixml` text key. Defensive against writers that emit a
+    /// placeholder iXML header without filling it.
+    #[test]
+    fn ixml_empty_body_surfaces_only_body_len() {
+        let bytes = wav_with_ixml(&[]);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:ixml.body_len"), Some(&"0".to_string()));
+        assert!(!md.contains_key("wav:ixml"));
+        assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
+    }
+
+    /// An `iXML` chunk whose body is entirely NUL / whitespace (e.g.
+    /// "padding awaiting a writer") surfaces `body_len` but no text key.
+    #[test]
+    fn ixml_whitespace_only_body_omits_text_key() {
+        let body = b"   \t\r\n   \0\0\0".to_vec();
+        let bytes = wav_with_ixml(&body);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:ixml.body_len"), Some(&body.len().to_string()));
+        assert!(!md.contains_key("wav:ixml"));
+    }
+
+    /// An odd-length `iXML` body forces a 1-byte pad; the `data` chunk
+    /// that follows must still be located correctly (regression guard
+    /// matching `plst_odd_body_padding` / `fact_odd_body_padding`).
+    #[test]
+    fn ixml_odd_body_padding() {
+        // 17 bytes of XML — odd, so the chunk-walk pad-byte path is
+        // exercised.
+        let body = b"<X>1</X><Y>2</Y>!".to_vec();
+        assert_eq!(body.len() % 2, 1);
+        let bytes = wav_with_ixml(&body);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:ixml"), Some(&"<X>1</X><Y>2</Y>!".to_string()));
+        assert_eq!(md.get("wav:ixml.body_len"), Some(&"17".to_string()));
+        assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
     }
 
     /// Locate the first chunk with the given 4-byte FOURCC in a

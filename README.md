@@ -57,7 +57,14 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework â€
   low_velocity,high_velocity}` (signed `fine_tune` / `gain` decoded as
   `i8`). Loop counts that exceed the chunk body are clamped; bodies
   shorter than the 36-byte `smpl` / 7-byte `inst` fixed header are
-  treated as opaque.
+  treated as opaque. The `iXML` third-party metadata block (the
+  production-recorder schema catalogued in ExifTool's RIFF tag
+  table) is surfaced through `wav:ixml` (UTF-8 text payload, trimmed
+  at the first NUL + surrounding whitespace) and `wav:ixml.body_len`
+  (raw on-wire chunk size, always emitted when the chunk is present
+  so a NUL-padded "reserved for in-place editing" region is still
+  visible to downstream tooling); bodies that are empty or entirely
+  NUL/whitespace surface only `wav:ixml.body_len`.
 - **slin** container: Asterisk-style headerless `.sln*` / `.slin*` raw
   S16LE PCM (extension drives the sample rate).
 - **Y4M (YUV4MPEG2)** container: rawvideo demuxer + muxer for `.y4m` files,
