@@ -222,6 +222,14 @@ fn open_demuxer(
                     input.seek(SeekFrom::Current(1))?;
                 }
             }
+            b"CSET" => {
+                let mut buf = vec![0u8; size as usize];
+                input.read_exact(&mut buf)?;
+                parse_cset_chunk(&buf, &mut metadata);
+                if size % 2 == 1 {
+                    input.seek(SeekFrom::Current(1))?;
+                }
+            }
             b"data" => {
                 data_offset = input.stream_position()?;
                 data_size = size;
@@ -827,6 +835,178 @@ fn parse_ixml_chunk(buf: &[u8], out: &mut Vec<(String, String)>) {
     let text = String::from_utf8_lossy(&buf[..end]).trim().to_string();
     if !text.is_empty() {
         out.push(("wav:ixml".to_string(), text));
+    }
+}
+
+/// Map a Microsoft RIFF MCI §3 "Country Codes" three-digit code to its
+/// human-readable name. Returns `None` for unknown codes; the caller
+/// surfaces the numeric value regardless so a future code-page addition
+/// is still visible.
+fn cset_country_name(code: u16) -> Option<&'static str> {
+    // Verbatim from `docs/container/riff/metadata/microsoft-riffmci.pdf`
+    // §3 "Country Codes" (the table immediately following the CSET
+    // definition). Codes are three-digit telephony region codes.
+    match code {
+        0 => Some("None"),
+        1 => Some("USA"),
+        2 => Some("Canada"),
+        3 => Some("Latin America"),
+        30 => Some("Greece"),
+        31 => Some("Netherlands"),
+        32 => Some("Belgium"),
+        33 => Some("France"),
+        34 => Some("Spain"),
+        39 => Some("Italy"),
+        41 => Some("Switzerland"),
+        43 => Some("Austria"),
+        44 => Some("United Kingdom"),
+        45 => Some("Denmark"),
+        46 => Some("Sweden"),
+        47 => Some("Norway"),
+        49 => Some("West Germany"),
+        52 => Some("Mexico"),
+        55 => Some("Brazil"),
+        61 => Some("Australia"),
+        64 => Some("New Zealand"),
+        81 => Some("Japan"),
+        82 => Some("Korea"),
+        86 => Some("People's Republic of China"),
+        88 => Some("Taiwan"),
+        90 => Some("Turkey"),
+        351 => Some("Portugal"),
+        352 => Some("Luxembourg"),
+        354 => Some("Iceland"),
+        358 => Some("Finland"),
+        _ => None,
+    }
+}
+
+/// Map a Microsoft RIFF MCI §3 (`wLanguage`, `wDialect`) pair to its
+/// human-readable name. Returns `None` for any unknown pair; the caller
+/// surfaces the raw numeric values regardless so dialects added by
+/// vendor extensions are still observable.
+fn cset_language_name(language: u16, dialect: u16) -> Option<&'static str> {
+    // Verbatim from `docs/container/riff/metadata/microsoft-riffmci.pdf`
+    // §3 "Language and Dialect Codes". The dialect column disambiguates
+    // regional variants (e.g. UK vs US English, Belgian vs Canadian
+    // French, Latin vs Cyrillic Serbo-Croatian). A `(language, 0)` pair
+    // is "ignore dialect": resolved as the first listed dialect when
+    // present, otherwise `None`.
+    match (language, dialect) {
+        (0, _) => Some("None"),
+        (1, 1) => Some("Arabic"),
+        (2, 1) => Some("Bulgarian"),
+        (3, 1) => Some("Catalan"),
+        (4, 1) => Some("Traditional Chinese"),
+        (4, 2) => Some("Simplified Chinese"),
+        (5, 1) => Some("Czech"),
+        (6, 1) => Some("Danish"),
+        (7, 1) => Some("German"),
+        (7, 2) => Some("Swiss German"),
+        (8, 1) => Some("Greek"),
+        (9, 1) => Some("US English"),
+        (9, 2) => Some("UK English"),
+        (10, 1) => Some("Spanish"),
+        (10, 2) => Some("Spanish Mexican"),
+        (11, 1) => Some("Finnish"),
+        (12, 1) => Some("French"),
+        (12, 2) => Some("Belgian French"),
+        (12, 3) => Some("Canadian French"),
+        (12, 4) => Some("Swiss French"),
+        (13, 1) => Some("Hebrew"),
+        (14, 1) => Some("Hungarian"),
+        (15, 1) => Some("Icelandic"),
+        (16, 1) => Some("Italian"),
+        (16, 2) => Some("Swiss Italian"),
+        (17, 1) => Some("Japanese"),
+        (18, 1) => Some("Korean"),
+        (19, 1) => Some("Dutch"),
+        (19, 2) => Some("Belgian Dutch"),
+        (20, 1) => Some("Norwegian - Bokmal"),
+        (20, 2) => Some("Norwegian - Nynorsk"),
+        (21, 1) => Some("Polish"),
+        (22, 1) => Some("Brazilian Portuguese"),
+        (22, 2) => Some("Portuguese"),
+        (23, 1) => Some("Rhaeto-Romanic"),
+        (24, 1) => Some("Romanian"),
+        (25, 1) => Some("Russian"),
+        (26, 1) => Some("Serbo-Croatian (Latin)"),
+        (26, 2) => Some("Serbo-Croatian (Cyrillic)"),
+        (27, 1) => Some("Slovak"),
+        (28, 1) => Some("Albanian"),
+        (29, 1) => Some("Swedish"),
+        (30, 1) => Some("Thai"),
+        (31, 1) => Some("Turkish"),
+        (32, 1) => Some("Urdu"),
+        (33, 1) => Some("Bahasa"),
+        _ => None,
+    }
+}
+
+/// Parse a `CSET` (Character Set) chunk body per
+/// `docs/container/riff/metadata/microsoft-riffmci.pdf` §3
+/// "CSET (Character Set) Chunk":
+///
+/// ```text
+/// <CSET-chunk> -> CSET( <wCodePage:WORD>
+///                       <wCountryCode:WORD>
+///                       <wLanguageCode:WORD>
+///                       <wDialect:WORD> )
+/// ```
+///
+/// All four fields are 16-bit little-endian; the chunk body is therefore
+/// exactly 8 bytes in the canonical form. The CSET chunk declares the
+/// code page, country, language and dialect that file elements (notably
+/// the `LIST INFO` ZSTR sub-chunks) are interpreted under. Per the spec,
+/// each field's zero value is "ignore" / "use the default":
+///
+/// * `wCodePage = 0` → ISO 8859/1 (Latin-1), identical to code page 1004
+///   without hex columns 0/1/8/9.
+/// * `wCountryCode = 0` → USA (country code 001).
+/// * `wLanguageCode = 0` / `wDialect = 0` → US English (language 9,
+///   dialect 1).
+///
+/// The parser surfaces:
+///
+/// * `wav:cset.code_page` — raw `wCodePage` decimal value (0 = ISO
+///   8859/1; any non-zero value is the 16-bit Windows / OS-2 code-page
+///   number, e.g. 1252 for Western European, 932 for Shift-JIS, 65001
+///   for UTF-8).
+/// * `wav:cset.country` — raw `wCountryCode` decimal value.
+/// * `wav:cset.country_name` — human-readable name from the §3
+///   "Country Codes" table (only when the code is in the spec's
+///   enumerated set).
+/// * `wav:cset.language` — raw `wLanguageCode` decimal value.
+/// * `wav:cset.dialect` — raw `wDialect` decimal value.
+/// * `wav:cset.language_name` — human-readable name from the §3
+///   "Language and Dialect Codes" table (only when the pair is in the
+///   spec's enumerated set).
+/// * `wav:cset.body_len` — total chunk-body length, always emitted when
+///   the chunk is present so a writer that grew the chunk for forward
+///   compatibility is still observable.
+///
+/// Bodies shorter than the 8-byte canonical struct are treated as
+/// opaque: only `wav:cset.body_len` is emitted. Bodies longer than 8
+/// bytes have the trailing region tolerated (forward compatibility); the
+/// `body_len` key lets downstream tooling notice the extra payload.
+fn parse_cset_chunk(buf: &[u8], out: &mut Vec<(String, String)>) {
+    out.push(("wav:cset.body_len".to_string(), buf.len().to_string()));
+    if buf.len() < 8 {
+        return;
+    }
+    let code_page = u16::from_le_bytes([buf[0], buf[1]]);
+    let country = u16::from_le_bytes([buf[2], buf[3]]);
+    let language = u16::from_le_bytes([buf[4], buf[5]]);
+    let dialect = u16::from_le_bytes([buf[6], buf[7]]);
+    out.push(("wav:cset.code_page".to_string(), code_page.to_string()));
+    out.push(("wav:cset.country".to_string(), country.to_string()));
+    if let Some(name) = cset_country_name(country) {
+        out.push(("wav:cset.country_name".to_string(), name.to_string()));
+    }
+    out.push(("wav:cset.language".to_string(), language.to_string()));
+    out.push(("wav:cset.dialect".to_string(), dialect.to_string()));
+    if let Some(name) = cset_language_name(language, dialect) {
+        out.push(("wav:cset.language_name".to_string(), name.to_string()));
     }
 }
 
@@ -3137,6 +3317,290 @@ mod tests {
         assert_eq!(md.get("wav:ixml"), Some(&"<X>1</X><Y>2</Y>!".to_string()));
         assert_eq!(md.get("wav:ixml.body_len"), Some(&"17".to_string()));
         assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
+    }
+
+    /// Build a minimal valid PCM WAV with a caller-supplied raw `CSET`
+    /// chunk inserted between `fmt ` and `data`. Mirrors `wav_with_ixml`
+    /// for the character-set declaration documented in
+    /// `docs/container/riff/metadata/microsoft-riffmci.pdf` §3
+    /// "CSET (Character Set) Chunk".
+    fn wav_with_cset(cset_body: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"RIFF");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(b"WAVE");
+        // fmt : 16-byte PCM s16 mono 8000 Hz.
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&16u32.to_le_bytes());
+        buf.extend_from_slice(&FMT_PCM.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&8_000u32.to_le_bytes());
+        buf.extend_from_slice(&16_000u32.to_le_bytes());
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(&16u16.to_le_bytes());
+        // CSET chunk.
+        buf.extend_from_slice(b"CSET");
+        buf.extend_from_slice(&(cset_body.len() as u32).to_le_bytes());
+        buf.extend_from_slice(cset_body);
+        if cset_body.len() % 2 == 1 {
+            buf.push(0);
+        }
+        // empty data chunk
+        buf.extend_from_slice(b"data");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf
+    }
+
+    /// Build a canonical 8-byte CSET body from its four `u16` fields,
+    /// mirroring the spec layout `(code_page, country, language, dialect)`.
+    fn cset_body(code_page: u16, country: u16, language: u16, dialect: u16) -> Vec<u8> {
+        let mut body = Vec::with_capacity(8);
+        body.extend_from_slice(&code_page.to_le_bytes());
+        body.extend_from_slice(&country.to_le_bytes());
+        body.extend_from_slice(&language.to_le_bytes());
+        body.extend_from_slice(&dialect.to_le_bytes());
+        body
+    }
+
+    /// A canonical CSET chunk for Windows-1252 / UK English / United
+    /// Kingdom round-trips: every raw field surfaces under the matching
+    /// `wav:cset.*` key, the human-readable lookups resolve, and the
+    /// `body_len` reflects the 8-byte canonical struct.
+    #[test]
+    fn cset_canonical_uk_english_round_trips() {
+        // wCodePage = 1252 (Windows Western European), wCountryCode = 44
+        // (United Kingdom), wLanguageCode = 9 / wDialect = 2 (UK English).
+        let body = cset_body(1252, 44, 9, 2);
+        let bytes = wav_with_cset(&body);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:cset.body_len"), Some(&"8".to_string()));
+        assert_eq!(md.get("wav:cset.code_page"), Some(&"1252".to_string()));
+        assert_eq!(md.get("wav:cset.country"), Some(&"44".to_string()));
+        assert_eq!(
+            md.get("wav:cset.country_name"),
+            Some(&"United Kingdom".to_string())
+        );
+        assert_eq!(md.get("wav:cset.language"), Some(&"9".to_string()));
+        assert_eq!(md.get("wav:cset.dialect"), Some(&"2".to_string()));
+        assert_eq!(
+            md.get("wav:cset.language_name"),
+            Some(&"UK English".to_string())
+        );
+        assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
+    }
+
+    /// All-zero CSET — the spec-mandated "use defaults" form — must
+    /// surface the raw zeros plus the human-readable "None" placeholders
+    /// from the country / language tables. The language pair `(0, _)`
+    /// resolves to `None` per the §3 enumeration.
+    #[test]
+    fn cset_all_zero_uses_spec_defaults() {
+        let body = cset_body(0, 0, 0, 0);
+        let bytes = wav_with_cset(&body);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:cset.code_page"), Some(&"0".to_string()));
+        assert_eq!(md.get("wav:cset.country"), Some(&"0".to_string()));
+        assert_eq!(
+            md.get("wav:cset.country_name"),
+            Some(&"None".to_string()),
+            "wCountryCode = 0 must resolve to the §3 'None' placeholder"
+        );
+        assert_eq!(md.get("wav:cset.language"), Some(&"0".to_string()));
+        assert_eq!(md.get("wav:cset.dialect"), Some(&"0".to_string()));
+        assert_eq!(
+            md.get("wav:cset.language_name"),
+            Some(&"None".to_string()),
+            "wLanguageCode = 0 must resolve to the §3 'None' placeholder regardless of dialect"
+        );
+    }
+
+    /// Out-of-table code-page / country / language values still surface
+    /// their raw numeric value; the human-readable lookups are simply
+    /// absent. Defensive guard for vendor extensions and future code
+    /// pages (e.g. 65001 / UTF-8 is not in the 1991 enumeration).
+    #[test]
+    fn cset_unknown_codes_emit_raw_values_only() {
+        // 65001 (UTF-8 / not in the §3 enumeration), 999 (not a defined
+        // country code), 99 / 99 (not a defined language pair).
+        let body = cset_body(65001, 999, 99, 99);
+        let bytes = wav_with_cset(&body);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:cset.code_page"), Some(&"65001".to_string()));
+        assert_eq!(md.get("wav:cset.country"), Some(&"999".to_string()));
+        assert!(
+            !md.contains_key("wav:cset.country_name"),
+            "unknown country must not synthesise a human-readable name"
+        );
+        assert_eq!(md.get("wav:cset.language"), Some(&"99".to_string()));
+        assert_eq!(md.get("wav:cset.dialect"), Some(&"99".to_string()));
+        assert!(
+            !md.contains_key("wav:cset.language_name"),
+            "unknown language pair must not synthesise a human-readable name"
+        );
+    }
+
+    /// A CSET body shorter than the canonical 8-byte struct is treated
+    /// as opaque: only `wav:cset.body_len` is emitted. Defensive against
+    /// truncated writers; the chunk-walk loop still advances correctly.
+    #[test]
+    fn cset_short_body_treated_as_opaque() {
+        // 4 bytes — half the spec struct. No `code_page` / `country` /
+        // language pair should surface (incomplete fields would be a
+        // guess, not a read).
+        let body = vec![0x52, 0x04, 0x00, 0x00];
+        let bytes = wav_with_cset(&body);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:cset.body_len"), Some(&"4".to_string()));
+        assert!(!md.contains_key("wav:cset.code_page"));
+        assert!(!md.contains_key("wav:cset.country"));
+        assert!(!md.contains_key("wav:cset.language"));
+        assert!(!md.contains_key("wav:cset.dialect"));
+        assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
+    }
+
+    /// A CSET body longer than the canonical 8 bytes tolerates the
+    /// trailing region (forward-compat) — every documented field still
+    /// surfaces, and `body_len` reflects the actual on-wire size so the
+    /// extra payload is observable.
+    #[test]
+    fn cset_oversized_body_tolerates_trailing_bytes() {
+        // 8-byte canonical struct + 4 trailing bytes a hypothetical
+        // future extension might reserve.
+        let mut body = cset_body(932, 81, 17, 1); // Shift-JIS / Japan / Japanese
+        body.extend_from_slice(&[0xFE, 0xCA, 0xAD, 0xDE]);
+        assert_eq!(body.len(), 12);
+        let bytes = wav_with_cset(&body);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:cset.body_len"), Some(&"12".to_string()));
+        assert_eq!(md.get("wav:cset.code_page"), Some(&"932".to_string()));
+        assert_eq!(md.get("wav:cset.country"), Some(&"81".to_string()));
+        assert_eq!(md.get("wav:cset.country_name"), Some(&"Japan".to_string()));
+        assert_eq!(md.get("wav:cset.language"), Some(&"17".to_string()));
+        assert_eq!(md.get("wav:cset.dialect"), Some(&"1".to_string()));
+        assert_eq!(
+            md.get("wav:cset.language_name"),
+            Some(&"Japanese".to_string())
+        );
+    }
+
+    /// CSET coexists with `LIST INFO` without disrupting the existing
+    /// INFO sub-ID parser — the CSET fields surface alongside the INFO
+    /// title and the file still parses end-to-end. Regression guard for
+    /// the chunk-walk ordering CSET → LIST(INFO).
+    #[test]
+    fn cset_coexists_with_list_info() {
+        // Hand-build: RIFF / WAVE / fmt / CSET / LIST(INFO INAM "T") /
+        // data(empty). CSET says Windows-1252 / France / French.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"RIFF");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(b"WAVE");
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&16u32.to_le_bytes());
+        buf.extend_from_slice(&FMT_PCM.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&8_000u32.to_le_bytes());
+        buf.extend_from_slice(&16_000u32.to_le_bytes());
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(&16u16.to_le_bytes());
+        // CSET: 1252 / 33 (France) / 12 / 1 (French).
+        let cset = cset_body(1252, 33, 12, 1);
+        buf.extend_from_slice(b"CSET");
+        buf.extend_from_slice(&(cset.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&cset);
+        // LIST INFO with INAM = "T" (1 byte, odd-length → 1 byte pad).
+        // INFO header (4) + INAM(4) + size(4) + payload(1) + pad(1) = 14.
+        // Total LIST body = "INFO" + (INAM + size + "T" + pad) = 4 + 10 = 14.
+        let mut list_body = Vec::new();
+        list_body.extend_from_slice(b"INFO");
+        list_body.extend_from_slice(b"INAM");
+        list_body.extend_from_slice(&1u32.to_le_bytes());
+        list_body.extend_from_slice(b"T");
+        list_body.push(0); // ZSTR NUL terminator (consumed as the in-body pad).
+        buf.extend_from_slice(b"LIST");
+        buf.extend_from_slice(&(list_body.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&list_body);
+        // empty data chunk.
+        buf.extend_from_slice(b"data");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+
+        let dmx = open_demux_from_bytes(buf);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:cset.code_page"), Some(&"1252".to_string()));
+        assert_eq!(md.get("wav:cset.country_name"), Some(&"France".to_string()));
+        assert_eq!(
+            md.get("wav:cset.language_name"),
+            Some(&"French".to_string())
+        );
+        assert_eq!(md.get("title"), Some(&"T".to_string()));
+    }
+
+    /// An odd-length CSET body forces a 1-byte pad; the `data` chunk
+    /// that follows must still be located correctly (regression guard
+    /// matching `ixml_odd_body_padding`).
+    #[test]
+    fn cset_odd_body_padding() {
+        // 9-byte CSET body: 8 canonical bytes + 1 trailing sentinel.
+        let mut body = cset_body(1252, 1, 9, 1);
+        body.push(0xAA);
+        assert_eq!(body.len() % 2, 1);
+        let bytes = wav_with_cset(&body);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:cset.body_len"), Some(&"9".to_string()));
+        assert_eq!(md.get("wav:cset.code_page"), Some(&"1252".to_string()));
+        assert_eq!(md.get("wav:cset.country_name"), Some(&"USA".to_string()));
+        assert_eq!(
+            md.get("wav:cset.language_name"),
+            Some(&"US English".to_string())
+        );
+        assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
+    }
+
+    /// `cset_country_name` covers the spec's enumerated country codes;
+    /// unknown codes return `None`. Spot-check the boundary codes (the
+    /// three-digit Portugal / Luxembourg / Iceland / Finland entries)
+    /// plus a representative one-digit code (USA).
+    #[test]
+    fn cset_country_name_table_spot_checks() {
+        assert_eq!(cset_country_name(1), Some("USA"));
+        assert_eq!(cset_country_name(44), Some("United Kingdom"));
+        assert_eq!(cset_country_name(351), Some("Portugal"));
+        assert_eq!(cset_country_name(358), Some("Finland"));
+        assert_eq!(cset_country_name(0), Some("None"));
+        assert_eq!(cset_country_name(500), None);
+    }
+
+    /// `cset_language_name` covers the spec's enumerated `(language,
+    /// dialect)` pairs. Spot-check the dialect-disambiguated rows
+    /// (English UK/US, French Belgian/Canadian/Swiss, Serbo-Croatian
+    /// Latin/Cyrillic) — they are the entries the table exists *for*.
+    #[test]
+    fn cset_language_name_table_spot_checks() {
+        assert_eq!(cset_language_name(9, 1), Some("US English"));
+        assert_eq!(cset_language_name(9, 2), Some("UK English"));
+        assert_eq!(cset_language_name(12, 2), Some("Belgian French"));
+        assert_eq!(cset_language_name(12, 3), Some("Canadian French"));
+        assert_eq!(cset_language_name(12, 4), Some("Swiss French"));
+        assert_eq!(cset_language_name(26, 1), Some("Serbo-Croatian (Latin)"));
+        assert_eq!(cset_language_name(26, 2), Some("Serbo-Croatian (Cyrillic)"));
+        assert_eq!(cset_language_name(0, 0), Some("None"));
+        assert_eq!(cset_language_name(0, 1), Some("None"));
+        // Defined language, undefined dialect — must NOT silently fall
+        // back to dialect 1.
+        assert_eq!(cset_language_name(9, 9), None);
     }
 
     /// Locate the first chunk with the given 4-byte FOURCC in a

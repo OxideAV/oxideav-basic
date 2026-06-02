@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- WAV demuxer parses the `CSET` (Character Set) chunk per
+  `docs/container/riff/metadata/microsoft-riffmci.pdf` §3
+  "CSET (Character Set) Chunk". The canonical 8-byte body carries four
+  16-bit little-endian fields — `wCodePage`, `wCountryCode`,
+  `wLanguageCode`, `wDialect` — declaring the code page, country,
+  language and dialect that file elements (notably the `LIST INFO`
+  ZSTR sub-chunks) are interpreted under. The parser surfaces raw
+  values under `wav:cset.code_page` / `.country` / `.language` /
+  `.dialect`, resolves the §3 "Country Codes" and "Language and
+  Dialect Codes" enumerations to human-readable
+  `wav:cset.country_name` / `wav:cset.language_name` keys, and always
+  emits `wav:cset.body_len` so writers that extend the chunk past the
+  canonical 8 bytes are still observable to downstream tooling.
+  All-zero fields are honoured as the spec's "use defaults" form (ISO
+  8859/1 / USA / US English). Bodies shorter than 8 bytes are treated
+  as opaque (only `body_len` is emitted); bodies longer than 8 bytes
+  tolerate the trailing region for forward compatibility. CSET coexists
+  with `LIST INFO`: a single file may carry both, and the INFO sub-IDs
+  still resolve through the existing standard-tag mapping.
 - WAV demuxer parses the `iXML` chunk (the third-party
   production-recorder metadata block catalogued in
   `docs/container/riff/metadata/exiftool-riff-tags.html` § `iXML`

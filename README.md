@@ -64,7 +64,17 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework �
   (raw on-wire chunk size, always emitted when the chunk is present
   so a NUL-padded "reserved for in-place editing" region is still
   visible to downstream tooling); bodies that are empty or entirely
-  NUL/whitespace surface only `wav:ixml.body_len`.
+  NUL/whitespace surface only `wav:ixml.body_len`. The `CSET`
+  (Character Set) chunk (RIFF MCI §3 "CSET Chunk") is parsed end-to-end:
+  `wCodePage` / `wCountryCode` / `wLanguageCode` / `wDialect` (each a
+  16-bit LE field) surface under `wav:cset.code_page` / `.country` /
+  `.language` / `.dialect`, the §3 country and `(language, dialect)`
+  tables resolve to human-readable `wav:cset.country_name` /
+  `wav:cset.language_name` keys, and `wav:cset.body_len` is always
+  emitted (so writers that extend the chunk past its canonical 8-byte
+  struct are observable). Bodies shorter than 8 bytes are treated as
+  opaque; bodies longer than 8 bytes tolerate the trailing region for
+  forward compatibility.
 - **slin** container: Asterisk-style headerless `.sln*` / `.slin*` raw
   S16LE PCM (extension drives the sample rate).
 - **Y4M (YUV4MPEG2)** container: rawvideo demuxer + muxer for `.y4m` files,
