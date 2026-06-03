@@ -9,7 +9,17 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework �
 - **PCM codecs**: `pcm_u8`, `pcm_s16le`, `pcm_s24le`, `pcm_s32le`, `pcm_f32le`,
   `pcm_f64le`.
 - **WAV** container: RIFF/WAVE demuxer + muxer with `fmt`, `data`, and
-  `LIST/INFO` metadata. Dispatches `WAVE_FORMAT_ALAW (0x0006)` /
+  the full Microsoft RIFF MCI §3 "INFO List Chunk" baseline (23 sub-IDs
+  from the 1991 spec: `IARL` → `archival_location`, `IART` → `artist`,
+  `ICMS` → `commissioned`, `ICMT` → `comment`, `ICOP` → `copyright`,
+  `ICRD` → `date`, `ICRP` → `cropped`, `IDIM` → `dimensions`, `IDPI` →
+  `dpi`, `IENG` → `engineer`, `IGNR` → `genre`, `IKEY` → `keywords`,
+  `ILGT` → `lightness`, `IMED` → `medium`, `INAM` → `title`, `IPLT` →
+  `palette_setting`, `IPRD` → `album`, `ISBJ` → `subject`, `ISFT` →
+  `encoder`, `ISHP` → `sharpness`, `ISRC` → `source`, `ISRF` →
+  `source_form`, `ITCH` → `technician`; non-baseline `ITRK` → `track`
+  retained for compatibility; unknown sub-IDs are skipped silently).
+  Dispatches `WAVE_FORMAT_ALAW (0x0006)` /
   `WAVE_FORMAT_MULAW (0x0007)` to the `pcm_alaw` / `pcm_mulaw` codecs
   (host runtime applies G.711 decode). `WAVE_FORMAT_EXTENSIBLE (0xFFFE)`
   is parsed end-to-end — the 22-byte extension's `wValidBitsPerSample`,

@@ -1010,19 +1010,72 @@ fn parse_cset_chunk(buf: &[u8], out: &mut Vec<(String, String)>) {
     }
 }
 
+/// Map a `LIST INFO` sub-chunk FOURCC to its conventional metadata-key
+/// name, covering the full Microsoft RIFF MCI §3 "INFO List Chunk"
+/// baseline (per `docs/container/riff/metadata/microsoft-riffmci.pdf`
+/// pp. 2-14 .. 2-16). The 1991 baseline registers 23 sub-IDs; this
+/// function returns the key under which each is surfaced to the
+/// caller through `Demuxer::metadata`.
+///
+/// The mapping keeps the prior short-form names for the four widely-
+/// quoted "audio tag" sub-IDs (`INAM` → `title`, `IART` → `artist`,
+/// `IPRD` → `album`, `ICMT` → `comment`, `ICRD` → `date`, `IGNR` →
+/// `genre`, `ICOP` → `copyright`, `IENG` → `engineer`, `ITCH` →
+/// `technician`, `ISFT` → `encoder`, `ISBJ` → `subject`). `IPRD`'s
+/// "album" alias is conventional rather than spec-literal — the §3
+/// description says "Product. Specifies the name of the title the
+/// file was originally intended for"; the tagging community has
+/// long re-used the field to carry album names (matching how
+/// ExifTool surfaces it).
+///
+/// The remaining baseline sub-IDs surface under spec-derived
+/// snake_case names that come straight from the §3 entries:
+///
+/// * `IARL` Archival Location → `archival_location`.
+/// * `ICMS` Commissioned → `commissioned`.
+/// * `ICRP` Cropped → `cropped`.
+/// * `IDIM` Dimensions → `dimensions`.
+/// * `IDPI` Dots Per Inch → `dpi`.
+/// * `IKEY` Keywords → `keywords`.
+/// * `ILGT` Lightness → `lightness`.
+/// * `IMED` Medium → `medium`.
+/// * `IPLT` Palette Setting → `palette_setting`.
+/// * `ISHP` Sharpness → `sharpness`.
+/// * `ISRC` Source → `source`.
+/// * `ISRF` Source Form → `source_form`.
+///
+/// `ITRK` (Track Number) is not in the §3 baseline but is the
+/// canonical non-baseline tag every WAV-handling tool surfaces; we
+/// keep it for compatibility with the existing public-API behaviour.
+/// Sub-IDs outside this set return `None`; their bytes are skipped
+/// by `parse_info_list` rather than surfaced under a synthetic key.
 fn info_id_to_key(id: &[u8; 4]) -> Option<&'static str> {
     match id {
-        b"INAM" => Some("title"),
+        // RIFF MCI §3 baseline (1991), in spec order.
+        b"IARL" => Some("archival_location"),
         b"IART" => Some("artist"),
-        b"IPRD" => Some("album"),
+        b"ICMS" => Some("commissioned"),
         b"ICMT" => Some("comment"),
-        b"ICRD" => Some("date"),
-        b"IGNR" => Some("genre"),
         b"ICOP" => Some("copyright"),
+        b"ICRD" => Some("date"),
+        b"ICRP" => Some("cropped"),
+        b"IDIM" => Some("dimensions"),
+        b"IDPI" => Some("dpi"),
         b"IENG" => Some("engineer"),
-        b"ITCH" => Some("technician"),
-        b"ISFT" => Some("encoder"),
+        b"IGNR" => Some("genre"),
+        b"IKEY" => Some("keywords"),
+        b"ILGT" => Some("lightness"),
+        b"IMED" => Some("medium"),
+        b"INAM" => Some("title"),
+        b"IPLT" => Some("palette_setting"),
+        b"IPRD" => Some("album"),
         b"ISBJ" => Some("subject"),
+        b"ISFT" => Some("encoder"),
+        b"ISHP" => Some("sharpness"),
+        b"ISRC" => Some("source"),
+        b"ISRF" => Some("source_form"),
+        b"ITCH" => Some("technician"),
+        // Non-baseline but ubiquitous in tag-writer output.
         b"ITRK" => Some("track"),
         _ => None,
     }
@@ -3640,5 +3693,202 @@ mod tests {
             fmt_guid(&GUID_MULAW),
             "00000007-0000-0010-8000-00AA00389B71"
         );
+    }
+
+    /// Build a one-entry `LIST INFO` sub-chunk header + payload for
+    /// `id` carrying the ASCII text `text` plus a single NUL terminator.
+    /// Used by the §3 baseline-coverage tests below to feed one INFO
+    /// sub-ID at a time through the demuxer.
+    fn info_subchunk(id: &[u8; 4], text: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(id);
+        // Payload = text bytes + 1 NUL terminator (the §3 ZSTR form).
+        let payload_len = text.len() + 1;
+        out.extend_from_slice(&(payload_len as u32).to_le_bytes());
+        out.extend_from_slice(text.as_bytes());
+        out.push(0);
+        // Word-align the sub-chunk to the next even boundary, per the
+        // RIFF padding rule (§2 "Chunks": "Padding, if present, is not
+        // included in `ckSize`.").
+        if payload_len % 2 == 1 {
+            out.push(0);
+        }
+        out
+    }
+
+    /// Build a minimal valid WAV file whose `LIST INFO` chunk carries
+    /// the supplied per-sub-ID payloads. Empty `data` keeps the file
+    /// short; `fmt ` is PCM-S16 mono so the demuxer accepts it.
+    fn wav_with_info_entries(entries: &[(&[u8; 4], &str)]) -> Vec<u8> {
+        let mut list_body = Vec::new();
+        list_body.extend_from_slice(b"INFO");
+        for (id, text) in entries {
+            list_body.extend_from_slice(&info_subchunk(id, text));
+        }
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"RIFF");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(b"WAVE");
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&16u32.to_le_bytes());
+        buf.extend_from_slice(&FMT_PCM.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&8_000u32.to_le_bytes());
+        buf.extend_from_slice(&16_000u32.to_le_bytes());
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(&16u16.to_le_bytes());
+        buf.extend_from_slice(b"LIST");
+        buf.extend_from_slice(&(list_body.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&list_body);
+        buf.extend_from_slice(b"data");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf
+    }
+
+    /// Every Microsoft RIFF MCI §3 INFO List Chunk baseline sub-ID (the
+    /// 23 entries on pp. 2-14 to 2-16) round-trips through
+    /// `parse_info_list` to its conventional key name. Spec text per
+    /// `docs/container/riff/metadata/microsoft-riffmci.pdf`.
+    #[test]
+    fn info_list_full_baseline_round_trip() {
+        // One representative payload per sub-ID, mirroring the §3
+        // example phrasing where the spec gives one.
+        let entries: &[(&[u8; 4], &str)] = &[
+            (b"IARL", "Library of Congress"),
+            (b"IART", "Michaelangelo"),
+            (b"ICMS", "Pope Julian II"),
+            (b"ICMT", "General comment."),
+            (b"ICOP", "Copyright Encyclopedia International 1991"),
+            (b"ICRD", "1553-05-03"),
+            (b"ICRP", "lower right corner"),
+            (b"IDIM", "8.5 in h, 11 in w"),
+            (b"IDPI", "300"),
+            (b"IENG", "Smith, John; Adams, Joe"),
+            (b"IGNR", "landscape"),
+            (b"IKEY", "Seattle; aerial view; scenery"),
+            (b"ILGT", "+10"),
+            (b"IMED", "lithograph"),
+            (b"INAM", "Seattle From Above"),
+            (b"IPLT", "256"),
+            (b"IPRD", "Encyclopedia of Pacific Northwest Geography"),
+            (b"ISBJ", "Aerial view of Seattle"),
+            (b"ISFT", "Microsoft WaveEdit"),
+            (b"ISHP", "+5"),
+            (b"ISRC", "Trey Research"),
+            (b"ISRF", "slide"),
+            (b"ITCH", "Smith, John"),
+        ];
+
+        let bytes = wav_with_info_entries(entries);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+
+        // The expected key for each baseline sub-ID. Order matches
+        // `entries` so a failure points at the offending FOURCC.
+        let expected: &[(&str, &str)] = &[
+            ("archival_location", "Library of Congress"),
+            ("artist", "Michaelangelo"),
+            ("commissioned", "Pope Julian II"),
+            ("comment", "General comment."),
+            ("copyright", "Copyright Encyclopedia International 1991"),
+            ("date", "1553-05-03"),
+            ("cropped", "lower right corner"),
+            ("dimensions", "8.5 in h, 11 in w"),
+            ("dpi", "300"),
+            ("engineer", "Smith, John; Adams, Joe"),
+            ("genre", "landscape"),
+            ("keywords", "Seattle; aerial view; scenery"),
+            ("lightness", "+10"),
+            ("medium", "lithograph"),
+            ("title", "Seattle From Above"),
+            ("palette_setting", "256"),
+            ("album", "Encyclopedia of Pacific Northwest Geography"),
+            ("subject", "Aerial view of Seattle"),
+            ("encoder", "Microsoft WaveEdit"),
+            ("sharpness", "+5"),
+            ("source", "Trey Research"),
+            ("source_form", "slide"),
+            ("technician", "Smith, John"),
+        ];
+        for (key, value) in expected {
+            assert_eq!(
+                md.get(*key),
+                Some(&(*value).to_string()),
+                "INFO key {key:?} missing or wrong; got {:?}",
+                md.get(*key)
+            );
+        }
+    }
+
+    /// Each pre-r221 INFO sub-ID still maps to the same conventional
+    /// key — the §3 baseline expansion does not perturb the four
+    /// widely-quoted audio-tag aliases (`title`, `artist`, `album`,
+    /// `comment`, `genre`, `copyright`, `engineer`, `technician`,
+    /// `encoder`, `subject`, `date`) or the `track` extension.
+    #[test]
+    fn info_id_to_key_legacy_aliases_preserved() {
+        assert_eq!(info_id_to_key(b"INAM"), Some("title"));
+        assert_eq!(info_id_to_key(b"IART"), Some("artist"));
+        assert_eq!(info_id_to_key(b"IPRD"), Some("album"));
+        assert_eq!(info_id_to_key(b"ICMT"), Some("comment"));
+        assert_eq!(info_id_to_key(b"ICRD"), Some("date"));
+        assert_eq!(info_id_to_key(b"IGNR"), Some("genre"));
+        assert_eq!(info_id_to_key(b"ICOP"), Some("copyright"));
+        assert_eq!(info_id_to_key(b"IENG"), Some("engineer"));
+        assert_eq!(info_id_to_key(b"ITCH"), Some("technician"));
+        assert_eq!(info_id_to_key(b"ISFT"), Some("encoder"));
+        assert_eq!(info_id_to_key(b"ISBJ"), Some("subject"));
+        assert_eq!(info_id_to_key(b"ITRK"), Some("track"));
+    }
+
+    /// Every §3 baseline sub-ID resolves to `Some` and every unknown
+    /// FOURCC resolves to `None`. The `Some` branch is sufficient for
+    /// the FOURCC-typo regression guard the round-trip test does not
+    /// catch (a misspelt `b"IRAL"` for `IARL` would silently lose
+    /// data otherwise).
+    #[test]
+    fn info_id_to_key_baseline_completeness() {
+        const BASELINE: &[&[u8; 4]] = &[
+            b"IARL", b"IART", b"ICMS", b"ICMT", b"ICOP", b"ICRD", b"ICRP", b"IDIM", b"IDPI",
+            b"IENG", b"IGNR", b"IKEY", b"ILGT", b"IMED", b"INAM", b"IPLT", b"IPRD", b"ISBJ",
+            b"ISFT", b"ISHP", b"ISRC", b"ISRF", b"ITCH",
+        ];
+        for id in BASELINE {
+            assert!(
+                info_id_to_key(id).is_some(),
+                "baseline INFO sub-ID {:?} missing from info_id_to_key",
+                std::str::from_utf8(*id).unwrap()
+            );
+        }
+        // Negative: a definitely-unregistered FOURCC.
+        assert_eq!(info_id_to_key(b"ZZZZ"), None);
+        // Negative: easy typo of IARL.
+        assert_eq!(info_id_to_key(b"IRAL"), None);
+    }
+
+    /// A `LIST INFO` chunk that contains an unknown sub-ID alongside
+    /// known ones — the unknown sub-ID is skipped without disturbing
+    /// the known ones' surfacing. Regression guard for the
+    /// "skip-unknown" branch in `parse_info_list`.
+    #[test]
+    fn info_list_unknown_subchunk_is_skipped() {
+        let entries: &[(&[u8; 4], &str)] = &[
+            (b"INAM", "Title"),
+            // `IZZZ` is not in the §3 baseline; the parser drops its
+            // bytes silently.
+            (b"IZZZ", "ignored"),
+            (b"IART", "Artist"),
+        ];
+        let bytes = wav_with_info_entries(entries);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("title"), Some(&"Title".to_string()));
+        assert_eq!(md.get("artist"), Some(&"Artist".to_string()));
+        // No synthetic key created for the unknown FOURCC.
+        assert!(md
+            .keys()
+            .all(|k| !k.contains("IZZZ") && !k.contains("izzz")));
     }
 }

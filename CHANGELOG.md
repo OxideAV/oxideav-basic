@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- WAV demuxer now resolves the complete Microsoft RIFF MCI §3 "INFO
+  List Chunk" baseline — all 23 sub-IDs registered by the 1991 spec
+  per `docs/container/riff/metadata/microsoft-riffmci.pdf` pp. 2-14
+  to 2-16. The eleven previously-handled sub-IDs (`INAM`, `IART`,
+  `IPRD`, `ICMT`, `ICRD`, `IGNR`, `ICOP`, `IENG`, `ITCH`, `ISFT`,
+  `ISBJ`) keep their conventional short-form key names; the twelve
+  additions surface under spec-derived snake_case names: `IARL` →
+  `archival_location`, `ICMS` → `commissioned`, `ICRP` → `cropped`,
+  `IDIM` → `dimensions`, `IDPI` → `dpi`, `IKEY` → `keywords`,
+  `ILGT` → `lightness`, `IMED` → `medium`, `IPLT` →
+  `palette_setting`, `ISHP` → `sharpness`, `ISRC` → `source`,
+  `ISRF` → `source_form`. The non-baseline `ITRK` → `track`
+  extension is retained for compatibility with the tag-writer
+  ecosystem. Unknown sub-IDs are skipped silently rather than
+  synthesised into ad-hoc keys, matching the §3 forward-compatibility
+  rule that "new chunks may be defined".
 - WAV demuxer parses the `CSET` (Character Set) chunk per
   `docs/container/riff/metadata/microsoft-riffmci.pdf` §3
   "CSET (Character Set) Chunk". The canonical 8-byte body carries four
