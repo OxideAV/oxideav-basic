@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/OxideAV/oxideav-basic/compare/v0.0.8...v0.0.9) - 2026-06-03
+
+### Other
+
+- RF64 / BW64 64-bit-extended file support + ds64 chunk parser
+- full RIFF MCI §3 INFO List Chunk baseline (12 added sub-IDs)
+- parse CSET (Character Set) chunk per Microsoft RIFF MCI §3
+- parse iXML chunk — third-party production-recorder metadata
+- parse fact chunk (RIFF MCI §3) — authoritative per-channel sample count
+
 ### Added
 
 - WAV demuxer accepts the EBU Tech 3306 `RF64` / ITU-R BS.2088 `BW64`
