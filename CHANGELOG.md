@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- WAV demuxer recognises the `RF64` and `BW64` top-level form magics
+  (EBU Tech 3306 v1 §3 and ITU-R BS.2088 / EBU Tech 3306 v2) and
+  parses the mandatory `ds64` chunk that follows. The 28-byte fixed
+  prefix decodes the 64-bit `riffSize`, `dataSize` and `sampleCount`
+  overrides plus a `tableLength` count of `(chunkId, chunkSize64)`
+  records — the optional table of per-chunk-ID 64-bit size overrides
+  for any non-`data` chunk that exceeds 4 GiB. When a chunk's 32-bit
+  on-wire size carries the `0xFFFFFFFF` sentinel the demuxer promotes
+  it to 64-bit via the dedicated `ds64.dataSize` (for `data`) or the
+  `ds64.table` lookup (for any other FOURCC). The legacy
+  `fact.dwFileSize` is likewise promoted to `ds64.sampleCount` when
+  it carries the sentinel. Surfaced under `wav:rf64.magic`,
+  `wav:rf64.riff_size`, `wav:rf64.data_size`, `wav:rf64.sample_count`,
+  `wav:rf64.table.count`, per-entry `wav:rf64.table.<i>.id` /
+  `.size`, and `wav:rf64.body_len`. Five new tests cover the RF64
+  ds64-promoted PCM path, the BW64 magic accepted on the same path,
+  the non-`data` table-lookup path through a `LIST INFO` whose size
+  is the sentinel, a sentinel-without-`ds64` rejection, and a
+  short-body `ds64` rejection.
 - WAV demuxer now resolves the complete Microsoft RIFF MCI §3 "INFO
   List Chunk" baseline — all 23 sub-IDs registered by the 1991 spec
   per `docs/container/riff/metadata/microsoft-riffmci.pdf` pp. 2-14

@@ -8,7 +8,9 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework �
 
 - **PCM codecs**: `pcm_u8`, `pcm_s16le`, `pcm_s24le`, `pcm_s32le`, `pcm_f32le`,
   `pcm_f64le`.
-- **WAV** container: RIFF/WAVE demuxer + muxer with `fmt`, `data`, and
+- **WAV** container: RIFF/WAVE (plus EBU Tech 3306 / ITU-R BS.2088
+  `RF64` and `BW64` 64-bit-extended forms) demuxer + muxer with
+  `fmt`, `data`, and
   the full Microsoft RIFF MCI §3 "INFO List Chunk" baseline (23 sub-IDs
   from the 1991 spec: `IARL` → `archival_location`, `IART` → `artist`,
   `ICMS` → `commissioned`, `ICMT` → `comment`, `ICOP` → `copyright`,
@@ -84,7 +86,23 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework �
   emitted (so writers that extend the chunk past its canonical 8-byte
   struct are observable). Bodies shorter than 8 bytes are treated as
   opaque; bodies longer than 8 bytes tolerate the trailing region for
-  forward compatibility.
+  forward compatibility. When the top-level magic is `RF64` or `BW64`
+  (the latter signalling an ADM-carrying file per ITU-R BS.2088) the
+  demuxer expects a mandatory `ds64` chunk immediately after `WAVE`
+  per EBU Tech 3306 §3 and Annex A.2. The 28-byte fixed prefix carries
+  the 64-bit `riffSize`, `dataSize` and `sampleCount` overrides plus
+  a `tableLength` count for an optional array of
+  `(chunkId, chunkSize64)` records describing other non-`data` chunks
+  that exceed 4 GiB. The 32-bit on-wire size field on any chunk may
+  be the `0xFFFFFFFF` sentinel — `data` is promoted via the dedicated
+  `dataSize` field, other chunk-IDs via the table lookup. Surfaces
+  `wav:rf64.magic` (`RF64`/`BW64`), `wav:rf64.riff_size`,
+  `wav:rf64.data_size`, `wav:rf64.sample_count`,
+  `wav:rf64.table.count` plus per-entry `wav:rf64.table.<i>.id` /
+  `.size` and `wav:rf64.body_len`. A sentinel without a `ds64`
+  override is rejected as malformed; a `ds64` body shorter than 28
+  bytes is rejected. The 32-bit legacy `fact.dwFileSize` is promoted
+  to the 64-bit `ds64.sampleCount` when it carries the sentinel.
 - **slin** container: Asterisk-style headerless `.sln*` / `.slin*` raw
   S16LE PCM (extension drives the sample rate).
 - **Y4M (YUV4MPEG2)** container: rawvideo demuxer + muxer for `.y4m` files,
