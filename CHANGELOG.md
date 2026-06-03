@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- WAV demuxer accepts the EBU Tech 3306 `RF64` / ITU-R BS.2088 `BW64`
+  top-level magic and parses the mandatory `ds64` chunk per
+  `docs/container/riff/metadata/ebu-tech3306-v1.pdf` §A.2 ("Data Size
+  64 chunk"). The 28-byte fixed prefix carries the 64-bit `riffSize`
+  / `dataSize` / `sampleCount` fields that replace the 32-bit RIFF
+  size, the `data` chunk size and the `fact` per-channel sample
+  count when those fields are set to the `0xFFFFFFFF` sentinel
+  (§3.4 "If the 32-bit value in the field is -1 the 64-bit value in
+  the `ds64` chunk is used instead"); the optional `tableLength × 12`
+  byte table provides per-chunk 64-bit size overrides for any
+  non-`data` chunk that exceeds 4 GiB. The `ds64.sampleCount` becomes
+  the authoritative `StreamInfo::duration` (full 64-bit, can exceed
+  `u32::MAX`). The demuxer surfaces the ds64 fields verbatim under
+  `wav:ds64.form` / `.riff_size` / `.data_size` / `.sample_count` /
+  `.table_length` / `.body_len`, plus a higher-level summary under
+  `wav:rf64.form` / `.riff_size` / `.data_size` / `.sample_count` and
+  per-table-entry `wav:rf64.table.<n>.id` / `.size` keys. A ds64
+  chunk riding a plain `RIFF` file (forward-compat noise from a
+  recorder that emitted `ds64` ahead of crossing the 4 GiB boundary
+  but ultimately stayed under it) is treated as opaque so the
+  sentinel-substitution path is NOT erroneously activated for plain
+  RIFF/WAVE streams. A missing `ds64` in an RF64/BW64 file whose
+  `data` size is the sentinel is rejected with
+  `Error::invalid("RF64 data chunk size sentinel without ds64
+  chunk")`; a `ds64` body shorter than the 28-byte fixed prefix is
+  rejected per Annex A. The probe function (`fn probe`) now accepts
+  `RF64` / `BW64` form magic with the same priority-100 confidence
+  as `RIFF` when the WAVE form-type follows.
 - WAV demuxer now resolves the complete Microsoft RIFF MCI §3 "INFO
   List Chunk" baseline — all 23 sub-IDs registered by the 1991 spec
   per `docs/container/riff/metadata/microsoft-riffmci.pdf` pp. 2-14

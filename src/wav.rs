@@ -48,17 +48,43 @@ pub fn register(reg: &mut ContainerRegistry) {
     reg.register_probe("wav", probe);
 }
 
-/// `RIFF....WAVE` — unambiguous when present.
+/// `RIFF....WAVE` — unambiguous when present. Also matches the EBU
+/// RF64 / BW64 64-bit-extended variants per
+/// `docs/container/riff/metadata/ebu-tech3306-v1.pdf` §3 ("Definition
+/// of a New Format, RF64") and `ebu-tech3306-v2.pdf` §2 (the ITU-R
+/// BS.2088 `BW64` adoption) — both keep the `WAVE` form type and only
+/// substitute the top-level magic to signal "size fields may be the
+/// `0xFFFFFFFF` sentinel; consult the mandatory `ds64` chunk".
 fn probe(p: &oxideav_core::ProbeData) -> u8 {
     if p.buf.len() < 12 {
         return 0;
     }
-    if &p.buf[0..4] == b"RIFF" && &p.buf[8..12] == b"WAVE" {
-        100
-    } else {
-        0
+    if &p.buf[8..12] != b"WAVE" {
+        return 0;
+    }
+    match &p.buf[0..4] {
+        b"RIFF" | b"RF64" | b"BW64" => 100,
+        _ => 0,
     }
 }
+
+/// RF64 / BW64 top-level magic per `docs/container/riff/metadata/
+/// ebu-tech3306-v1.pdf` §3 ("RF64 identifying MBWF file exceeding 4
+/// Gbyte"). When the top-level magic is one of these, the RIFF
+/// chunk-size and the `data` chunk-size are allowed to be the
+/// sentinel `0xFFFFFFFF` and the real 64-bit values come from the
+/// mandatory `ds64` chunk that immediately follows.
+const FORM_RF64: &[u8; 4] = b"RF64";
+/// Alternative ITU-R BS.2088 magic — the BW64 form. Identical layout
+/// to RF64; the BW64 spelling signals an ADM-carrying file (see EBU
+/// Tech 3306 v2 §2).
+const FORM_BW64: &[u8; 4] = b"BW64";
+/// The 32-bit sentinel that a top-level RIFF size, a `data` chunk
+/// size, or a `fact` sample count uses to signal "real 64-bit value
+/// in `ds64`" — per EBU Tech 3306 v1 §3 ("If the 32-bit value in the
+/// field is -1 (= FFFFFFFF hex) the 64-bit value in the `ds64` chunk
+/// is used instead").
+const RF64_SIZE_SENTINEL: u32 = 0xFFFF_FFFF;
 
 // On-the-wire `wFormatTag` constants from RFC 2361 / `mmreg.h`. Public so
 // muxer callers can build `WAVE_FORMAT_EXTENSIBLE` streams against the
@@ -129,9 +155,12 @@ fn open_demuxer(
 ) -> Result<Box<dyn Demuxer>> {
     let mut hdr = [0u8; 12];
     input.read_exact(&mut hdr)?;
-    if &hdr[0..4] != b"RIFF" || &hdr[8..12] != b"WAVE" {
+    let form_magic: [u8; 4] = [hdr[0], hdr[1], hdr[2], hdr[3]];
+    let is_rf64 = &form_magic == FORM_RF64 || &form_magic == FORM_BW64;
+    if (&hdr[0..4] != b"RIFF" && !is_rf64) || &hdr[8..12] != b"WAVE" {
         return Err(Error::invalid("not a RIFF/WAVE file"));
     }
+    let riff_size_32 = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
 
     // Walk chunks until we hit "data"; parse "fmt " and "LIST" along the way.
     let mut fmt: Option<WaveFmt> = None;
@@ -142,14 +171,69 @@ fn open_demuxer(
     // Chunk" — the only honest sample count when `block_align *
     // total_samples != data_size`.
     let mut fact_sample_count: Option<u32> = None;
+    // EBU Tech 3306 `ds64` 64-bit-extension table when the form magic is
+    // `RF64` / `BW64`. The 28-byte fixed prefix replaces three 32-bit
+    // RIFF fields whose on-wire value has been set to the sentinel
+    // `0xFFFFFFFF`; the optional table[] carries per-chunk 64-bit size
+    // overrides for any non-`data` chunk that exceeds 4 GiB (Annex A.2:
+    // "currently, no standard chunk type other than `data` is likely to
+    // exceed a size of 4 Gbyte").
+    let mut ds64: Option<Ds64Info> = None;
     let data_offset: u64;
     let data_size: u64;
     loop {
         let mut chdr = [0u8; 8];
         input.read_exact(&mut chdr)?;
         let id = &chdr[0..4];
-        let size = u32::from_le_bytes([chdr[4], chdr[5], chdr[6], chdr[7]]) as u64;
+        let id_owned: [u8; 4] = [id[0], id[1], id[2], id[3]];
+        let on_wire_size = u32::from_le_bytes([chdr[4], chdr[5], chdr[6], chdr[7]]);
+        // Per EBU Tech 3306 §3.4: any chunk whose on-wire size is the
+        // sentinel `0xFFFFFFFF` and whose chunk-id appears in the ds64
+        // table[] gets its real size from the table entry. The `data`
+        // chunk is special-cased: its 64-bit size lives in the ds64
+        // fixed prefix (`dataSize`), not in the table.
+        let size: u64 = if on_wire_size == RF64_SIZE_SENTINEL {
+            if &id_owned == b"data" {
+                match ds64.as_ref() {
+                    Some(d) => d.data_size,
+                    None => {
+                        return Err(Error::invalid(
+                            "RF64 data chunk size sentinel without ds64 chunk",
+                        ));
+                    }
+                }
+            } else {
+                // Honour a per-chunk table override; otherwise fall back
+                // to the literal 4 GiB-minus-1 (caller used the sentinel
+                // value as a real size — unusual but legal under §3.4
+                // for chunks not actually overflowing 32 bits).
+                ds64.as_ref()
+                    .and_then(|d| d.table_size_for(&id_owned))
+                    .unwrap_or(on_wire_size as u64)
+            }
+        } else {
+            on_wire_size as u64
+        };
         match id {
+            b"ds64" => {
+                // ds64 is mandatory under the RF64/BW64 form (Annex A:
+                // "this chunk has to be the first chunk after the RF64
+                // chunk"). We accept it in a flexible position to
+                // tolerate non-conformant writers, but only honour it
+                // when the top-level form magic actually signalled
+                // RF64/BW64 — a `ds64` body riding a plain RIFF file is
+                // silently skipped because the §3 sentinel-substitution
+                // rule wouldn't apply anyway.
+                let mut buf = vec![0u8; size as usize];
+                input.read_exact(&mut buf)?;
+                if is_rf64 {
+                    let parsed = parse_ds64_chunk(&buf, &form_magic, &mut metadata)?;
+                    ds64 = Some(parsed);
+                }
+                if size % 2 == 1 {
+                    input.seek(SeekFrom::Current(1))?;
+                }
+            }
             b"fmt " => {
                 let mut buf = vec![0u8; size as usize];
                 input.read_exact(&mut buf)?;
@@ -162,6 +246,21 @@ fn open_demuxer(
                 let mut buf = vec![0u8; size as usize];
                 input.read_exact(&mut buf)?;
                 fact_sample_count = parse_fact_chunk(&buf, &mut metadata);
+                // RF64/BW64 sample-count override per EBU Tech 3306 §3.4:
+                // a `fact` `dwFileSize` of `0xFFFFFFFF` defers to
+                // `ds64.sampleCount`. The §3 wording is "If the 32-bit
+                // value in the field is -1 the 64-bit value in the
+                // `ds64` chunk is used instead" — for the per-channel
+                // sample count the `0` sentinel and a literal `0xFFFFFFFF`
+                // both signal "use ds64".
+                if let Some(d) = ds64.as_ref() {
+                    if matches!(fact_sample_count, Some(RF64_SIZE_SENTINEL) | None) {
+                        // Truncate to u32 only for downstream
+                        // bookkeeping; `total_samples` below picks up the
+                        // full 64-bit value through `ds64.sample_count`.
+                        fact_sample_count = Some(d.sample_count.min(u32::MAX as u64) as u32);
+                    }
+                }
                 if size % 2 == 1 {
                     input.seek(SeekFrom::Current(1))?;
                 }
@@ -256,14 +355,35 @@ fn open_demuxer(
     let time_base = TimeBase::new(1, fmt.sample_rate as i64);
     let block_align = fmt.block_align.max(1) as u64;
     let block_samples = data_size / block_align;
-    // Prefer the `fact` chunk's per-channel sample count when present —
-    // for compressed WAV streams (and for `wavl LIST` containers in
-    // general) the `data_size / block_align` heuristic is meaningless
-    // because one byte of payload no longer maps to one sample. For PCM
-    // the two should agree; when they don't we surface
-    // `wav:fact.mismatch` so a downstream tool can flag the file rather
-    // than silently trusting one number over the other.
-    let total_samples = if let Some(fc) = fact_sample_count {
+    // Prefer the `ds64.sampleCount` for RF64/BW64 files (full 64-bit;
+    // can exceed `u32::MAX`); fall back to the `fact` chunk's 32-bit
+    // `dwFileSize` when present, and finally to the
+    // `data_size / block_align` heuristic. The heuristic is meaningless
+    // for compressed WAV streams (one byte of payload no longer maps
+    // to one sample); a mismatch between the heuristic and an
+    // authoritative count surfaces under `wav:fact.mismatch` so a
+    // downstream tool can flag the file rather than silently trusting
+    // one number over the other.
+    let total_samples = if let Some(d) = ds64.as_ref() {
+        if d.sample_count != 0 && d.sample_count != block_samples {
+            metadata.push((
+                "wav:fact.mismatch".to_string(),
+                format!(
+                    "block_samples={block_samples} fact_samples={}",
+                    d.sample_count
+                ),
+            ));
+        }
+        // ds64.sampleCount of 0 with a non-empty `data` chunk means the
+        // writer hasn't filled the field — fall back to the heuristic
+        // (matches what a libsndfile-written PCM RF64 file does for
+        // PCM-only streams where the count is reconstructable).
+        if d.sample_count != 0 {
+            d.sample_count
+        } else {
+            block_samples
+        }
+    } else if let Some(fc) = fact_sample_count {
         if fc as u64 != block_samples {
             metadata.push((
                 "wav:fact.mismatch".to_string(),
@@ -274,6 +394,36 @@ fn open_demuxer(
     } else {
         block_samples
     };
+    // Surface the top-level form-magic + the resolved 64-bit RIFF size
+    // for RF64/BW64 streams. The 32-bit on-wire RIFF size is the
+    // sentinel for ds64-driven streams; for a non-overflowing file the
+    // writer may legitimately keep the 32-bit value and skip the ds64
+    // override, so we surface both here.
+    if is_rf64 {
+        let form_str = std::str::from_utf8(&form_magic).unwrap_or("?");
+        metadata.push(("wav:rf64.form".to_string(), form_str.to_string()));
+        let riff_size_64 = match ds64.as_ref() {
+            Some(d) if riff_size_32 == RF64_SIZE_SENTINEL => d.riff_size,
+            _ => riff_size_32 as u64,
+        };
+        metadata.push(("wav:rf64.riff_size".to_string(), riff_size_64.to_string()));
+        if let Some(d) = ds64.as_ref() {
+            metadata.push(("wav:rf64.data_size".to_string(), d.data_size.to_string()));
+            metadata.push((
+                "wav:rf64.sample_count".to_string(),
+                d.sample_count.to_string(),
+            ));
+            for (n, (id, sz)) in d.table.iter().enumerate() {
+                let id_text = std::str::from_utf8(id)
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|_| {
+                        format!("0x{:02X}{:02X}{:02X}{:02X}", id[0], id[1], id[2], id[3])
+                    });
+                metadata.push((format!("wav:rf64.table.{n}.id"), id_text));
+                metadata.push((format!("wav:rf64.table.{n}.size"), sz.to_string()));
+            }
+        }
+    }
     let duration_micros: i64 = if fmt.sample_rate > 0 {
         (total_samples as i128 * 1_000_000 / fmt.sample_rate as i128) as i64
     } else {
@@ -758,6 +908,127 @@ fn parse_inst_chunk(buf: &[u8], out: &mut Vec<(String, String)>) {
         "wav:inst.high_velocity".to_string(),
         high_velocity.to_string(),
     ));
+}
+
+/// Parsed `ds64` chunk per EBU Tech 3306 v1 §A.2 "Data Size 64
+/// chunk" — the 28-byte fixed prefix (`riffSize` / `dataSize` /
+/// `sampleCount` low+high `DWORD` pairs + `tableLength`) followed by
+/// `tableLength × 12` bytes of per-chunk 64-bit size overrides for
+/// any non-`data` chunk that exceeds 4 GiB.
+///
+/// The struct stores the three primary 64-bit fields plus the table
+/// as `(chunkId, size)` tuples; the demuxer consults it twice: once
+/// up-front for `data`-chunk size override (the §3 fixed prefix) and
+/// again per non-`data` chunk during the walk when the on-wire 32-bit
+/// size is the `0xFFFFFFFF` sentinel (the §3.4 table lookup).
+#[derive(Debug, Default, Clone)]
+struct Ds64Info {
+    riff_size: u64,
+    data_size: u64,
+    sample_count: u64,
+    /// Per-chunk 64-bit override table — `(chunk_id, size)` entries.
+    /// Empty in the common case (only `data` exceeds 4 GiB until the
+    /// `data` chunk crosses ~512 GiB per Annex A.2: "no standard chunk
+    /// type other than `data` is likely to exceed a size of 4 Gbyte").
+    table: Vec<([u8; 4], u64)>,
+}
+
+impl Ds64Info {
+    /// Look up the 64-bit size for `chunk_id` in the optional override
+    /// table. Returns `None` if the id is not present (the demuxer
+    /// falls back to the on-wire 32-bit value).
+    fn table_size_for(&self, chunk_id: &[u8; 4]) -> Option<u64> {
+        self.table
+            .iter()
+            .find(|(id, _)| id == chunk_id)
+            .map(|(_, sz)| *sz)
+    }
+}
+
+/// Parse a `ds64` chunk body per EBU Tech 3306 v1 §A.2 and surface
+/// every field through `Demuxer::metadata`. The chunk MUST be the
+/// first chunk after the `RF64`/`BW64` form header per §3 ("The
+/// `ds64` chunk has to be the first chunk after the `RF64` chunk");
+/// callers can substitute a `JUNK` chunk of identical size at file-
+/// creation time and rewrite it to `ds64` once the recording
+/// crosses the 4 GiB boundary (§3.5 "Achieving compatibility").
+///
+/// Layout (little-endian, all integers):
+///
+/// ```text
+/// riffSizeLow   : u32   } riffSize_64 = (high << 32) | low
+/// riffSizeHigh  : u32   }
+/// dataSizeLow   : u32   } dataSize_64
+/// dataSizeHigh  : u32   }
+/// sampleCountLow  : u32 } sampleCount_64
+/// sampleCountHigh : u32 }
+/// tableLength   : u32   (count of 12-byte ChunkSize64 entries)
+/// table         : ChunkSize64[tableLength]
+///   ChunkSize64 = { chunkId: [u8; 4]; chunkSizeLow: u32; chunkSizeHigh: u32 }
+/// ```
+///
+/// Surface keys:
+///
+/// - `wav:ds64.riff_size` / `.data_size` / `.sample_count` — the three
+///   64-bit fields as decimal strings.
+/// - `wav:ds64.table_length` — declared table entry count.
+/// - `wav:ds64.body_len` — total chunk-body length, always emitted so
+///   downstream tooling can spot writers that pad the chunk past the
+///   declared `tableLength × 12` (the §3 ds64-as-resized-JUNK case).
+///
+/// Bodies shorter than the 28-byte fixed prefix are rejected (the
+/// chunk is mandatory and the prefix is the contract; a writer that
+/// emits less is signalling a corrupt file rather than a forward-
+/// compatible extension). A declared `tableLength` that exceeds the
+/// chunk body is clamped to the entries that actually fit.
+fn parse_ds64_chunk(
+    buf: &[u8],
+    form_magic: &[u8; 4],
+    out: &mut Vec<(String, String)>,
+) -> Result<Ds64Info> {
+    if buf.len() < 28 {
+        return Err(Error::invalid("ds64 chunk shorter than 28-byte prefix"));
+    }
+    let riff_size = u64::from(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]))
+        | (u64::from(u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]])) << 32);
+    let data_size = u64::from(u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]))
+        | (u64::from(u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]])) << 32);
+    let sample_count = u64::from(u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]))
+        | (u64::from(u32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]])) << 32);
+    let table_length = u32::from_le_bytes([buf[24], buf[25], buf[26], buf[27]]) as usize;
+    let mut table = Vec::with_capacity(table_length.min((buf.len().saturating_sub(28)) / 12));
+    let mut i = 28usize;
+    let mut declared = table_length;
+    while declared > 0 && i + 12 <= buf.len() {
+        let id: [u8; 4] = [buf[i], buf[i + 1], buf[i + 2], buf[i + 3]];
+        let lo = u32::from_le_bytes([buf[i + 4], buf[i + 5], buf[i + 6], buf[i + 7]]);
+        let hi = u32::from_le_bytes([buf[i + 8], buf[i + 9], buf[i + 10], buf[i + 11]]);
+        let sz = u64::from(lo) | (u64::from(hi) << 32);
+        table.push((id, sz));
+        i += 12;
+        declared -= 1;
+    }
+    out.push((
+        "wav:ds64.form".to_string(),
+        std::str::from_utf8(form_magic).unwrap_or("?").to_string(),
+    ));
+    out.push(("wav:ds64.riff_size".to_string(), riff_size.to_string()));
+    out.push(("wav:ds64.data_size".to_string(), data_size.to_string()));
+    out.push((
+        "wav:ds64.sample_count".to_string(),
+        sample_count.to_string(),
+    ));
+    out.push((
+        "wav:ds64.table_length".to_string(),
+        table_length.to_string(),
+    ));
+    out.push(("wav:ds64.body_len".to_string(), buf.len().to_string()));
+    Ok(Ds64Info {
+        riff_size,
+        data_size,
+        sample_count,
+        table,
+    })
 }
 
 /// Parse a `fact` chunk body per
@@ -3890,5 +4161,368 @@ mod tests {
         assert!(md
             .keys()
             .all(|k| !k.contains("IZZZ") && !k.contains("izzz")));
+    }
+
+    /// Build a minimal `RF64` / `BW64` file with a `ds64` chunk
+    /// declaring the supplied 64-bit `data_size` and `sample_count`,
+    /// followed by a PCM-S16 mono `fmt ` chunk and a `data` chunk of
+    /// the actual bytes given. Used by the RF64 tests below to
+    /// exercise the ds64-override and form-magic paths without needing
+    /// a multi-gibibyte fixture on disk.
+    ///
+    /// `riff_size_field` controls the on-wire 32-bit RIFF-size value
+    /// (caller passes `RF64_SIZE_SENTINEL` to drive the §3.4 "use
+    /// ds64" branch). `data_size_field` is the 32-bit `data` chunk
+    /// size on the wire (same sentinel convention).
+    fn rf64_with_ds64(
+        form: &[u8; 4],
+        riff_size_field: u32,
+        data_size_field: u32,
+        ds64_data_size: u64,
+        ds64_sample_count: u64,
+        data_bytes: &[u8],
+        table: &[([u8; 4], u64)],
+    ) -> Vec<u8> {
+        let mut buf = Vec::new();
+        // RF64 / BW64 header
+        buf.extend_from_slice(form);
+        buf.extend_from_slice(&riff_size_field.to_le_bytes());
+        buf.extend_from_slice(b"WAVE");
+
+        // ds64 chunk (28-byte fixed + N × 12-byte table)
+        buf.extend_from_slice(b"ds64");
+        let body_len: u32 = 28 + (table.len() as u32) * 12;
+        buf.extend_from_slice(&body_len.to_le_bytes());
+        // riffSize: real value the receiver computes once the wave file
+        // is closed. For the test we provide whatever the caller pinned.
+        let riff_size_64: u64 = 0;
+        buf.extend_from_slice(&(riff_size_64 as u32).to_le_bytes());
+        buf.extend_from_slice(&((riff_size_64 >> 32) as u32).to_le_bytes());
+        buf.extend_from_slice(&(ds64_data_size as u32).to_le_bytes());
+        buf.extend_from_slice(&((ds64_data_size >> 32) as u32).to_le_bytes());
+        buf.extend_from_slice(&(ds64_sample_count as u32).to_le_bytes());
+        buf.extend_from_slice(&((ds64_sample_count >> 32) as u32).to_le_bytes());
+        buf.extend_from_slice(&(table.len() as u32).to_le_bytes());
+        for (id, sz) in table {
+            buf.extend_from_slice(id);
+            buf.extend_from_slice(&(*sz as u32).to_le_bytes());
+            buf.extend_from_slice(&((*sz >> 32) as u32).to_le_bytes());
+        }
+
+        // fmt  (PCM-S16 mono @ 8 kHz)
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&16u32.to_le_bytes());
+        buf.extend_from_slice(&FMT_PCM.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&8_000u32.to_le_bytes());
+        buf.extend_from_slice(&16_000u32.to_le_bytes());
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(&16u16.to_le_bytes());
+
+        // data chunk (on-wire size from caller, actual payload below)
+        buf.extend_from_slice(b"data");
+        buf.extend_from_slice(&data_size_field.to_le_bytes());
+        buf.extend_from_slice(data_bytes);
+        buf
+    }
+
+    /// An `RF64` file with `data` size sentinel (`0xFFFFFFFF`) and a
+    /// ds64 chunk providing the real 64-bit `dataSize`. The demuxer
+    /// must honour the override and surface the form magic +
+    /// resolved sizes through the metadata table per EBU Tech 3306
+    /// v1 §3.4.
+    #[test]
+    fn rf64_data_size_override_from_ds64() {
+        // 10 samples × 2 bytes/sample = 20 bytes of S16 mono data.
+        let data: Vec<u8> = (0..10).flat_map(|i| (i as i16).to_le_bytes()).collect();
+        let bytes = rf64_with_ds64(
+            FORM_RF64,
+            RF64_SIZE_SENTINEL,
+            RF64_SIZE_SENTINEL,
+            data.len() as u64,
+            10,
+            &data,
+            &[],
+        );
+        let mut dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:rf64.form"), Some(&"RF64".to_string()));
+        assert_eq!(md.get("wav:ds64.data_size"), Some(&"20".to_string()));
+        assert_eq!(md.get("wav:rf64.sample_count"), Some(&"10".to_string()));
+        // Stream duration carries the ds64 sample count (10 samples).
+        assert_eq!(dmx.streams()[0].duration, Some(10));
+        // Demux the data: should yield exactly 20 bytes.
+        let mut out = Vec::new();
+        loop {
+            match dmx.next_packet() {
+                Ok(p) => out.extend_from_slice(&p.data),
+                Err(Error::Eof) => break,
+                Err(e) => panic!("demux error: {e}"),
+            }
+        }
+        assert_eq!(out, data);
+    }
+
+    /// The `BW64` form magic (ITU-R BS.2088 / EBU Tech 3306 v2) is
+    /// accepted on the same code path as `RF64` and surfaces the form
+    /// string through `wav:rf64.form`.
+    #[test]
+    fn bw64_form_magic_accepted() {
+        let data: Vec<u8> = (0..4).flat_map(|i| (i as i16).to_le_bytes()).collect();
+        let bytes = rf64_with_ds64(
+            FORM_BW64,
+            RF64_SIZE_SENTINEL,
+            RF64_SIZE_SENTINEL,
+            data.len() as u64,
+            4,
+            &data,
+            &[],
+        );
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:rf64.form"), Some(&"BW64".to_string()));
+        assert_eq!(dmx.streams()[0].duration, Some(4));
+    }
+
+    /// Probe accepts `RF64` and `BW64` headers as confidently as `RIFF`
+    /// (priority 100). A non-WAVE form type for any of the three is
+    /// rejected; a foreign top-level magic with `WAVE` form is also
+    /// rejected.
+    #[test]
+    fn probe_rf64_and_bw64() {
+        use oxideav_core::ProbeData;
+        fn pd(bytes: &[u8]) -> ProbeData<'_> {
+            ProbeData {
+                buf: bytes,
+                ext: None,
+            }
+        }
+        let mut riff = Vec::new();
+        riff.extend_from_slice(b"RIFF");
+        riff.extend_from_slice(&0u32.to_le_bytes());
+        riff.extend_from_slice(b"WAVE");
+        assert_eq!(probe(&pd(&riff)), 100);
+
+        let mut rf64 = Vec::new();
+        rf64.extend_from_slice(b"RF64");
+        rf64.extend_from_slice(&RF64_SIZE_SENTINEL.to_le_bytes());
+        rf64.extend_from_slice(b"WAVE");
+        assert_eq!(probe(&pd(&rf64)), 100);
+
+        let mut bw64 = Vec::new();
+        bw64.extend_from_slice(b"BW64");
+        bw64.extend_from_slice(&RF64_SIZE_SENTINEL.to_le_bytes());
+        bw64.extend_from_slice(b"WAVE");
+        assert_eq!(probe(&pd(&bw64)), 100);
+
+        // RF64 with a non-WAVE form type — rejected.
+        let mut bogus = Vec::new();
+        bogus.extend_from_slice(b"RF64");
+        bogus.extend_from_slice(&0u32.to_le_bytes());
+        bogus.extend_from_slice(b"AVI ");
+        assert_eq!(probe(&pd(&bogus)), 0);
+
+        // Foreign magic with WAVE form — rejected.
+        let mut foreign = Vec::new();
+        foreign.extend_from_slice(b"XXXX");
+        foreign.extend_from_slice(&0u32.to_le_bytes());
+        foreign.extend_from_slice(b"WAVE");
+        assert_eq!(probe(&pd(&foreign)), 0);
+    }
+
+    /// An RF64 file whose 32-bit on-wire RIFF and data sizes are
+    /// *not* the sentinel (a small RF64 file under 4 GiB written by a
+    /// recorder that started in RF64 mode and never grew large
+    /// enough to require the override) — the demuxer uses the on-wire
+    /// 32-bit sizes verbatim but still surfaces the form magic +
+    /// ds64 prefix so downstream tools can see the file's BWF/MBWF
+    /// origin.
+    #[test]
+    fn rf64_with_legal_32bit_sizes() {
+        let data: Vec<u8> = vec![0u8; 8];
+        let bytes = rf64_with_ds64(
+            FORM_RF64,
+            // Real 32-bit RIFF size (the writer kept it because the
+            // file fit under 4 GiB after all).
+            64,
+            // Real 32-bit data size — fits in 32 bits so no sentinel.
+            data.len() as u32,
+            // ds64 fields still populated by the recorder; the
+            // demuxer must not prefer them over the on-wire 32-bit
+            // sizes per §3.4 "If the 32-bit value in the field is not
+            // -1 (= FFFFFFFF hex) then this 32-bit value is used".
+            999_999,
+            999_999,
+            &data,
+            &[],
+        );
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:rf64.form"), Some(&"RF64".to_string()));
+        // data_size_field = 8 → block_samples = 8/2 = 4. But
+        // ds64.sample_count = 999_999, which the demuxer prefers when
+        // present and non-zero. So `wav:fact.mismatch` should surface.
+        assert!(md.contains_key("wav:fact.mismatch"));
+        // sample_count from ds64 takes precedence.
+        assert_eq!(dmx.streams()[0].duration, Some(999_999));
+    }
+
+    /// ds64 with an optional table[] override — a `big1` chunk's
+    /// 32-bit on-wire size is the sentinel and its real 64-bit size
+    /// comes from the per-entry table lookup. The demuxer skips the
+    /// chunk body using the resolved size and surfaces the entry
+    /// through `wav:rf64.table.<n>.id` / `.size`.
+    #[test]
+    fn rf64_ds64_table_size_override() {
+        // 8 bytes of "big1" chunk body that, on the wire, claims size =
+        // sentinel. The ds64 table entry says the real size is 8 (a
+        // chunk that fits in 32 bits but the writer chose to use the
+        // sentinel for testing the §3.4 table-lookup path).
+        let big1_payload: Vec<u8> = vec![0xAAu8; 8];
+        let data: Vec<u8> = vec![0u8; 4];
+        // Build the file: RF64 / WAVE / ds64 / fmt  / big1 / data.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(FORM_RF64);
+        buf.extend_from_slice(&RF64_SIZE_SENTINEL.to_le_bytes());
+        buf.extend_from_slice(b"WAVE");
+        // ds64 with one table entry for `big1` size = 8.
+        buf.extend_from_slice(b"ds64");
+        let body_len: u32 = 28 + 12;
+        buf.extend_from_slice(&body_len.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes()); // riff lo
+        buf.extend_from_slice(&0u32.to_le_bytes()); // riff hi
+        buf.extend_from_slice(&(data.len() as u32).to_le_bytes()); // data lo
+        buf.extend_from_slice(&0u32.to_le_bytes()); // data hi
+        buf.extend_from_slice(&2u32.to_le_bytes()); // sample_count lo (4 bytes / 2 = 2 samples)
+        buf.extend_from_slice(&0u32.to_le_bytes()); // sample_count hi
+        buf.extend_from_slice(&1u32.to_le_bytes()); // tableLength
+        buf.extend_from_slice(b"big1");
+        buf.extend_from_slice(&8u32.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        // fmt
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&16u32.to_le_bytes());
+        buf.extend_from_slice(&FMT_PCM.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&8_000u32.to_le_bytes());
+        buf.extend_from_slice(&16_000u32.to_le_bytes());
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(&16u16.to_le_bytes());
+        // big1 chunk — on-wire size = sentinel; real size from table.
+        buf.extend_from_slice(b"big1");
+        buf.extend_from_slice(&RF64_SIZE_SENTINEL.to_le_bytes());
+        buf.extend_from_slice(&big1_payload);
+        // data
+        buf.extend_from_slice(b"data");
+        buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&data);
+
+        let dmx = open_demux_from_bytes(buf);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:rf64.form"), Some(&"RF64".to_string()));
+        assert_eq!(md.get("wav:rf64.table.0.id"), Some(&"big1".to_string()));
+        assert_eq!(md.get("wav:rf64.table.0.size"), Some(&"8".to_string()));
+        // ds64.table_length surfaced as well.
+        assert_eq!(md.get("wav:ds64.table_length"), Some(&"1".to_string()));
+        // data chunk decoded after `big1` was skipped via the table-
+        // lookup path; sample count is 2.
+        assert_eq!(dmx.streams()[0].duration, Some(2));
+    }
+
+    /// A plain RIFF file that happens to carry a `ds64` chunk
+    /// (forward-compat noise — a non-RF64 writer who emitted ds64
+    /// in case the file would grow but then closed it under 4 GiB)
+    /// must NOT activate the sentinel-substitution path. The
+    /// demuxer treats the ds64 chunk as opaque, neither failing nor
+    /// re-interpreting the 32-bit sizes.
+    #[test]
+    fn riff_with_stray_ds64_is_ignored() {
+        let data: Vec<u8> = vec![0u8; 8];
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"RIFF");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(b"WAVE");
+        // ds64 with 28-byte prefix only.
+        buf.extend_from_slice(b"ds64");
+        buf.extend_from_slice(&28u32.to_le_bytes());
+        for _ in 0..7 {
+            buf.extend_from_slice(&0u32.to_le_bytes());
+        }
+        // fmt
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&16u32.to_le_bytes());
+        buf.extend_from_slice(&FMT_PCM.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&8_000u32.to_le_bytes());
+        buf.extend_from_slice(&16_000u32.to_le_bytes());
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(&16u16.to_le_bytes());
+        // data
+        buf.extend_from_slice(b"data");
+        buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&data);
+
+        let dmx = open_demux_from_bytes(buf);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        // No `wav:rf64.*` keys — the form magic was `RIFF` so the
+        // ds64 body was skipped as opaque.
+        assert!(!md.contains_key("wav:rf64.form"));
+        assert!(!md.contains_key("wav:ds64.data_size"));
+        // 4 samples / mono / S16 → duration 4.
+        assert_eq!(dmx.streams()[0].duration, Some(4));
+    }
+
+    /// An RF64 stream whose `data` chunk size is the sentinel BUT
+    /// whose ds64 chunk is missing — invalid per §3 ("the `ds64`
+    /// chunk has to be the first chunk after the RF64 chunk"). The
+    /// demuxer rejects the file with `Error::Invalid`.
+    #[test]
+    fn rf64_missing_ds64_is_rejected() {
+        // RF64 / WAVE / fmt  / data (no ds64). data size = sentinel.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(FORM_RF64);
+        buf.extend_from_slice(&RF64_SIZE_SENTINEL.to_le_bytes());
+        buf.extend_from_slice(b"WAVE");
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&16u32.to_le_bytes());
+        buf.extend_from_slice(&FMT_PCM.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&8_000u32.to_le_bytes());
+        buf.extend_from_slice(&16_000u32.to_le_bytes());
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(&16u16.to_le_bytes());
+        buf.extend_from_slice(b"data");
+        buf.extend_from_slice(&RF64_SIZE_SENTINEL.to_le_bytes());
+        // (No data payload — the demuxer should reject before any
+        // payload is read.)
+
+        use std::io::Cursor;
+        let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(buf));
+        let result = open_demuxer(rs, &oxideav_core::NullCodecResolver);
+        assert!(result.is_err(), "expected RF64-without-ds64 rejection");
+    }
+
+    /// A `ds64` chunk whose body is shorter than the 28-byte fixed
+    /// prefix is rejected per Annex A: the prefix is mandatory and
+    /// truncation is signalled as a corrupt file, not as a forward-
+    /// compatible extension.
+    #[test]
+    fn ds64_short_body_rejected() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(FORM_RF64);
+        buf.extend_from_slice(&RF64_SIZE_SENTINEL.to_le_bytes());
+        buf.extend_from_slice(b"WAVE");
+        buf.extend_from_slice(b"ds64");
+        buf.extend_from_slice(&8u32.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 8]);
+        use std::io::Cursor;
+        let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(buf));
+        let result = open_demuxer(rs, &oxideav_core::NullCodecResolver);
+        assert!(result.is_err(), "expected short-ds64 rejection");
     }
 }

@@ -8,9 +8,26 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework �
 
 - **PCM codecs**: `pcm_u8`, `pcm_s16le`, `pcm_s24le`, `pcm_s32le`, `pcm_f32le`,
   `pcm_f64le`.
-- **WAV** container: RIFF/WAVE demuxer + muxer with `fmt`, `data`, and
-  the full Microsoft RIFF MCI §3 "INFO List Chunk" baseline (23 sub-IDs
-  from the 1991 spec: `IARL` → `archival_location`, `IART` → `artist`,
+- **WAV** container: RIFF/WAVE demuxer + muxer with `fmt`, `data`,
+  and end-to-end EBU Tech 3306 `RF64` / `BW64` 64-bit-extended file
+  support — the demuxer accepts the alternative top-level magic, parses
+  the mandatory `ds64` chunk (`riffSize` / `dataSize` / `sampleCount`
+  64-bit fields + optional per-chunk size override table) and honours
+  the `0xFFFFFFFF` sentinel on the 32-bit RIFF and `data` size fields by
+  substituting the ds64 values. ds64 fields surface through
+  `wav:ds64.riff_size` / `.data_size` / `.sample_count` /
+  `.table_length` / `.body_len`; the form magic + resolved sizes
+  surface through `wav:rf64.form` / `.riff_size` / `.data_size` /
+  `.sample_count`; per-table-entry overrides surface as
+  `wav:rf64.table.<n>.id` / `.size`. The ds64 `sampleCount` becomes the
+  authoritative `StreamInfo::duration` for RF64/BW64 streams (full
+  64-bit, can exceed `u32::MAX`). A ds64 chunk riding a plain `RIFF`
+  file is treated as opaque (no sentinel substitution); a missing
+  ds64 in an RF64 file whose `data` size is the sentinel is rejected;
+  a ds64 body shorter than the 28-byte fixed prefix is rejected. The
+  parser also resolves the full Microsoft RIFF MCI §3 "INFO List
+  Chunk" baseline (23 sub-IDs from the 1991 spec: `IARL` →
+  `archival_location`, `IART` → `artist`,
   `ICMS` → `commissioned`, `ICMT` → `comment`, `ICOP` → `copyright`,
   `ICRD` → `date`, `ICRP` → `cropped`, `IDIM` → `dimensions`, `IDPI` →
   `dpi`, `IENG` → `engineer`, `IGNR` → `genre`, `IKEY` → `keywords`,
