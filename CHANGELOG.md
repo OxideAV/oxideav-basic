@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- New `filter` module exposing a typed scalar form of the Reinhard 2002
+  simple global tone-mapping operator (`Ld = L / (1 + L)`) per
+  `docs/image/filter/tone-mapping-operators.md` §2.2. The forward map is
+  surfaced as `SceneLuminance::to_display`; the closed-form inverse
+  `L = Ld / (1 − Ld)` is surfaced as `DisplayLuminance::to_scene`. The
+  two newtypes separate scene (pre-tone-map, non-negative finite) and
+  display (post-tone-map, `[0, 1)`) luminance domains so callers can't
+  swap them at a function boundary. Constructors reject invalid inputs
+  (negative scene values, NaN, non-finite, `Ld ≥ 1.0`). Round-trip is
+  bit-exact at the three §2.2 reference points (`L = 0 → 0`,
+  `L = 1 → 0.5`, `L = 3 → 0.75`) and stays within a relative error of
+  `1e-9` across an 11-point span from `1e-9` to `1e6` of scene
+  luminance. Six in-crate unit tests plus three integration tests on
+  the public surface cover constructor rejection, known curve values,
+  the `Ld < 1` asymptote, and round-trip in both directions.
 - WAV demuxer recognises the `RF64` and `BW64` top-level form magics
   (EBU Tech 3306 v1 §3 and ITU-R BS.2088 / EBU Tech 3306 v2) and
   parses the mandatory `ds64` chunk that follows. The 28-byte fixed

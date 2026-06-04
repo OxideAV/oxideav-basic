@@ -108,6 +108,14 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework �
 - **Y4M (YUV4MPEG2)** container: rawvideo demuxer + muxer for `.y4m` files,
   supporting 4:2:0 / 4:2:2 / 4:4:4 / mono at 8/10/12-bit. Header `X<key>=<val>`
   extensions are surfaced verbatim through `Demuxer::metadata`.
+- **Filter primitive**: typed scalar Reinhard 2002 simple global
+  tone-mapping operator (`Ld = L / (1 + L)`) with its closed-form inverse
+  (`L = Ld / (1 − Ld)`). Scene-luminance and display-luminance domains are
+  separated by distinct `SceneLuminance` / `DisplayLuminance` wrapper
+  types, so callers can't accidentally swap pre- and post-tone-map values;
+  constructors reject invalid inputs (negative, NaN, non-finite, or
+  display ≥ 1.0). The forward map is a published mathematical fact
+  transcribed from `docs/image/filter/tone-mapping-operators.md` §2.2.
 
 ## Usage
 

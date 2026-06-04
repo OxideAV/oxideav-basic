@@ -1,6 +1,7 @@
 //! Bundled simple formats: codecs and containers that are small and standard
 //! enough to share one crate. Anything larger gets its own crate.
 
+pub mod filter;
 pub mod pcm;
 pub mod slin;
 pub mod wav;
