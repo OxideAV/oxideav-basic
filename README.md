@@ -102,7 +102,19 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework �
   `.size` and `wav:rf64.body_len`. A sentinel without a `ds64`
   override is rejected as malformed; a `ds64` body shorter than 28
   bytes is rejected. The 32-bit legacy `fact.dwFileSize` is promoted
-  to the 64-bit `ds64.sampleCount` when it carries the sentinel.
+  to the 64-bit `ds64.sampleCount` when it carries the sentinel. The
+  `JUNK` (Filler) chunk (RIFF MCI §2 "JUNK (Filler) Chunk") is
+  recognised end-to-end — the chunk body is defined as "no relevant
+  data" so its bytes are not surfaced, but the demuxer accounts for
+  every `JUNK` chunk seen: `wav:junk.count` (total number of `JUNK`
+  chunks), `wav:junk.total_bytes` (cumulative payload bytes across all
+  `JUNK` chunks; excludes the 8-byte chunk header and the word-align
+  pad), and per-chunk `wav:junk.<n>.body_len` indexed zero-based by
+  encounter order. Lets a downstream tool observe how much filler a
+  writer reserved for in-place edits without pretending the bytes
+  carry meaning. Multiple `JUNK` chunks are allowed; empty `JUNK`
+  chunks (size = 0) still increment the count. Files with no `JUNK`
+  chunk emit no `wav:junk.*` keys at all (absence is observable).
 - **slin** container: Asterisk-style headerless `.sln*` / `.slin*` raw
   S16LE PCM (extension drives the sample rate).
 - **Y4M (YUV4MPEG2)** container: rawvideo demuxer + muxer for `.y4m` files,

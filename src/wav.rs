@@ -429,6 +429,21 @@ fn open_demuxer(
                     input.seek(SeekFrom::Current(1))?;
                 }
             }
+            b"JUNK" => {
+                // Microsoft RIFF MCI §2 "JUNK (Filler) Chunk": padding,
+                // filler or outdated information; the body contains
+                // random data and carries no relevant payload. We skip
+                // the body but surface accounting metadata so a
+                // downstream tool can observe how much filler the
+                // producer reserved (e.g. for in-place editing) and
+                // how many JUNK chunks appeared. Multiple JUNK chunks
+                // are allowed; the count/total-bytes accumulate.
+                input.seek(SeekFrom::Current(size as i64))?;
+                surface_junk_metadata(&mut metadata, size);
+                if size % 2 == 1 {
+                    input.seek(SeekFrom::Current(1))?;
+                }
+            }
             b"data" => {
                 data_offset = input.stream_position()?;
                 data_size = size;
@@ -1035,6 +1050,68 @@ fn parse_ixml_chunk(buf: &[u8], out: &mut Vec<(String, String)>) {
     if !text.is_empty() {
         out.push(("wav:ixml".to_string(), text));
     }
+}
+
+/// Surface metadata for a `JUNK` (Filler) chunk per
+/// `docs/container/riff/metadata/microsoft-riffmci.pdf` §2 "JUNK
+/// (Filler) Chunk":
+///
+/// > A JUNK chunk represents padding, filler or outdated information.
+/// > It contains no relevant data; it is a space filler of arbitrary
+/// > size.
+///
+/// We deliberately do not surface the chunk body (it's defined as
+/// random/outdated data with no semantic content). What we do surface
+/// is *accounting*: how many `JUNK` chunks the file contains and the
+/// cumulative number of payload bytes they reserve. This lets a
+/// downstream tool answer "is this writer leaving room for in-place
+/// edits, and how much?" without us pretending the bytes carry meaning.
+///
+/// Keys:
+///
+/// * `wav:junk.count` — number of `JUNK` chunks seen so far. Each
+///   call increments the counter so a multi-`JUNK` file (common when
+///   a writer reserves separate slots ahead of `LIST INFO` and ahead
+///   of `data`) is fully observable.
+/// * `wav:junk.total_bytes` — cumulative payload size across all
+///   `JUNK` chunks (the spec's "arbitrary size" filler region; does
+///   not include the 8-byte chunk header or the trailing word-align
+///   pad byte).
+/// * `wav:junk.<n>.body_len` — per-chunk payload size, indexed
+///   zero-based by encounter order. Allows a downstream tool to
+///   distinguish "one big filler" from "many small fillers" without
+///   re-walking the file.
+///
+/// Empty (`size = 0`) `JUNK` chunks are tolerated and still bump the
+/// counter; their `body_len` surfaces as `0`. The spec calls the
+/// filler "of arbitrary size" so a zero-length body is in-range.
+fn surface_junk_metadata(out: &mut Vec<(String, String)>, size: u64) {
+    // Count existing entries to derive the next zero-based index and
+    // the running total. We linear-scan the metadata vector because
+    // it's already keyed by string and we want a single source of
+    // truth (no parallel counter to forget to update). Metadata
+    // vectors stay small (low hundreds of entries) so this is O(n)
+    // per JUNK chunk over a tiny n.
+    let mut count: u64 = 0;
+    let mut total: u64 = 0;
+    for (k, v) in out.iter() {
+        if k == "wav:junk.count" {
+            count = v.parse().unwrap_or(count);
+        } else if k == "wav:junk.total_bytes" {
+            total = v.parse().unwrap_or(total);
+        }
+    }
+    let idx = count;
+    count = count.saturating_add(1);
+    total = total.saturating_add(size);
+    // Per-chunk entry.
+    out.push((format!("wav:junk.{idx}.body_len"), size.to_string()));
+    // Update the rolling aggregates. We push fresh entries rather than
+    // mutate in place so the vector stays append-only (matching how
+    // every other chunk parser in this module emits).
+    out.retain(|(k, _)| k != "wav:junk.count" && k != "wav:junk.total_bytes");
+    out.push(("wav:junk.count".to_string(), count.to_string()));
+    out.push(("wav:junk.total_bytes".to_string(), total.to_string()));
 }
 
 /// Map a Microsoft RIFF MCI §3 "Country Codes" three-digit code to its
@@ -3853,6 +3930,200 @@ mod tests {
         // Defined language, undefined dialect — must NOT silently fall
         // back to dialect 1.
         assert_eq!(cset_language_name(9, 9), None);
+    }
+
+    /// Build a minimal valid PCM WAV with a caller-supplied number of
+    /// `JUNK` chunks, each with the given body size and a fixed
+    /// per-chunk fill byte, inserted between `fmt ` and `data`. Mirrors
+    /// `wav_with_cset` / `wav_with_ixml` for the filler chunk
+    /// documented in Microsoft RIFF MCI §2 "JUNK (Filler) Chunk".
+    fn wav_with_junk(junk_sizes: &[usize]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"RIFF");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(b"WAVE");
+        // fmt : 16-byte PCM s16 mono 8000 Hz.
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&16u32.to_le_bytes());
+        buf.extend_from_slice(&FMT_PCM.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&8_000u32.to_le_bytes());
+        buf.extend_from_slice(&16_000u32.to_le_bytes());
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(&16u16.to_le_bytes());
+        for (i, &sz) in junk_sizes.iter().enumerate() {
+            buf.extend_from_slice(b"JUNK");
+            buf.extend_from_slice(&(sz as u32).to_le_bytes());
+            // Fill byte is the chunk index — lets a debugger see which
+            // JUNK the bytes belong to without affecting parsing
+            // behaviour (the parser must not depend on the contents).
+            buf.extend(std::iter::repeat_n(i as u8, sz));
+            if sz % 2 == 1 {
+                buf.push(0);
+            }
+        }
+        // empty data chunk
+        buf.extend_from_slice(b"data");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf
+    }
+
+    /// A single 16-byte `JUNK` chunk surfaces its count, total payload
+    /// bytes and per-chunk body length under the `wav:junk.*` key
+    /// shape. The body contents are not surfaced (the spec defines
+    /// them as "no relevant data"). The chunk-walk still locates the
+    /// `data` chunk that follows.
+    #[test]
+    fn junk_single_chunk_surfaces_accounting_metadata() {
+        let bytes = wav_with_junk(&[16]);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:junk.count"), Some(&"1".to_string()));
+        assert_eq!(md.get("wav:junk.total_bytes"), Some(&"16".to_string()));
+        assert_eq!(md.get("wav:junk.0.body_len"), Some(&"16".to_string()));
+        // Body contents must not leak into metadata under any key.
+        assert!(
+            !md.keys()
+                .any(|k| k.starts_with("wav:junk") && k.ends_with(".body")),
+            "JUNK chunk body must not be surfaced (Microsoft RIFF MCI §2)"
+        );
+        // The fmt + data path still works end-to-end.
+        assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
+    }
+
+    /// Multiple `JUNK` chunks accumulate into the `count` /
+    /// `total_bytes` aggregates and each surfaces its own
+    /// `wav:junk.<n>.body_len`. The §2 spec allows arbitrary repetition;
+    /// many real writers reserve one slot ahead of `LIST INFO` and a
+    /// second ahead of `data` for in-place editing.
+    #[test]
+    fn junk_multiple_chunks_accumulate() {
+        let bytes = wav_with_junk(&[32, 8, 100]);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:junk.count"), Some(&"3".to_string()));
+        assert_eq!(
+            md.get("wav:junk.total_bytes"),
+            Some(&(32u64 + 8 + 100).to_string())
+        );
+        assert_eq!(md.get("wav:junk.0.body_len"), Some(&"32".to_string()));
+        assert_eq!(md.get("wav:junk.1.body_len"), Some(&"8".to_string()));
+        assert_eq!(md.get("wav:junk.2.body_len"), Some(&"100".to_string()));
+        assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
+    }
+
+    /// A zero-length `JUNK` chunk is in-range per the §2 "arbitrary
+    /// size" language and still increments the count. The
+    /// `wav:junk.0.body_len = 0` entry distinguishes "an empty JUNK
+    /// was present" from "no JUNK was present at all" — the latter
+    /// emits no `wav:junk.*` keys whatsoever.
+    #[test]
+    fn junk_empty_body_still_counts() {
+        let bytes = wav_with_junk(&[0]);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:junk.count"), Some(&"1".to_string()));
+        assert_eq!(md.get("wav:junk.total_bytes"), Some(&"0".to_string()));
+        assert_eq!(md.get("wav:junk.0.body_len"), Some(&"0".to_string()));
+    }
+
+    /// A file with no `JUNK` chunks must not synthesise any
+    /// `wav:junk.*` keys (absence is observable: zero `count` keys is
+    /// stronger than `count = 0` because it costs no bytes). Baseline
+    /// regression guard against a future refactor that initialises the
+    /// counter unconditionally.
+    #[test]
+    fn junk_absent_emits_no_keys() {
+        let bytes = wav_with_junk(&[]);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert!(
+            !md.keys().any(|k| k.starts_with("wav:junk")),
+            "no JUNK chunk → no wav:junk.* metadata"
+        );
+        assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
+    }
+
+    /// An odd-length `JUNK` body forces a 1-byte word-align pad; the
+    /// `data` chunk that follows must still be located correctly
+    /// (regression guard matching `ixml_odd_body_padding` /
+    /// `cset_odd_body_padding`). RIFF MCI §2 "Chunks" requires all
+    /// chunks to be word-aligned with an implicit pad byte when the
+    /// body is odd; the pad byte is NOT part of `ckSize`.
+    #[test]
+    fn junk_odd_body_padding() {
+        let bytes = wav_with_junk(&[7]); // odd
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:junk.0.body_len"), Some(&"7".to_string()));
+        assert_eq!(md.get("wav:junk.total_bytes"), Some(&"7".to_string()));
+        // data chunk located correctly past the pad.
+        assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
+    }
+
+    /// `JUNK` coexists with `LIST INFO` and `CSET` without disrupting
+    /// the rest of the metadata surface. Regression guard for the
+    /// chunk-walk ordering JUNK → CSET → LIST(INFO) → JUNK → data
+    /// (a realistic shape when a writer reserves filler ahead of both
+    /// the metadata block and the audio payload).
+    #[test]
+    fn junk_coexists_with_other_chunks() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"RIFF");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(b"WAVE");
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&16u32.to_le_bytes());
+        buf.extend_from_slice(&FMT_PCM.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&8_000u32.to_le_bytes());
+        buf.extend_from_slice(&16_000u32.to_le_bytes());
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(&16u16.to_le_bytes());
+        // First JUNK: 12 bytes of filler.
+        buf.extend_from_slice(b"JUNK");
+        buf.extend_from_slice(&12u32.to_le_bytes());
+        buf.extend(std::iter::repeat_n(0xAAu8, 12));
+        // CSET: Windows-1252 / USA / US English (canonical 8-byte body).
+        let cset = cset_body(1252, 1, 9, 1);
+        buf.extend_from_slice(b"CSET");
+        buf.extend_from_slice(&(cset.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&cset);
+        // LIST INFO with INAM = "T" (1 byte + NUL terminator).
+        let mut list_body = Vec::new();
+        list_body.extend_from_slice(b"INFO");
+        list_body.extend_from_slice(b"INAM");
+        list_body.extend_from_slice(&1u32.to_le_bytes());
+        list_body.extend_from_slice(b"T");
+        list_body.push(0);
+        buf.extend_from_slice(b"LIST");
+        buf.extend_from_slice(&(list_body.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&list_body);
+        // Second JUNK: 4 bytes of filler ahead of `data`.
+        buf.extend_from_slice(b"JUNK");
+        buf.extend_from_slice(&4u32.to_le_bytes());
+        buf.extend(std::iter::repeat_n(0xBBu8, 4));
+        // empty data chunk.
+        buf.extend_from_slice(b"data");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+
+        let dmx = open_demux_from_bytes(buf);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        // Both JUNK chunks counted; aggregates reflect both.
+        assert_eq!(md.get("wav:junk.count"), Some(&"2".to_string()));
+        assert_eq!(md.get("wav:junk.total_bytes"), Some(&"16".to_string()));
+        assert_eq!(md.get("wav:junk.0.body_len"), Some(&"12".to_string()));
+        assert_eq!(md.get("wav:junk.1.body_len"), Some(&"4".to_string()));
+        // Other chunks survived the interleaved JUNK chunks intact.
+        assert_eq!(md.get("wav:cset.code_page"), Some(&"1252".to_string()));
+        assert_eq!(md.get("title"), Some(&"T".to_string()));
+        assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
     }
 
     /// Locate the first chunk with the given 4-byte FOURCC in a

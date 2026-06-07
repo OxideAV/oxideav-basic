@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- WAV demuxer recognises the `JUNK` (Filler) chunk per
+  `docs/container/riff/metadata/microsoft-riffmci.pdf` §2 "JUNK
+  (Filler) Chunk" ("A JUNK chunk represents padding, filler or
+  outdated information. It contains no relevant data; it is a space
+  filler of arbitrary size."). The chunk body is deliberately not
+  surfaced — its bytes are spec-defined as having no semantic content
+  — but the demuxer accounts for every `JUNK` chunk seen so a
+  downstream tool can observe how much filler the producer reserved
+  (commonly for in-place editing) without re-walking the file. Each
+  encounter emits `wav:junk.<n>.body_len` (zero-based, per-chunk
+  payload size) and updates the rolling aggregates `wav:junk.count`
+  (total `JUNK` chunks seen) and `wav:junk.total_bytes` (cumulative
+  payload size; excludes the 8-byte chunk header and the implicit
+  word-align pad byte). Multiple `JUNK` chunks are allowed; empty
+  bodies (`size = 0`) still increment the count. Files with no `JUNK`
+  chunk emit no `wav:junk.*` keys at all — absence is observable.
+  Odd-length bodies forward the chunk-walk past the implicit RIFF §2
+  word-align pad byte correctly. Six new lib tests cover the single-
+  chunk path, the multi-chunk accumulation path, the zero-length
+  in-range path, the no-JUNK absence guard, the odd-length-body
+  padding regression guard, and the coexistence path with `LIST INFO`
+  + `CSET` interleaved around the JUNK chunks.
 - New `filter` module exposing a typed scalar form of the Reinhard 2002
   simple global tone-mapping operator (`Ld = L / (1 + L)`) per
   `docs/image/filter/tone-mapping-operators.md` §2.2. The forward map is
