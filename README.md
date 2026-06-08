@@ -76,7 +76,14 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework �
   (raw on-wire chunk size, always emitted when the chunk is present
   so a NUL-padded "reserved for in-place editing" region is still
   visible to downstream tooling); bodies that are empty or entirely
-  NUL/whitespace surface only `wav:ixml.body_len`. The `CSET`
+  NUL/whitespace surface only `wav:ixml.body_len`. The `<axml>` chunk
+  (EBU Tech 3285 Supplement 5) carries a UTF-8 XML document —
+  typically an EBUCore wrapper around an `<audioFormatExtended>` ADM
+  document or an ISRC identifier declaration — and surfaces through
+  `wav:axml` (text payload trimmed at the first NUL + surrounding
+  whitespace, schema-agnostic) and `wav:axml.body_len` (always
+  emitted when the chunk is present, so a NUL-padded ADM reservation
+  block reserved for in-place editing is observable). The `CSET`
   (Character Set) chunk (RIFF MCI §3 "CSET Chunk") is parsed end-to-end:
   `wCodePage` / `wCountryCode` / `wLanguageCode` / `wDialect` (each a
   16-bit LE field) surface under `wav:cset.code_page` / `.country` /

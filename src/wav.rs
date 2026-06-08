@@ -421,6 +421,14 @@ fn open_demuxer(
                     input.seek(SeekFrom::Current(1))?;
                 }
             }
+            b"axml" => {
+                let mut buf = vec![0u8; size as usize];
+                input.read_exact(&mut buf)?;
+                parse_axml_chunk(&buf, &mut metadata);
+                if size % 2 == 1 {
+                    input.seek(SeekFrom::Current(1))?;
+                }
+            }
             b"CSET" => {
                 let mut buf = vec![0u8; size as usize];
                 input.read_exact(&mut buf)?;
@@ -1049,6 +1057,63 @@ fn parse_ixml_chunk(buf: &[u8], out: &mut Vec<(String, String)>) {
     let text = String::from_utf8_lossy(&buf[..end]).trim().to_string();
     if !text.is_empty() {
         out.push(("wav:ixml".to_string(), text));
+    }
+}
+
+/// Parse an `<axml>` chunk body and surface its XML payload through
+/// the metadata table.
+///
+/// The `<axml>` chunk carries an XML document compliant with XML 1.0
+/// (or later), per
+/// `docs/container/riff/metadata/ebu-tech3285s5-ADM.pdf` §3 "AXML
+/// chunk definition":
+///
+/// > The <axml> chunk consists of a header followed by data compliant
+/// > with the XML format. The overall length of the chunk is not fixed.
+/// >
+/// > typedef struct axml {
+/// >     CHAR    ckID[4];     // {'a','x','m','l'}
+/// >     DWORD   ckSize;      // size of chunk
+/// >     CHAR    xmlData[];   // text data in XML
+/// > } axml_chunk;
+///
+/// The §3 "Terminology" paragraph also notes the `<axml>` chunk may
+/// occur in any order relative to other BWF chunks within the same
+/// file — the demuxer's chunk-walk already tolerates any inter-chunk
+/// ordering between `fmt ` and `data`.
+///
+/// Typical payloads are EBUCore (`<ebuCoreMain>`) wrappers around an
+/// `<audioFormatExtended>` ADM document or an ISRC identifier
+/// declaration (§4.1 + §4.2 examples). This parser does not interpret
+/// the XML schema — it surfaces the textual payload verbatim so a
+/// downstream tool (or a higher-level ADM-aware crate) can apply the
+/// schema-specific decoding without re-walking the RIFF tree.
+///
+/// Surface shape mirrors `parse_ixml_chunk` (the sibling third-party
+/// XML metadata block):
+///
+/// * `wav:axml.body_len` — raw on-wire chunk-body length. Always
+///   emitted when the chunk is present (even for empty / NUL-only /
+///   whitespace-only bodies) so downstream tooling can distinguish
+///   "no `<axml>` chunk" from "an `<axml>` chunk reserved for later
+///   population". Excludes the 8-byte chunk header and the implicit
+///   RIFF §2 word-align pad byte.
+/// * `wav:axml` — the UTF-8 XML text payload. Trimmed at the first
+///   NUL byte (writers commonly NUL-pad to reserve room for in-place
+///   editing of a larger ADM document) and stripped of surrounding
+///   whitespace. Omitted entirely when the pre-NUL, trimmed text is
+///   empty — the §3 note "if the receiving device cannot interpret
+///   the content of the <axml> chunk in accordance with the
+///   specification stated in the XML, the entire chunk shall be
+///   ignored" applies to the *schema* level, not the byte level, so a
+///   present-but-empty body still surfaces its `body_len` so the
+///   placeholder is observable.
+fn parse_axml_chunk(buf: &[u8], out: &mut Vec<(String, String)>) {
+    out.push(("wav:axml.body_len".to_string(), buf.len().to_string()));
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let text = String::from_utf8_lossy(&buf[..end]).trim().to_string();
+    if !text.is_empty() {
+        out.push(("wav:axml".to_string(), text));
     }
 }
 
@@ -3645,6 +3710,181 @@ mod tests {
             dmx.metadata().iter().cloned().collect();
         assert_eq!(md.get("wav:ixml"), Some(&"<X>1</X><Y>2</Y>!".to_string()));
         assert_eq!(md.get("wav:ixml.body_len"), Some(&"17".to_string()));
+        assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
+    }
+
+    /// Build a minimal valid PCM WAV with a caller-supplied raw `<axml>`
+    /// chunk inserted between `fmt ` and `data`. Mirrors `wav_with_ixml`
+    /// for the BWF supplement-5 XML metadata block documented in
+    /// `docs/container/riff/metadata/ebu-tech3285s5-ADM.pdf` §3.
+    fn wav_with_axml(axml_body: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"RIFF");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(b"WAVE");
+        // fmt : 16-byte PCM s16 mono 8000 Hz.
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&16u32.to_le_bytes());
+        buf.extend_from_slice(&FMT_PCM.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&8_000u32.to_le_bytes());
+        buf.extend_from_slice(&16_000u32.to_le_bytes());
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(&16u16.to_le_bytes());
+        // axml chunk.
+        buf.extend_from_slice(b"axml");
+        buf.extend_from_slice(&(axml_body.len() as u32).to_le_bytes());
+        buf.extend_from_slice(axml_body);
+        if axml_body.len() % 2 == 1 {
+            buf.push(0);
+        }
+        // empty data chunk
+        buf.extend_from_slice(b"data");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf
+    }
+
+    /// A canonical EBUCore-wrapped ADM document round-trips: the XML
+    /// text surfaces verbatim under `wav:axml`, and the raw chunk-body
+    /// length surfaces under `wav:axml.body_len`. The fixture is the
+    /// `<axml>` payload pattern from
+    /// `docs/container/riff/metadata/ebu-tech3285s5-ADM.pdf` §4.2 with
+    /// the inner element set trimmed to a single
+    /// `<audioProgramme>` reference — enough to exercise the parser
+    /// without dragging the full HOA pack into the fixture.
+    #[test]
+    fn axml_canonical_ebucore_adm_document_round_trips() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ebuCoreMain xmlns="urn:ebu:metadata-schema:ebucore"
+    xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <coreMetadata>
+    <format>
+      <audioFormatExtended>
+        <audioProgramme audioProgrammeID="APR_1001"
+            audioProgrammeName="OxideAV Round 258 demo">
+          <audioContentIDRef>ACO_1001</audioContentIDRef>
+        </audioProgramme>
+      </audioFormatExtended>
+    </format>
+  </coreMetadata>
+</ebuCoreMain>"#;
+        let bytes = wav_with_axml(xml.as_bytes());
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(
+            md.get("wav:axml.body_len"),
+            Some(&xml.len().to_string()),
+            "raw chunk-body length must surface verbatim"
+        );
+        assert_eq!(
+            md.get("wav:axml").map(|s| s.as_str()),
+            Some(xml.trim()),
+            "axml text payload must round-trip"
+        );
+        // The chunk-walk must still resolve fmt + data after the
+        // axml hop — regression guard matching ixml_canonical.
+        assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
+    }
+
+    /// An ISRC identifier `<axml>` payload (§4.1 example) round-trips
+    /// just like the ADM one — the parser is schema-agnostic.
+    #[test]
+    fn axml_isrc_identifier_document_round_trips() {
+        let xml = r#"<ebuCoreMain xmlns:dc="http://purl.org/dc/elements/1.1/"
+    xmlns="urn:ebu:metadata-schema:ebucore">
+  <coreMetadata>
+    <identifier typeLabel="GUID" typeDefinition="Globally Unique Identifier"
+        formatLabel="ISRC" formatDefinition="International Standard Recording Code">
+      <dc:identifier>ISRC:NOX001212345</dc:identifier>
+    </identifier>
+  </coreMetadata>
+</ebuCoreMain>"#;
+        let bytes = wav_with_axml(xml.as_bytes());
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:axml").map(|s| s.as_str()), Some(xml.trim()));
+        assert!(
+            md.get("wav:axml")
+                .map(|s| s.contains("ISRC:NOX001212345"))
+                .unwrap_or(false),
+            "ISRC identifier must survive the round-trip"
+        );
+    }
+
+    /// A NUL-padded `<axml>` body (writers commonly reserve a
+    /// fixed-size block then NUL-fill the trailing space to keep the
+    /// ADM document mutable in-place) surfaces only the pre-NUL text
+    /// under `wav:axml`; the raw `body_len` still reflects the on-wire
+    /// byte count so the trailing reserved bytes are not silently
+    /// lost. Mirrors `ixml_trailing_nuls_trimmed_in_text_but_body_len_kept`.
+    #[test]
+    fn axml_trailing_nuls_trimmed_in_text_but_body_len_kept() {
+        let mut body = b"<ebuCoreMain><id>X</id></ebuCoreMain>".to_vec();
+        body.resize(body.len() + 128, 0);
+        let bytes = wav_with_axml(&body);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(
+            md.get("wav:axml"),
+            Some(&"<ebuCoreMain><id>X</id></ebuCoreMain>".to_string())
+        );
+        assert_eq!(md.get("wav:axml.body_len"), Some(&body.len().to_string()));
+    }
+
+    /// An `<axml>` chunk whose body is empty (zero bytes between the
+    /// 8-byte header and the next chunk) surfaces
+    /// `wav:axml.body_len = 0` but no `wav:axml` text key. Defensive
+    /// against writers that emit a placeholder header without filling
+    /// it; the §3 "shall be ignored" rule for unintelligible content
+    /// is a schema-level concern, not a byte-level one — the body
+    /// length stays observable so the placeholder is discoverable.
+    #[test]
+    fn axml_empty_body_surfaces_only_body_len() {
+        let bytes = wav_with_axml(&[]);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:axml.body_len"), Some(&"0".to_string()));
+        assert!(!md.contains_key("wav:axml"));
+        assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
+    }
+
+    /// An `<axml>` chunk whose body is entirely NUL / whitespace
+    /// (placeholder reserved by a writer ahead of an ADM authoring
+    /// pass) surfaces `body_len` but no text key.
+    #[test]
+    fn axml_whitespace_only_body_omits_text_key() {
+        let body = b"   \t\r\n   \0\0\0".to_vec();
+        let bytes = wav_with_axml(&body);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:axml.body_len"), Some(&body.len().to_string()));
+        assert!(!md.contains_key("wav:axml"));
+    }
+
+    /// An odd-length `<axml>` body forces a 1-byte pad; the `data`
+    /// chunk that follows must still be located correctly (regression
+    /// guard matching `ixml_odd_body_padding`).
+    #[test]
+    fn axml_odd_body_padding() {
+        // 25 bytes of XML — odd, so the chunk-walk pad-byte path is
+        // exercised. The inner content is deliberately short but
+        // schema-recognisable.
+        let body = b"<root><id>z</id></root>!!".to_vec();
+        assert_eq!(body.len() % 2, 1);
+        let bytes = wav_with_axml(&body);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(
+            md.get("wav:axml"),
+            Some(&"<root><id>z</id></root>!!".to_string())
+        );
+        assert_eq!(md.get("wav:axml.body_len"), Some(&"25".to_string()));
         assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
     }
 

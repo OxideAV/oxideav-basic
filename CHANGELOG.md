@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- WAV demuxer parses the `<axml>` chunk per
+  `docs/container/riff/metadata/ebu-tech3285s5-ADM.pdf` §3 ("AXML
+  chunk definition"). The chunk carries a UTF-8 XML document
+  (typically an EBUCore wrapper around an `<audioFormatExtended>`
+  ADM document — see §4.2 — or an ISRC identifier declaration —
+  §4.1) and is supplement-5's vehicle for transporting ADM
+  metadata inside BWF / RF64 / BW64 files. The parser surfaces
+  the textual payload verbatim under `wav:axml` (trimmed at the
+  first NUL and surrounding whitespace, so writers that NUL-pad
+  to reserve room for in-place editing of the ADM document do
+  not leak the padding into the text key) and always emits the
+  raw on-wire chunk-body length under `wav:axml.body_len`
+  whenever the chunk is present — even for empty / NUL-only /
+  whitespace-only bodies — so downstream tooling can distinguish
+  "no `<axml>` chunk" from "an `<axml>` chunk reserved for later
+  ADM authoring". An odd-length body forces the standard RIFF
+  1-byte pad and the `data` chunk that follows is located
+  correctly. The XML schema is not interpreted at this layer —
+  the parser is schema-agnostic so a higher-level ADM-aware
+  crate (or a downstream tool walking `wav:axml`) can apply the
+  EBUCore / BS.2076 decoding without re-walking the RIFF tree.
+  Six new lib tests cover the canonical EBUCore-wrapped ADM
+  document path, the ISRC identifier example from §4.1, the
+  NUL-padded reservation path, the empty-body absence guard, the
+  whitespace-only placeholder path, and the odd-length-body
+  padding regression guard.
 - WAV demuxer recognises the `JUNK` (Filler) chunk per
   `docs/container/riff/metadata/microsoft-riffmci.pdf` §2 "JUNK
   (Filler) Chunk" ("A JUNK chunk represents padding, filler or
