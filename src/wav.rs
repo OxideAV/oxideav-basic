@@ -429,6 +429,14 @@ fn open_demuxer(
                     input.seek(SeekFrom::Current(1))?;
                 }
             }
+            b"_PMX" => {
+                let mut buf = vec![0u8; size as usize];
+                input.read_exact(&mut buf)?;
+                parse_pmx_chunk(&buf, &mut metadata);
+                if size % 2 == 1 {
+                    input.seek(SeekFrom::Current(1))?;
+                }
+            }
             b"CSET" => {
                 let mut buf = vec![0u8; size as usize];
                 input.read_exact(&mut buf)?;
@@ -1114,6 +1122,53 @@ fn parse_axml_chunk(buf: &[u8], out: &mut Vec<(String, String)>) {
     let text = String::from_utf8_lossy(&buf[..end]).trim().to_string();
     if !text.is_empty() {
         out.push(("wav:axml".to_string(), text));
+    }
+}
+
+/// Parse a `_PMX` (Adobe XMP packet) chunk body and surface its UTF-8
+/// XMP packet through the metadata table.
+///
+/// The `_PMX` FOURCC is the WAV/AVI carrier for an XMP serialised
+/// packet, catalogued under
+/// `docs/container/riff/metadata/exiftool-riff-tags.html` § "RIFF Main
+/// tags" (entry `'_PMX'`, family `XMP`, scope note "AVI and WAV
+/// files"). The FOURCC is little-endian "XMP_" reversed — the same
+/// convention RIFF uses for chunks whose payload originates in a
+/// little-endian DWORD-aligned authoring tool. The payload itself is
+/// the XMP packet text exactly as it would appear in an XMP sidecar
+/// (`x:xmpmeta` wrapped in `<?xpacket begin=...?>` /
+/// `<?xpacket end=...?>` processing instructions).
+///
+/// Surface shape mirrors `parse_ixml_chunk` and `parse_axml_chunk`
+/// (the two existing third-party XML metadata blocks) for orthogonality
+/// at the consumer surface:
+///
+/// * `wav:xmp.body_len` — raw on-wire chunk-body length. Always
+///   emitted when the `_PMX` chunk is present (even for empty /
+///   NUL-only / whitespace-only bodies) so downstream tooling can
+///   distinguish "no `_PMX` chunk" from "an `_PMX` chunk reserved for
+///   later population by an XMP-aware writer". Excludes the 8-byte
+///   chunk header and the implicit RIFF §2 word-align pad byte.
+/// * `wav:xmp` — the UTF-8 XMP packet text. Trimmed at the first NUL
+///   byte (writers commonly NUL-pad to a fixed length so an XMP-aware
+///   editor can rewrite the packet in place without re-walking the
+///   chunk graph) and stripped of surrounding whitespace. Omitted
+///   entirely when the pre-NUL, trimmed text is empty — the
+///   placeholder body length still surfaces so the reservation is
+///   observable.
+///
+/// This parser deliberately does not interpret the XMP schema (RDF,
+/// namespace prefixes, xpacket processing instructions). A higher
+/// layer (or a dedicated XMP crate) can apply the schema-specific
+/// decoding without re-walking the RIFF tree. Keeps the wav module's
+/// surface schema-agnostic, matching the existing `_PMX`-adjacent
+/// `iXML` and `<axml>` parsers.
+fn parse_pmx_chunk(buf: &[u8], out: &mut Vec<(String, String)>) {
+    out.push(("wav:xmp.body_len".to_string(), buf.len().to_string()));
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let text = String::from_utf8_lossy(&buf[..end]).trim().to_string();
+    if !text.is_empty() {
+        out.push(("wav:xmp".to_string(), text));
     }
 }
 
@@ -3886,6 +3941,178 @@ mod tests {
         );
         assert_eq!(md.get("wav:axml.body_len"), Some(&"25".to_string()));
         assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
+    }
+
+    /// Build a minimal valid PCM WAV with a caller-supplied raw `_PMX`
+    /// (XMP packet) chunk inserted between `fmt ` and `data`. Mirrors
+    /// `wav_with_axml` / `wav_with_ixml` for the third-party XMP
+    /// metadata block catalogued in
+    /// `docs/container/riff/metadata/exiftool-riff-tags.html` § "RIFF
+    /// Main tags" (entry `'_PMX'`, scope "AVI and WAV files").
+    fn wav_with_pmx(pmx_body: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"RIFF");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(b"WAVE");
+        // fmt : 16-byte PCM s16 mono 8000 Hz.
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&16u32.to_le_bytes());
+        buf.extend_from_slice(&FMT_PCM.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&8_000u32.to_le_bytes());
+        buf.extend_from_slice(&16_000u32.to_le_bytes());
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(&16u16.to_le_bytes());
+        // _PMX chunk.
+        buf.extend_from_slice(b"_PMX");
+        buf.extend_from_slice(&(pmx_body.len() as u32).to_le_bytes());
+        buf.extend_from_slice(pmx_body);
+        if pmx_body.len() % 2 == 1 {
+            buf.push(0);
+        }
+        // empty data chunk
+        buf.extend_from_slice(b"data");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf
+    }
+
+    /// A canonical Adobe-style XMP packet round-trips: the UTF-8 XMP
+    /// text surfaces verbatim under `wav:xmp`, and the raw chunk-body
+    /// length surfaces under `wav:xmp.body_len`. The wrapping
+    /// `<?xpacket begin=...?>` / `<?xpacket end=...?>` processing
+    /// instructions are passed through unchanged — the parser is
+    /// schema-agnostic by design.
+    #[test]
+    fn pmx_canonical_xmp_packet_round_trips() {
+        let xml = r#"<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+    <rdf:Description rdf:about=""
+        xmlns:dc="http://purl.org/dc/elements/1.1/">
+      <dc:title>
+        <rdf:Alt>
+          <rdf:li xml:lang="x-default">OxideAV Round 263 Fixture</rdf:li>
+        </rdf:Alt>
+      </dc:title>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end="w"?>"#;
+        let bytes = wav_with_pmx(xml.as_bytes());
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(
+            md.get("wav:xmp.body_len"),
+            Some(&xml.len().to_string()),
+            "raw chunk-body length must surface verbatim"
+        );
+        assert_eq!(
+            md.get("wav:xmp").map(|s| s.as_str()),
+            Some(xml.trim()),
+            "XMP packet text must round-trip"
+        );
+        assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
+    }
+
+    /// A NUL-padded `_PMX` body (writers commonly reserve a fixed-size
+    /// block for in-place XMP editing) surfaces only the pre-NUL text
+    /// under `wav:xmp`; the raw `body_len` still reflects the on-wire
+    /// byte count so the trailing reserved bytes are observable.
+    #[test]
+    fn pmx_trailing_nuls_trimmed_in_text_but_body_len_kept() {
+        let mut body = b"<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"/>".to_vec();
+        // Reserve another 96 bytes of NUL pad — emulates writers that
+        // size the XMP region for in-place editing.
+        body.resize(body.len() + 96, 0);
+        let bytes = wav_with_pmx(&body);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(
+            md.get("wav:xmp"),
+            Some(&"<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"/>".to_string())
+        );
+        assert_eq!(md.get("wav:xmp.body_len"), Some(&body.len().to_string()));
+    }
+
+    /// A `_PMX` chunk whose body is empty (zero bytes between the
+    /// 8-byte header and the next chunk) surfaces `wav:xmp.body_len = 0`
+    /// but no `wav:xmp` text key. Defensive against writers that emit a
+    /// placeholder XMP header without filling it.
+    #[test]
+    fn pmx_empty_body_surfaces_only_body_len() {
+        let bytes = wav_with_pmx(&[]);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:xmp.body_len"), Some(&"0".to_string()));
+        assert!(!md.contains_key("wav:xmp"));
+        assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
+    }
+
+    /// A `_PMX` chunk whose body is entirely NUL / whitespace
+    /// (placeholder awaiting an XMP-aware writer) surfaces `body_len`
+    /// but no text key.
+    #[test]
+    fn pmx_whitespace_only_body_omits_text_key() {
+        let body = b"   \t\r\n   \0\0\0".to_vec();
+        let bytes = wav_with_pmx(&body);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:xmp.body_len"), Some(&body.len().to_string()));
+        assert!(!md.contains_key("wav:xmp"));
+    }
+
+    /// An odd-length `_PMX` body forces a 1-byte pad; the `data` chunk
+    /// that follows must still be located correctly (regression guard
+    /// matching `axml_odd_body_padding` / `ixml_odd_body_padding`).
+    #[test]
+    fn pmx_odd_body_padding() {
+        // 27 bytes — odd, exercises the chunk-walk pad-byte path.
+        let body = b"<x:xmpmeta xmlns:x=\"a:n\"/>!".to_vec();
+        assert_eq!(body.len() % 2, 1);
+        let bytes = wav_with_pmx(&body);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(
+            md.get("wav:xmp"),
+            Some(&"<x:xmpmeta xmlns:x=\"a:n\"/>!".to_string())
+        );
+        assert_eq!(md.get("wav:xmp.body_len"), Some(&"27".to_string()));
+        assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
+    }
+
+    /// A file with no `_PMX` chunk surfaces no `wav:xmp.*` keys at all
+    /// — absence is observable. Mirrors the matching absence guards for
+    /// `iXML`, `axml`, and `JUNK`.
+    #[test]
+    fn pmx_absent_chunk_emits_no_xmp_keys() {
+        // Reuse the wav_with_axml helper but pass through with NO axml
+        // body to avoid coincidental key emissions — we want a file with
+        // neither axml nor _PMX, which the iXML/JUNK suites already do.
+        // Build the minimal "fmt + data only" PCM file directly.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"RIFF");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(b"WAVE");
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&16u32.to_le_bytes());
+        buf.extend_from_slice(&FMT_PCM.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&8_000u32.to_le_bytes());
+        buf.extend_from_slice(&16_000u32.to_le_bytes());
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(&16u16.to_le_bytes());
+        buf.extend_from_slice(b"data");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        let dmx = open_demux_from_bytes(buf);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert!(!md.contains_key("wav:xmp"));
+        assert!(!md.contains_key("wav:xmp.body_len"));
     }
 
     /// Build a minimal valid PCM WAV with a caller-supplied raw `CSET`

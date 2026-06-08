@@ -83,7 +83,18 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework �
   `wav:axml` (text payload trimmed at the first NUL + surrounding
   whitespace, schema-agnostic) and `wav:axml.body_len` (always
   emitted when the chunk is present, so a NUL-padded ADM reservation
-  block reserved for in-place editing is observable). The `CSET`
+  block reserved for in-place editing is observable). The `_PMX`
+  chunk (Adobe XMP packet, the WAV/AVI carrier for an XMP serialised
+  packet — FOURCC is little-endian "XMP_" reversed; catalogued in
+  exiftool-riff-tags.html § "RIFF Main tags" entry `'_PMX'`, scope
+  "AVI and WAV files") surfaces through `wav:xmp` (UTF-8 XMP packet
+  text trimmed at the first NUL + surrounding whitespace, so writers
+  that NUL-pad a fixed-size XMP region for in-place editing do not
+  leak padding into the text key) and `wav:xmp.body_len` (always
+  emitted when the chunk is present, so an XMP-aware reserved block
+  is observable). Schema-agnostic — `<?xpacket begin=...?>` /
+  `<?xpacket end=...?>` and the inner `x:xmpmeta` / RDF tree pass
+  through unchanged. The `CSET`
   (Character Set) chunk (RIFF MCI §3 "CSET Chunk") is parsed end-to-end:
   `wCodePage` / `wCountryCode` / `wLanguageCode` / `wDialect` (each a
   16-bit LE field) surface under `wav:cset.code_page` / `.country` /

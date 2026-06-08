@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- WAV demuxer parses the `_PMX` chunk (Adobe XMP packet, the WAV/AVI
+  carrier for an XMP serialised packet, catalogued in
+  `docs/container/riff/metadata/exiftool-riff-tags.html` § "RIFF Main
+  tags" — entry `'_PMX'`, family `XMP`, scope "AVI and WAV files").
+  The FOURCC is little-endian "XMP_" reversed, the convention RIFF
+  uses for chunks whose payload originates in a little-endian
+  DWORD-aligned authoring tool; the payload is the XMP packet text
+  exactly as it would appear in an XMP sidecar (`x:xmpmeta` wrapped
+  in `<?xpacket begin=...?>` / `<?xpacket end=...?>` processing
+  instructions). Surface shape mirrors the sibling third-party XML
+  parsers (`iXML` / `<axml>`) so the consumer keeps a single mental
+  model: the UTF-8 XMP text surfaces verbatim under `wav:xmp`
+  (trimmed at the first NUL and surrounding whitespace so writers
+  that NUL-pad a fixed-size XMP region for in-place editing do not
+  leak padding into the text key), and the raw on-wire chunk-body
+  length always surfaces under `wav:xmp.body_len` when the chunk is
+  present — even for empty / NUL-only / whitespace-only bodies — so
+  downstream tooling can distinguish "no `_PMX` chunk" from "an
+  `_PMX` chunk reserved for later XMP authoring". An odd-length body
+  forces the standard RIFF 1-byte pad and the `data` chunk that
+  follows is located correctly. The XMP schema (RDF, namespace
+  prefixes, xpacket processing instructions) is not interpreted at
+  this layer; a higher-level XMP-aware crate can apply
+  schema-specific decoding without re-walking the RIFF tree. Tests
+  cover a canonical Adobe-style packet, NUL-padded reservation
+  bodies, an empty body (`body_len = 0`, no text key),
+  whitespace-only bodies, odd-length pad rounding, and the absence
+  guard (a file without `_PMX` emits no `wav:xmp.*` keys).
+
 - WAV demuxer parses the `<axml>` chunk per
   `docs/container/riff/metadata/ebu-tech3285s5-ADM.pdf` §3 ("AXML
   chunk definition"). The chunk carries a UTF-8 XML document
