@@ -59,7 +59,17 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework �
   playlist entries); `labl` / `note` text sub-chunks surface as
   `wav:adtl.labl.<dwName>` / `wav:adtl.note.<dwName>`; the `ltxt`
   (text-with-segment-length) sub-chunk surfaces as
-  `wav:adtl.ltxt.<dwName>.length` / `.purpose` (FOURCC) / `.text`. The
+  `wav:adtl.ltxt.<dwName>.length` / `.purpose` (FOURCC) / `.text` plus
+  its four §3 locale WORDs `.country` / `.language` / `.dialect` /
+  `.code_page` (raw decimals, always emitted) with `.country_name` /
+  `.language_name` resolved through the same §3 Chapter-2 tables the
+  `CSET` chunk uses (emitted only when the code is in the enumerated
+  set); the `file` (embedded media file) sub-chunk surfaces
+  `wav:adtl.file.<dwName>.med_type` (FOURCC when printable, the
+  spec-allowed zero as `0`, hex otherwise) and `.body_len` (embedded
+  payload length — the `fileData` bytes themselves are not exposed
+  through the string-typed metadata API); sub-chunks shorter than
+  their fixed headers are skipped as opaque. The
   `smpl` (Sampler) and `inst` (Instrument) chunks surface through
   `wav:smpl.*` (manufacturer / product / sample_period / midi_unity_note
   / midi_pitch_fraction / smpte_format / smpte_offset rendered as

@@ -585,8 +585,9 @@ fn open_demuxer(
 /// `INFO` maps `IART`/`INAM`/... sub-chunks to standard key names
 /// (`artist`, `title`, ...); `adtl` (Associated Data List, per
 /// `docs/container/riff/metadata/microsoft-riffmci.pdf` §3 "Associated
-/// Data Chunk") maps `labl`/`note`/`ltxt` sub-chunks to
-/// `wav:adtl.<id>.<dwName>` keys carrying the cue-point text.
+/// Data Chunk") maps `labl`/`note`/`ltxt`/`file` sub-chunks to
+/// `wav:adtl.<id>.<dwName>` keys carrying the cue-point text /
+/// embedded-file accounting.
 fn parse_list_chunk(buf: &[u8], out: &mut Vec<(String, String)>) {
     if buf.len() < 4 {
         return;
@@ -634,10 +635,28 @@ fn parse_info_list(buf: &[u8], out: &mut Vec<(String, String)>) {
 ///   <wDialect> <wCodePage> <data:BYTE>...)` — text covering a
 ///   `dwSampleLength`-sample segment starting at cue `dwName`. The
 ///   parser surfaces the segment length under `.ltxt.<dwName>.length`,
-///   the FOURCC purpose under `.ltxt.<dwName>.purpose`, and the text
-///   payload (trimmed at the first NUL) under `.ltxt.<dwName>.text`.
-/// * `file(...)` — embedded media file; skipped (binary, no useful
-///   metadata key without a reader for the inner format type).
+///   the FOURCC purpose under `.ltxt.<dwName>.purpose`, the text
+///   payload (trimmed at the first NUL) under `.ltxt.<dwName>.text`,
+///   and the four locale WORDs under `.ltxt.<dwName>.country` /
+///   `.language` / `.dialect` / `.code_page` (raw decimals, always
+///   emitted). Per §3 "Text with Data Length Information" the country
+///   and `(language, dialect)` codes come from the same Chapter-2
+///   tables the `CSET` chunk uses, so the parser resolves them through
+///   the shared table lookups into `.ltxt.<dwName>.country_name` /
+///   `.language_name` (emitted only when the code is in the spec's
+///   enumerated set).
+/// * `file(<dwName:DWORD> <dwMedType:DWORD> <fileData:BYTE>...)` —
+///   embedded media file for cue `dwName`. Per §3 "Embedded File
+///   Information" `dwMedType` identifies the file type carried in
+///   `fileData` ("If the fileData section contains a RIFF form, the
+///   dwMedType field is the same as the RIFF form type"; zero is
+///   explicitly allowed). The parser surfaces the type under
+///   `.file.<dwName>.med_type` (FOURCC text when printable, `0` for
+///   the spec-allowed zero value, hex otherwise) and the embedded
+///   payload length under `.file.<dwName>.body_len`. The `fileData`
+///   bytes themselves are not surfaced through the string-typed
+///   metadata API — `body_len` keeps the payload observable without
+///   pretending the parser can interpret the inner format.
 ///
 /// Sub-chunks shorter than the minimum required header are skipped.
 fn parse_adtl_list(buf: &[u8], out: &mut Vec<(String, String)>) {
@@ -682,6 +701,45 @@ fn parse_adtl_list(buf: &[u8], out: &mut Vec<(String, String)>) {
                     )
                 };
                 out.push((format!("wav:adtl.ltxt.{dw_name}.purpose"), purpose_str));
+                // §3 "Text with Data Length Information": wCountry,
+                // (wLanguage, wDialect) and wCodePage qualify the text
+                // payload, drawing on the same Chapter-2 country /
+                // language-and-dialect tables that the CSET chunk uses.
+                // Raw decimals are always emitted (zero = "use the
+                // default" per the CSET zero-value semantics); the
+                // human-readable names only when the table resolves.
+                let country = u16::from_le_bytes([body[12], body[13]]);
+                let language = u16::from_le_bytes([body[14], body[15]]);
+                let dialect = u16::from_le_bytes([body[16], body[17]]);
+                let code_page = u16::from_le_bytes([body[18], body[19]]);
+                out.push((
+                    format!("wav:adtl.ltxt.{dw_name}.country"),
+                    country.to_string(),
+                ));
+                if let Some(name) = cset_country_name(country) {
+                    out.push((
+                        format!("wav:adtl.ltxt.{dw_name}.country_name"),
+                        name.to_string(),
+                    ));
+                }
+                out.push((
+                    format!("wav:adtl.ltxt.{dw_name}.language"),
+                    language.to_string(),
+                ));
+                out.push((
+                    format!("wav:adtl.ltxt.{dw_name}.dialect"),
+                    dialect.to_string(),
+                ));
+                if let Some(name) = cset_language_name(language, dialect) {
+                    out.push((
+                        format!("wav:adtl.ltxt.{dw_name}.language_name"),
+                        name.to_string(),
+                    ));
+                }
+                out.push((
+                    format!("wav:adtl.ltxt.{dw_name}.code_page"),
+                    code_page.to_string(),
+                ));
                 let raw = &body[20..];
                 // The text payload may or may not be NUL-terminated
                 // per the spec ("<data:BYTE>..."); trim at the first
@@ -692,10 +750,34 @@ fn parse_adtl_list(buf: &[u8], out: &mut Vec<(String, String)>) {
                     out.push((format!("wav:adtl.ltxt.{dw_name}.text"), text));
                 }
             }
-            // `file` sub-chunks carry an embedded media file; we don't
-            // surface their bytes through the string-typed metadata API.
-            // Truncated `labl`/`note`/`ltxt` (under the fixed-header
-            // minimum) are likewise skipped as opaque.
+            // §3 "Embedded File Information": dwName + dwMedType fixed
+            // header, then the embedded file bytes. The fileData payload
+            // is not surfaced through the string-typed metadata API;
+            // `med_type` + `body_len` keep it observable.
+            b"file" if body.len() >= 8 => {
+                let dw_name = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+                let med_type = &body[4..8];
+                // "This field can contain a zero value" — render the
+                // spec-allowed zero as plain `0`, a printable FOURCC as
+                // text, anything else as hex.
+                let med_type_str = if med_type == [0, 0, 0, 0] {
+                    "0".to_string()
+                } else if med_type.iter().all(|&b| (0x20..=0x7E).contains(&b)) {
+                    String::from_utf8_lossy(med_type).to_string()
+                } else {
+                    format!(
+                        "0x{:02X}{:02X}{:02X}{:02X}",
+                        med_type[0], med_type[1], med_type[2], med_type[3]
+                    )
+                };
+                out.push((format!("wav:adtl.file.{dw_name}.med_type"), med_type_str));
+                out.push((
+                    format!("wav:adtl.file.{dw_name}.body_len"),
+                    (body.len() - 8).to_string(),
+                ));
+            }
+            // Truncated `labl`/`note`/`ltxt`/`file` (under the
+            // fixed-header minimum) are skipped as opaque.
             _ => {}
         }
         i += size;
@@ -3058,10 +3140,10 @@ mod tests {
         ltxt_body.extend_from_slice(&7u32.to_le_bytes()); // dwName
         ltxt_body.extend_from_slice(&4410u32.to_le_bytes()); // dwSampleLength
         ltxt_body.extend_from_slice(b"scrp"); // dwPurpose
-        ltxt_body.extend_from_slice(&0u16.to_le_bytes()); // wCountry
-        ltxt_body.extend_from_slice(&0u16.to_le_bytes()); // wLanguage
-        ltxt_body.extend_from_slice(&0u16.to_le_bytes()); // wDialect
-        ltxt_body.extend_from_slice(&0u16.to_le_bytes()); // wCodePage
+        ltxt_body.extend_from_slice(&44u16.to_le_bytes()); // wCountry (United Kingdom)
+        ltxt_body.extend_from_slice(&9u16.to_le_bytes()); // wLanguage (English)
+        ltxt_body.extend_from_slice(&2u16.to_le_bytes()); // wDialect (UK)
+        ltxt_body.extend_from_slice(&1252u16.to_le_bytes()); // wCodePage
         ltxt_body.extend_from_slice(b"Hello world");
         ltxt_body.push(0);
 
@@ -3084,6 +3166,129 @@ mod tests {
             md.get("wav:adtl.ltxt.7.text"),
             Some(&"Hello world".to_string())
         );
+        // §3 locale WORDs: raw decimals plus the Chapter-2 table
+        // resolutions shared with CSET.
+        assert_eq!(md.get("wav:adtl.ltxt.7.country"), Some(&"44".to_string()));
+        assert_eq!(
+            md.get("wav:adtl.ltxt.7.country_name"),
+            Some(&"United Kingdom".to_string())
+        );
+        assert_eq!(md.get("wav:adtl.ltxt.7.language"), Some(&"9".to_string()));
+        assert_eq!(md.get("wav:adtl.ltxt.7.dialect"), Some(&"2".to_string()));
+        assert_eq!(
+            md.get("wav:adtl.ltxt.7.language_name"),
+            Some(&"UK English".to_string())
+        );
+        assert_eq!(
+            md.get("wav:adtl.ltxt.7.code_page"),
+            Some(&"1252".to_string())
+        );
+    }
+
+    /// `ltxt` locale fields left at zero still surface their raw
+    /// decimals (zero = "use the default" per the CSET zero-value
+    /// semantics) and resolve to the tables' explicit zero rows.
+    #[test]
+    fn adtl_ltxt_zero_locale_fields_surface() {
+        let mut cue_body = Vec::new();
+        cue_body.extend_from_slice(&1u32.to_le_bytes());
+        cue_body.extend(cue_point(3, 0, b"data", 0, 0, 0));
+
+        let mut ltxt_body = Vec::new();
+        ltxt_body.extend_from_slice(&3u32.to_le_bytes()); // dwName
+        ltxt_body.extend_from_slice(&100u32.to_le_bytes()); // dwSampleLength
+        ltxt_body.extend_from_slice(b"capt"); // dwPurpose
+        ltxt_body.extend_from_slice(&[0u8; 8]); // four zero WORDs
+
+        let mut adtl = Vec::new();
+        adtl.extend_from_slice(b"ltxt");
+        adtl.extend_from_slice(&(ltxt_body.len() as u32).to_le_bytes());
+        adtl.extend_from_slice(&ltxt_body);
+
+        let bytes = wav_with_cue_and_adtl(&cue_body, Some(&adtl));
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+
+        assert_eq!(md.get("wav:adtl.ltxt.3.country"), Some(&"0".to_string()));
+        assert_eq!(
+            md.get("wav:adtl.ltxt.3.country_name"),
+            Some(&"None".to_string())
+        );
+        assert_eq!(md.get("wav:adtl.ltxt.3.language"), Some(&"0".to_string()));
+        assert_eq!(md.get("wav:adtl.ltxt.3.dialect"), Some(&"0".to_string()));
+        assert_eq!(
+            md.get("wav:adtl.ltxt.3.language_name"),
+            Some(&"None".to_string())
+        );
+        assert_eq!(md.get("wav:adtl.ltxt.3.code_page"), Some(&"0".to_string()));
+        // No text payload past the 20-byte fixed header → no text key.
+        assert_eq!(md.get("wav:adtl.ltxt.3.text"), None);
+    }
+
+    /// `file` sub-chunk (§3 "Embedded File Information") surfaces the
+    /// media type FOURCC and the embedded payload length under
+    /// `wav:adtl.file.<dwName>.*` without exposing the payload bytes.
+    #[test]
+    fn adtl_file_subchunk_metadata() {
+        let mut cue_body = Vec::new();
+        cue_body.extend_from_slice(&1u32.to_le_bytes());
+        cue_body.extend(cue_point(5, 0, b"data", 0, 0, 0));
+
+        // file chunk for cue 5: an embedded 'RDIB' form of 11 bytes
+        // (the spec's own example of an embeddable RIFF form type).
+        let mut file_body = Vec::new();
+        file_body.extend_from_slice(&5u32.to_le_bytes()); // dwName
+        file_body.extend_from_slice(b"RDIB"); // dwMedType
+        file_body.extend_from_slice(&[0xAAu8; 11]); // fileData
+
+        let mut adtl = Vec::new();
+        adtl.extend_from_slice(b"file");
+        adtl.extend_from_slice(&(file_body.len() as u32).to_le_bytes());
+        adtl.extend_from_slice(&file_body);
+        if file_body.len() % 2 == 1 {
+            adtl.push(0);
+        }
+        // A second file chunk (dwName 6) with the spec-allowed zero
+        // dwMedType and no fileData payload.
+        let mut file2_body = Vec::new();
+        file2_body.extend_from_slice(&6u32.to_le_bytes()); // dwName
+        file2_body.extend_from_slice(&0u32.to_le_bytes()); // dwMedType = 0
+        adtl.extend_from_slice(b"file");
+        adtl.extend_from_slice(&(file2_body.len() as u32).to_le_bytes());
+        adtl.extend_from_slice(&file2_body);
+
+        let bytes = wav_with_cue_and_adtl(&cue_body, Some(&adtl));
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+
+        assert_eq!(
+            md.get("wav:adtl.file.5.med_type"),
+            Some(&"RDIB".to_string())
+        );
+        assert_eq!(md.get("wav:adtl.file.5.body_len"), Some(&"11".to_string()));
+        // Zero med_type renders as plain "0"; empty fileData → 0 len.
+        assert_eq!(md.get("wav:adtl.file.6.med_type"), Some(&"0".to_string()));
+        assert_eq!(md.get("wav:adtl.file.6.body_len"), Some(&"0".to_string()));
+    }
+
+    /// A `file` sub-chunk shorter than its 8-byte fixed header is
+    /// skipped as opaque — no keys, no panic.
+    #[test]
+    fn adtl_file_truncated_is_skipped() {
+        let cue_body = 0u32.to_le_bytes().to_vec();
+        let mut adtl = Vec::new();
+        adtl.extend_from_slice(b"file");
+        adtl.extend_from_slice(&6u32.to_le_bytes()); // 6 < 8-byte header
+        adtl.extend_from_slice(&[0u8; 6]);
+        let bytes = wav_with_cue_and_adtl(&cue_body, Some(&adtl));
+        let dmx = open_demux_from_bytes(bytes);
+        assert!(dmx
+            .metadata()
+            .iter()
+            .all(|(k, _)| !k.starts_with("wav:adtl.file.")));
+        assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
     }
 
     /// A `cue ` chunk whose `dwCuePoints` count exceeds the body length

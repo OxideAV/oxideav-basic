@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- WAV demuxer completes `LIST adtl` (Associated Data List) coverage per
+  `docs/container/riff/metadata/microsoft-riffmci.pdf` §3 "Associated
+  Data Chunk" — all four spec-defined sub-chunks are now parsed. The
+  `file` sub-chunk (§3 "Embedded File Information",
+  `file( <dwName:DWORD> <dwMedType:DWORD> <fileData:BYTE>... )`) is no
+  longer skipped: `wav:adtl.file.<dwName>.med_type` renders the media
+  type as FOURCC text when printable, the spec-allowed zero value as
+  plain `0` ("This field can contain a zero value"), and hex otherwise;
+  `wav:adtl.file.<dwName>.body_len` carries the embedded `fileData`
+  payload length (the payload bytes themselves are not exposed through
+  the string-typed metadata API — `body_len` keeps the attachment
+  observable without pretending the parser interprets the inner
+  format). The `ltxt` sub-chunk's four previously-undecoded locale
+  WORDs now surface: `wav:adtl.ltxt.<dwName>.country` / `.language` /
+  `.dialect` / `.code_page` (raw decimals, always emitted), with
+  `.country_name` / `.language_name` resolved through the same §3
+  Chapter-2 "Country Codes" / "Language and Dialect Codes" tables the
+  `CSET` parser uses (emitted only when the code is in the spec's
+  enumerated set; zero resolves to the tables' explicit `None` rows).
+  Sub-chunks shorter than their fixed headers (8 bytes for `file`,
+  20 for `ltxt`) remain skipped-as-opaque. Three new lib tests cover
+  the `file` FOURCC + zero-med_type + payload-length path, the
+  truncated-`file` opaque path, and the zero-locale `ltxt` path; the
+  existing `ltxt` test now drives non-zero locale fields
+  (UK / UK English / code page 1252) end-to-end.
+
 - WAV demuxer recognises the `slnt` (Silence) chunk per
   `docs/container/riff/metadata/microsoft-riffmci.pdf` §3 "Wave Data"
   (`<silence-ck> ➝ slnt( <dwSamples:DWORD> )` — "Count of silent
