@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- WAV demuxer recognises the `slnt` (Silence) chunk per
+  `docs/container/riff/metadata/microsoft-riffmci.pdf` §3 "Wave Data"
+  (`<silence-ck> ➝ slnt( <dwSamples:DWORD> )` — "Count of silent
+  samples"). Per the §3 note the chunk records a *count of silent
+  samples* rather than carrying any PCM payload, and the correct
+  playback fill value is context-dependent ("not necessarily a repeated
+  zero volume or baseline sample"), so the parser surfaces accounting
+  metadata without synthesising real zero/baseline samples into the
+  decoded stream. Each encounter emits `wav:slnt.<n>.samples`
+  (zero-based per-chunk `dwSamples` count) and updates the rolling
+  aggregates `wav:slnt.count` (total `slnt` chunks seen) and
+  `wav:slnt.total_samples` (cumulative silent-sample count). The §3
+  grammar `<wave-data> ➝ { <data-ck> | <data-list> }` lets the chunk
+  appear at the top level as a sibling of `data` (as well as inside a
+  `wavl` LIST); the demuxer accounts for every top-level occurrence. A
+  body shorter than the 4-byte `dwSamples` field is counted but treated
+  as opaque — it contributes `0` to the running total and omits its
+  per-chunk `samples` key, mirroring the other fixed-struct parsers;
+  a body longer than 4 bytes decodes the leading DWORD and tolerates
+  trailing forward-extension bytes. An odd-length body forces the
+  standard RIFF §2 word-align pad and the `data` chunk that follows is
+  located correctly. Files with no `slnt` chunk emit no `wav:slnt.*`
+  keys at all — absence is observable. Seven new lib tests cover the
+  single-chunk path, the multi-chunk accumulation path, the
+  zero-samples in-range path, the no-slnt absence guard, the
+  under-length opaque-body path, the over-length leading-DWORD path,
+  and the coexistence path with `JUNK` + `LIST INFO` interleaved.
 - WAV demuxer parses the `_PMX` chunk (Adobe XMP packet, the WAV/AVI
   carrier for an XMP serialised packet, catalogued in
   `docs/container/riff/metadata/exiftool-riff-tags.html` § "RIFF Main

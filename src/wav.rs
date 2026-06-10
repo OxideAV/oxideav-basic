@@ -460,6 +460,22 @@ fn open_demuxer(
                     input.seek(SeekFrom::Current(1))?;
                 }
             }
+            b"slnt" => {
+                // Microsoft RIFF MCI §3 "Wave Data": the `slnt`
+                // (silence) chunk `slnt( <dwSamples:DWORD> )` carries a
+                // single DWORD count of silent samples rather than a
+                // stretch of zeroed sample data. It normally appears
+                // inside a `wavl` LIST alternating with `data` chunks,
+                // but the spec allows it as a sibling of `data` at the
+                // top level too. We surface its sample count without
+                // synthesising real silence into the decoded stream.
+                let mut buf = vec![0u8; size as usize];
+                input.read_exact(&mut buf)?;
+                surface_slnt_metadata(&mut metadata, &buf);
+                if size % 2 == 1 {
+                    input.seek(SeekFrom::Current(1))?;
+                }
+            }
             b"data" => {
                 data_offset = input.stream_position()?;
                 data_size = size;
@@ -1232,6 +1248,64 @@ fn surface_junk_metadata(out: &mut Vec<(String, String)>, size: u64) {
     out.retain(|(k, _)| k != "wav:junk.count" && k != "wav:junk.total_bytes");
     out.push(("wav:junk.count".to_string(), count.to_string()));
     out.push(("wav:junk.total_bytes".to_string(), total.to_string()));
+}
+
+/// Surface metadata for a `slnt` (silence) chunk per
+/// `docs/container/riff/metadata/microsoft-riffmci.pdf` §3 "Wave Data":
+///
+/// > `<silence-ck>` ➝ `slnt( <dwSamples:DWORD> )` — Count of silent
+/// > samples.
+///
+/// The §3 note clarifies that "the `slnt` chunk represents silence, not
+/// necessarily a repeated zero volume or baseline sample" — i.e. the
+/// chunk records a *count of silent samples* rather than carrying any
+/// PCM payload. A `slnt` chunk most commonly appears inside a `wavl`
+/// LIST alternating with `data` chunks (a sparse-silence encoding), but
+/// the §3 grammar `<wave-data> ➝ { <data-ck> | <data-list> }` also lets
+/// the demuxer encounter a top-level `slnt` sibling of `data`; we
+/// account for every occurrence either way.
+///
+/// We deliberately do not synthesise real zero/baseline samples into
+/// the decoded stream (that is a host-runtime playback decision, and
+/// the §3 note is explicit that the "right" fill value is
+/// context-dependent — the last-played sample, not necessarily zero).
+/// Instead we surface accounting so a downstream tool can observe how
+/// many silent samples the producer encoded sparsely without re-walking
+/// the file:
+///
+/// * `wav:slnt.count` — number of `slnt` chunks seen so far. Each call
+///   increments the counter so a multi-`slnt` file (the normal `wavl`
+///   case) is fully observable.
+/// * `wav:slnt.total_samples` — cumulative silent-sample count across
+///   all `slnt` chunks (the sum of every `dwSamples` field).
+/// * `wav:slnt.<n>.samples` — per-chunk `dwSamples` value, indexed
+///   zero-based by encounter order.
+///
+/// A body shorter than the 4-byte `dwSamples` field is treated as
+/// opaque: the chunk is still counted (so the reservation is
+/// observable) but contributes `0` to the running sample total and its
+/// per-chunk `samples` key is omitted, mirroring how the other
+/// fixed-struct parsers treat an under-length body.
+fn surface_slnt_metadata(out: &mut Vec<(String, String)>, buf: &[u8]) {
+    let mut count: u64 = 0;
+    let mut total: u64 = 0;
+    for (k, v) in out.iter() {
+        if k == "wav:slnt.count" {
+            count = v.parse().unwrap_or(count);
+        } else if k == "wav:slnt.total_samples" {
+            total = v.parse().unwrap_or(total);
+        }
+    }
+    let idx = count;
+    count = count.saturating_add(1);
+    if buf.len() >= 4 {
+        let samples = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        total = total.saturating_add(samples as u64);
+        out.push((format!("wav:slnt.{idx}.samples"), samples.to_string()));
+    }
+    out.retain(|(k, _)| k != "wav:slnt.count" && k != "wav:slnt.total_samples");
+    out.push(("wav:slnt.count".to_string(), count.to_string()));
+    out.push(("wav:slnt.total_samples".to_string(), total.to_string()));
 }
 
 /// Map a Microsoft RIFF MCI §3 "Country Codes" three-digit code to its
@@ -4589,6 +4663,214 @@ mod tests {
         assert_eq!(md.get("wav:junk.1.body_len"), Some(&"4".to_string()));
         // Other chunks survived the interleaved JUNK chunks intact.
         assert_eq!(md.get("wav:cset.code_page"), Some(&"1252".to_string()));
+        assert_eq!(md.get("title"), Some(&"T".to_string()));
+        assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
+    }
+
+    /// Build a minimal valid WAV file carrying the supplied top-level
+    /// `slnt` (silence) chunks. Each `&[u8]` body is written verbatim as
+    /// the chunk payload (canonically a 4-byte LE `dwSamples`, but the
+    /// helper lets a test feed a short/long body to exercise the
+    /// opaque-body path). `fmt ` is PCM-S16 mono so the demuxer accepts
+    /// the file; an empty `data` chunk closes the chunk-walk.
+    fn wav_with_slnt(slnt_bodies: &[&[u8]]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"RIFF");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(b"WAVE");
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&16u32.to_le_bytes());
+        buf.extend_from_slice(&FMT_PCM.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&8_000u32.to_le_bytes());
+        buf.extend_from_slice(&16_000u32.to_le_bytes());
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(&16u16.to_le_bytes());
+        for body in slnt_bodies {
+            buf.extend_from_slice(b"slnt");
+            buf.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            buf.extend_from_slice(body);
+            if body.len() % 2 == 1 {
+                buf.push(0);
+            }
+        }
+        buf.extend_from_slice(b"data");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf
+    }
+
+    /// A single canonical `slnt` chunk surfaces its `dwSamples` count
+    /// under the `wav:slnt.*` accounting keys per Microsoft RIFF MCI §3
+    /// "Wave Data". No real silence is synthesised into the decoded
+    /// stream; the chunk-walk still locates the `data` chunk that
+    /// follows.
+    #[test]
+    fn slnt_single_chunk_surfaces_sample_count() {
+        let bytes = wav_with_slnt(&[&1_000u32.to_le_bytes()]);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:slnt.count"), Some(&"1".to_string()));
+        assert_eq!(md.get("wav:slnt.total_samples"), Some(&"1000".to_string()));
+        assert_eq!(md.get("wav:slnt.0.samples"), Some(&"1000".to_string()));
+        assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
+    }
+
+    /// Multiple top-level `slnt` chunks accumulate into the `count` /
+    /// `total_samples` aggregates and each surfaces its own
+    /// `wav:slnt.<n>.samples`. The §3 grammar allows the silence chunk
+    /// to repeat (the `wavl` alternating-data form); the demuxer
+    /// accounts for every occurrence it sees at the top level.
+    #[test]
+    fn slnt_multiple_chunks_accumulate() {
+        let bytes = wav_with_slnt(&[
+            &500u32.to_le_bytes(),
+            &250u32.to_le_bytes(),
+            &44_100u32.to_le_bytes(),
+        ]);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:slnt.count"), Some(&"3".to_string()));
+        assert_eq!(
+            md.get("wav:slnt.total_samples"),
+            Some(&(500u64 + 250 + 44_100).to_string())
+        );
+        assert_eq!(md.get("wav:slnt.0.samples"), Some(&"500".to_string()));
+        assert_eq!(md.get("wav:slnt.1.samples"), Some(&"250".to_string()));
+        assert_eq!(md.get("wav:slnt.2.samples"), Some(&"44100".to_string()));
+        assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
+    }
+
+    /// A `slnt` chunk whose `dwSamples` field is `0` is in-range (a
+    /// zero-length silence run) and still increments the count. The
+    /// per-chunk `samples = 0` entry distinguishes "an explicit empty
+    /// silence run" from "no slnt chunk at all".
+    #[test]
+    fn slnt_zero_samples_still_counts() {
+        let bytes = wav_with_slnt(&[&0u32.to_le_bytes()]);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:slnt.count"), Some(&"1".to_string()));
+        assert_eq!(md.get("wav:slnt.total_samples"), Some(&"0".to_string()));
+        assert_eq!(md.get("wav:slnt.0.samples"), Some(&"0".to_string()));
+    }
+
+    /// A file with no `slnt` chunk must not synthesise any `wav:slnt.*`
+    /// keys — absence is observable (zero keys is stronger than
+    /// `count = 0`). Regression guard against a future refactor that
+    /// initialises the counter unconditionally.
+    #[test]
+    fn slnt_absent_emits_no_keys() {
+        let bytes = wav_with_slnt(&[]);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert!(
+            !md.keys().any(|k| k.starts_with("wav:slnt")),
+            "no slnt chunk → no wav:slnt.* metadata"
+        );
+        assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
+    }
+
+    /// A `slnt` body shorter than the 4-byte `dwSamples` field is
+    /// treated as opaque: the chunk is still counted (so the reservation
+    /// is observable) but contributes nothing to `total_samples` and its
+    /// per-chunk `samples` key is omitted. Mirrors how the other
+    /// fixed-struct parsers treat an under-length body.
+    #[test]
+    fn slnt_short_body_is_opaque() {
+        // 3-byte body (one short of the 4-byte DWORD) — odd length also
+        // exercises the word-align pad on the way to `data`.
+        let bytes = wav_with_slnt(&[&[0x01, 0x02, 0x03]]);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:slnt.count"), Some(&"1".to_string()));
+        assert_eq!(md.get("wav:slnt.total_samples"), Some(&"0".to_string()));
+        assert!(
+            !md.contains_key("wav:slnt.0.samples"),
+            "under-length slnt body must not surface a samples value"
+        );
+        // data located correctly past the implicit pad byte.
+        assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
+    }
+
+    /// A `slnt` body longer than the canonical 4 bytes still decodes its
+    /// leading `dwSamples` DWORD and tolerates the trailing region for
+    /// forward compatibility (matching the §3 forward-extension rule the
+    /// `fact` parser follows). An odd over-length body also exercises
+    /// the word-align pad ahead of `data`.
+    #[test]
+    fn slnt_long_body_decodes_leading_dword() {
+        // 5-byte body: leading DWORD = 7, one trailing extension byte.
+        let mut body = 7u32.to_le_bytes().to_vec();
+        body.push(0xFF);
+        let bytes = wav_with_slnt(&[&body]);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:slnt.count"), Some(&"1".to_string()));
+        assert_eq!(md.get("wav:slnt.0.samples"), Some(&"7".to_string()));
+        assert_eq!(md.get("wav:slnt.total_samples"), Some(&"7".to_string()));
+        assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
+    }
+
+    /// `slnt` coexists with `JUNK` and `LIST INFO` without disrupting
+    /// the rest of the metadata surface, and the two independent
+    /// accounting namespaces (`wav:slnt.*` vs `wav:junk.*`) don't
+    /// collide. Regression guard for the chunk-walk ordering
+    /// slnt → JUNK → LIST(INFO) → slnt → data.
+    #[test]
+    fn slnt_coexists_with_other_chunks() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"RIFF");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(b"WAVE");
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&16u32.to_le_bytes());
+        buf.extend_from_slice(&FMT_PCM.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&8_000u32.to_le_bytes());
+        buf.extend_from_slice(&16_000u32.to_le_bytes());
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(&16u16.to_le_bytes());
+        // First slnt: 800 silent samples.
+        buf.extend_from_slice(b"slnt");
+        buf.extend_from_slice(&4u32.to_le_bytes());
+        buf.extend_from_slice(&800u32.to_le_bytes());
+        // JUNK: 6 bytes of filler.
+        buf.extend_from_slice(b"JUNK");
+        buf.extend_from_slice(&6u32.to_le_bytes());
+        buf.extend(std::iter::repeat_n(0xAAu8, 6));
+        // LIST INFO with INAM = "T".
+        let mut list_body = Vec::new();
+        list_body.extend_from_slice(b"INFO");
+        list_body.extend_from_slice(b"INAM");
+        list_body.extend_from_slice(&1u32.to_le_bytes());
+        list_body.extend_from_slice(b"T");
+        list_body.push(0);
+        buf.extend_from_slice(b"LIST");
+        buf.extend_from_slice(&(list_body.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&list_body);
+        // Second slnt: 200 silent samples.
+        buf.extend_from_slice(b"slnt");
+        buf.extend_from_slice(&4u32.to_le_bytes());
+        buf.extend_from_slice(&200u32.to_le_bytes());
+        // empty data chunk.
+        buf.extend_from_slice(b"data");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+
+        let dmx = open_demux_from_bytes(buf);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:slnt.count"), Some(&"2".to_string()));
+        assert_eq!(md.get("wav:slnt.total_samples"), Some(&"1000".to_string()));
+        assert_eq!(md.get("wav:slnt.0.samples"), Some(&"800".to_string()));
+        assert_eq!(md.get("wav:slnt.1.samples"), Some(&"200".to_string()));
+        // JUNK + INFO survived the interleaved slnt chunks intact.
+        assert_eq!(md.get("wav:junk.count"), Some(&"1".to_string()));
         assert_eq!(md.get("title"), Some(&"T".to_string()));
         assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
     }

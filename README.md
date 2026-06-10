@@ -132,7 +132,19 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework �
   writer reserved for in-place edits without pretending the bytes
   carry meaning. Multiple `JUNK` chunks are allowed; empty `JUNK`
   chunks (size = 0) still increment the count. Files with no `JUNK`
-  chunk emit no `wav:junk.*` keys at all (absence is observable).
+  chunk emit no `wav:junk.*` keys at all (absence is observable). The
+  `slnt` (Silence) chunk (RIFF MCI §3 "Wave Data" —
+  `slnt( dwSamples:DWORD )`) is recognised end-to-end: each chunk's
+  4-byte `dwSamples` count of silent samples surfaces as
+  `wav:slnt.<n>.samples` (zero-based by encounter order), the rolling
+  aggregates `wav:slnt.count` / `wav:slnt.total_samples` accumulate, and
+  no real zero/baseline samples are synthesised into the decoded stream
+  (the §3 note is explicit that the correct fill value is
+  context-dependent, not necessarily zero). Bodies shorter than the
+  4-byte field are counted but treated as opaque (no `samples` key);
+  over-length bodies decode the leading DWORD and tolerate trailing
+  forward-extension bytes. Files with no `slnt` chunk emit no
+  `wav:slnt.*` keys at all.
 - **slin** container: Asterisk-style headerless `.sln*` / `.slin*` raw
   S16LE PCM (extension drives the sample rate).
 - **Y4M (YUV4MPEG2)** container: rawvideo demuxer + muxer for `.y4m` files,
