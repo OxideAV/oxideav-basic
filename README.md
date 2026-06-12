@@ -154,7 +154,26 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework �
   4-byte field are counted but treated as opaque (no `samples` key);
   over-length bodies decode the leading DWORD and tolerate trailing
   forward-extension bytes. Files with no `slnt` chunk emit no
-  `wav:slnt.*` keys at all.
+  `wav:slnt.*` keys at all. The Acidizer `acid` chunk (layout per the
+  staged byte-indexed Acidizer table in
+  `docs/container/riff/metadata/exiftool-riff-tags.html`) is supported
+  on BOTH the read and write sides through the typed `wav::AcidChunk`
+  struct (24-byte LE body: flags bit-field @0, root note @4, six
+  reserved bytes carried verbatim @6..12, beats @12, meter @16, tempo
+  @20, with `parse` / `to_bytes` and the five documented flag-bit
+  helpers plus the 48..=71 root-note name table). The demuxer surfaces
+  `wav:acid.*` keys (flags hex, each flag bit, root note + name,
+  beats, meter, tempo, plus reserved-hex / body_len observability
+  keys) and the typed view via `WavDemuxer::acid()`; the muxer writes
+  the chunk via `WavMuxOptions::with_acid`. Truncated bodies are
+  skipped-as-opaque; the mux→demux round-trip is pinned byte-for-byte
+  in tests. The concrete demuxer is now publicly constructible via
+  `wav::open_wav_demuxer` so every typed accessor is reachable without
+  downcasting. ADM `chna` (channel-allocation) support is blocked on a
+  docs gap: the staged ITU-R BS.2076-1 §7 defines only the logical
+  record content (Table 46) and defers the binary chunk layout to
+  ITU-R BS.2088, which is not yet staged under
+  `docs/container/riff/metadata/`.
 - **slin** container: Asterisk-style headerless `.sln*` / `.slin*` raw
   S16LE PCM (extension drives the sample rate).
 - **Y4M (YUV4MPEG2)** container: rawvideo demuxer + muxer for `.y4m` files,

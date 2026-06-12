@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- WAV Acidizer `acid` chunk — read AND write sides with a typed
+  accessor surface, layout per
+  `docs/container/riff/metadata/exiftool-riff-tags.html` § "RIFF
+  Acidizer Tags" (24-byte little-endian body: flags bit-field at
+  offset 0, root note at 4, six reserved bytes carried verbatim at
+  6..12, beats at 12, meter at 16, tempo at 20). New public
+  `wav::AcidChunk` type with `parse` / `to_bytes` and per-bit helpers
+  (`one_shot` / `root_note_set` / `stretch` / `disk_based` /
+  `high_octave`) plus the 48..=71 root-note name table
+  (`root_note_name`). Demuxer surfaces `wav:acid.flags` /
+  `.one_shot` / `.root_note_set` / `.stretch` / `.disk_based` /
+  `.high_octave` / `.root_note` / `.root_note_name` / `.num_beats` /
+  `.meter` / `.tempo` (+ `.reserved` hex when nonzero and `.body_len`
+  when extension bytes ride past the fixed struct); truncated bodies
+  are skipped-as-opaque. Muxer gains
+  `WavMuxOptions::with_acid(AcidChunk)` emitting the chunk ahead of
+  `data`. Six new lib tests: byte-layout golden pin, full metadata
+  surface, out-of-table root note + reserved/body_len observability,
+  truncated-skip, mux→demux round-trip (serialized chunk pinned
+  verbatim in the output bytes), and typed-accessor equality.
+
+- New public `wav::open_wav_demuxer` returning the concrete
+  `WavDemuxer` so the typed accessor surface (`format_tag`,
+  `channel_mask`, `subformat`, `acid`, …) is reachable without
+  downcasting; the registry path now wraps it.
+
 - WAV demuxer completes `LIST adtl` (Associated Data List) coverage per
   `docs/container/riff/metadata/microsoft-riffmci.pdf` §3 "Associated
   Data Chunk" — all four spec-defined sub-chunks are now parsed. The

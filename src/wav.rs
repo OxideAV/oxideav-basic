@@ -259,10 +259,16 @@ fn fmt_guid(g: &[u8; 16]) -> String {
 
 // --- Demuxer ---------------------------------------------------------------
 
-fn open_demuxer(
-    mut input: Box<dyn ReadSeek>,
-    _codecs: &dyn CodecResolver,
-) -> Result<Box<dyn Demuxer>> {
+fn open_demuxer(input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
+    Ok(Box::new(open_wav_demuxer(input)?))
+}
+
+/// Open a WAV/RF64/BW64 demuxer returning the concrete [`WavDemuxer`]
+/// so the typed accessor surface ([`WavDemuxer::format_tag`],
+/// [`WavDemuxer::channel_mask`], [`WavDemuxer::acid`], …) is reachable
+/// without downcasting. The registry path wraps this in a
+/// `Box<dyn Demuxer>`.
+pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
     let mut hdr = [0u8; 12];
     input.read_exact(&mut hdr)?;
     let magic: [u8; 4] = [hdr[0], hdr[1], hdr[2], hdr[3]];
@@ -283,6 +289,8 @@ fn open_demuxer(
     // Chunk" — the only honest sample count when `block_align *
     // total_samples != data_size`.
     let mut fact_sample_count: Option<u64> = None;
+    // Typed Acidizer view, populated when an `acid` chunk parses.
+    let mut acid: Option<AcidChunk> = None;
     // RF64/BW64 ds64 (EBU Tech 3306 §3 / Annex A.2): mandatory first
     // chunk after the form header when the magic is RF64 or BW64;
     // otherwise must be absent.
@@ -409,6 +417,14 @@ fn open_demuxer(
                 let mut buf = vec![0u8; size as usize];
                 input.read_exact(&mut buf)?;
                 parse_inst_chunk(&buf, &mut metadata);
+                if size % 2 == 1 {
+                    input.seek(SeekFrom::Current(1))?;
+                }
+            }
+            b"acid" => {
+                let mut buf = vec![0u8; size as usize];
+                input.read_exact(&mut buf)?;
+                acid = parse_acid_chunk(&buf, &mut metadata);
                 if size % 2 == 1 {
                     input.seek(SeekFrom::Current(1))?;
                 }
@@ -563,7 +579,7 @@ fn open_demuxer(
         params,
     };
 
-    Ok(Box::new(WavDemuxer {
+    Ok(WavDemuxer {
         input,
         streams: vec![stream],
         data_offset,
@@ -578,7 +594,8 @@ fn open_demuxer(
         valid_bits_per_sample: fmt.valid_bits_per_sample,
         channel_mask: fmt.channel_mask,
         subformat: fmt.subformat,
-    }))
+        acid,
+    })
 }
 
 /// Parse a RIFF LIST chunk body. Dispatches by the 4-byte list type:
@@ -1086,6 +1103,195 @@ fn parse_inst_chunk(buf: &[u8], out: &mut Vec<(String, String)>) {
         "wav:inst.high_velocity".to_string(),
         high_velocity.to_string(),
     ));
+}
+
+/// `AcidChunk::flags` bit 0 — the clip is a one-shot (played once,
+/// not tempo-stretched as a loop).
+pub const ACID_FLAG_ONE_SHOT: u32 = 1 << 0;
+/// `AcidChunk::flags` bit 1 — `root_note` carries a meaningful value.
+pub const ACID_FLAG_ROOT_NOTE_SET: u32 = 1 << 1;
+/// `AcidChunk::flags` bit 2 — time-stretch enabled.
+pub const ACID_FLAG_STRETCH: u32 = 1 << 2;
+/// `AcidChunk::flags` bit 3 — disk-based (streamed) rather than
+/// RAM-resident.
+pub const ACID_FLAG_DISK_BASED: u32 = 1 << 3;
+/// `AcidChunk::flags` bit 4 — high-octave root-note interpretation.
+pub const ACID_FLAG_HIGH_OCTAVE: u32 = 1 << 4;
+
+/// Typed view of the Acidizer `acid` chunk body (loop/tempo metadata
+/// written by loop-authoring tools). Field offsets and flag-bit
+/// semantics per
+/// `docs/container/riff/metadata/exiftool-riff-tags.html` § "RIFF
+/// Acidizer Tags" (byte-indexed table: flags at 0, root note at 4,
+/// beats at 12, meter at 16, tempo at 20):
+///
+/// ```text
+/// <acid-ck> -> acid( <Flags:u32> <RootNote:u16> <Reserved:[u8;6]>
+///                    <Beats:u32> <Meter:u32> <Tempo:f32> )   // 24 bytes
+/// ```
+///
+/// All integer fields are little-endian. The staged reference
+/// enumerates the field *offsets*; the widths follow from the offset
+/// deltas (flags 0..4, beats 12..16, meter 16..20, tempo 20..24).
+/// Within the 8-byte span between the root-note offset (4) and the
+/// beats offset (12) only the leading 16 bits are enumerated (root
+/// note, value range 48..=71 per the table) — the remaining 6 bytes
+/// are not described, so they are carried verbatim in [`Self::reserved`]
+/// and round-trip losslessly. `tempo` is the 32-bit field at offset
+/// 20, interpreted as an IEEE-754 little-endian beats-per-minute
+/// value (the only 32-bit reading under which musically plausible
+/// tempos are representable with fractional precision).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AcidChunk {
+    /// Bit-field at offset 0 — see the `ACID_FLAG_*` constants.
+    pub flags: u32,
+    /// Root note at offset 4. 48 = C up to 71 = High B per the staged
+    /// table; meaningful only when [`Self::root_note_set`] is true.
+    pub root_note: u16,
+    /// Bytes 6..12 — not enumerated by the staged reference; preserved
+    /// verbatim so a read→write pass is byte-lossless.
+    pub reserved: [u8; 6],
+    /// Number of beats in the clip (offset 12).
+    pub num_beats: u32,
+    /// Meter field at offset 16 (single 32-bit field in the staged
+    /// table; carried raw).
+    pub meter: u32,
+    /// Tempo in beats per minute (offset 20).
+    pub tempo: f32,
+}
+
+impl AcidChunk {
+    /// Fixed body length of the `acid` chunk in bytes.
+    pub const BODY_LEN: usize = 24;
+
+    /// Bit 0 — one-shot clip.
+    pub fn one_shot(&self) -> bool {
+        self.flags & ACID_FLAG_ONE_SHOT != 0
+    }
+
+    /// Bit 1 — `root_note` carries a meaningful value.
+    pub fn root_note_set(&self) -> bool {
+        self.flags & ACID_FLAG_ROOT_NOTE_SET != 0
+    }
+
+    /// Bit 2 — time-stretch enabled.
+    pub fn stretch(&self) -> bool {
+        self.flags & ACID_FLAG_STRETCH != 0
+    }
+
+    /// Bit 3 — disk-based (streamed).
+    pub fn disk_based(&self) -> bool {
+        self.flags & ACID_FLAG_DISK_BASED != 0
+    }
+
+    /// Bit 4 — high-octave root-note interpretation.
+    pub fn high_octave(&self) -> bool {
+        self.flags & ACID_FLAG_HIGH_OCTAVE != 0
+    }
+
+    /// Note name for [`Self::root_note`] per the staged value table
+    /// (48 = C … 59 = B, 60 = High C … 71 = High B). `None` outside
+    /// the enumerated 48..=71 range.
+    pub fn root_note_name(&self) -> Option<&'static str> {
+        const NAMES: [&str; 24] = [
+            "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B", "High C", "High C#",
+            "High D", "High D#", "High E", "High F", "High F#", "High G", "High G#", "High A",
+            "High A#", "High B",
+        ];
+        NAMES.get(self.root_note.wrapping_sub(48) as usize).copied()
+    }
+
+    /// Decode an `acid` chunk body. Returns `None` when the body is
+    /// shorter than the 24-byte fixed struct (treated as opaque, same
+    /// policy as the other fixed-layout metadata chunks). Trailing
+    /// bytes past offset 24 are tolerated and ignored.
+    pub fn parse(buf: &[u8]) -> Option<AcidChunk> {
+        if buf.len() < Self::BODY_LEN {
+            return None;
+        }
+        let r32 =
+            |o: usize| -> u32 { u32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]) };
+        let mut reserved = [0u8; 6];
+        reserved.copy_from_slice(&buf[6..12]);
+        Some(AcidChunk {
+            flags: r32(0),
+            root_note: u16::from_le_bytes([buf[4], buf[5]]),
+            reserved,
+            num_beats: r32(12),
+            meter: r32(16),
+            tempo: f32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]]),
+        })
+    }
+
+    /// Serialize the 24-byte `acid` chunk body (little-endian, layout
+    /// per the struct-level documentation).
+    pub fn to_bytes(&self) -> [u8; 24] {
+        let mut out = [0u8; 24];
+        out[0..4].copy_from_slice(&self.flags.to_le_bytes());
+        out[4..6].copy_from_slice(&self.root_note.to_le_bytes());
+        out[6..12].copy_from_slice(&self.reserved);
+        out[12..16].copy_from_slice(&self.num_beats.to_le_bytes());
+        out[16..20].copy_from_slice(&self.meter.to_le_bytes());
+        out[20..24].copy_from_slice(&self.tempo.to_le_bytes());
+        out
+    }
+}
+
+/// Parse an `acid` chunk body, surface `wav:acid.*` metadata keys and
+/// return the typed view for the demuxer's [`WavDemuxer::acid`]
+/// accessor. Keys:
+///
+/// - `wav:acid.flags` — bit-field as `0xXXXXXXXX`.
+/// - `wav:acid.one_shot` / `.root_note_set` / `.stretch` /
+///   `.disk_based` / `.high_octave` — each documented flag bit as
+///   `0` / `1`.
+/// - `wav:acid.root_note` — raw value, plus `wav:acid.root_note_name`
+///   when the value falls in the enumerated 48..=71 table.
+/// - `wav:acid.num_beats`, `wav:acid.meter`, `wav:acid.tempo`.
+/// - `wav:acid.reserved` — bytes 6..12 as hex, only when nonzero.
+/// - `wav:acid.body_len` — only when the body exceeds the 24-byte
+///   fixed struct (extension bytes riding along).
+fn parse_acid_chunk(buf: &[u8], out: &mut Vec<(String, String)>) -> Option<AcidChunk> {
+    let acid = AcidChunk::parse(buf)?;
+    out.push((
+        "wav:acid.flags".to_string(),
+        format!("0x{:08X}", acid.flags),
+    ));
+    out.push((
+        "wav:acid.one_shot".to_string(),
+        (acid.one_shot() as u8).to_string(),
+    ));
+    out.push((
+        "wav:acid.root_note_set".to_string(),
+        (acid.root_note_set() as u8).to_string(),
+    ));
+    out.push((
+        "wav:acid.stretch".to_string(),
+        (acid.stretch() as u8).to_string(),
+    ));
+    out.push((
+        "wav:acid.disk_based".to_string(),
+        (acid.disk_based() as u8).to_string(),
+    ));
+    out.push((
+        "wav:acid.high_octave".to_string(),
+        (acid.high_octave() as u8).to_string(),
+    ));
+    out.push(("wav:acid.root_note".to_string(), acid.root_note.to_string()));
+    if let Some(name) = acid.root_note_name() {
+        out.push(("wav:acid.root_note_name".to_string(), name.to_string()));
+    }
+    out.push(("wav:acid.num_beats".to_string(), acid.num_beats.to_string()));
+    out.push(("wav:acid.meter".to_string(), acid.meter.to_string()));
+    out.push(("wav:acid.tempo".to_string(), acid.tempo.to_string()));
+    if acid.reserved.iter().any(|&b| b != 0) {
+        let hex: String = acid.reserved.iter().map(|b| format!("{b:02X}")).collect();
+        out.push(("wav:acid.reserved".to_string(), hex));
+    }
+    if buf.len() > AcidChunk::BODY_LEN {
+        out.push(("wav:acid.body_len".to_string(), buf.len().to_string()));
+    }
+    Some(acid)
 }
 
 /// Parse a `fact` chunk body per
@@ -1952,6 +2158,7 @@ pub struct WavDemuxer {
     valid_bits_per_sample: Option<u16>,
     channel_mask: Option<u32>,
     subformat: Option<[u8; 16]>,
+    acid: Option<AcidChunk>,
 }
 
 impl WavDemuxer {
@@ -1992,6 +2199,14 @@ impl WavDemuxer {
     /// `XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX` GUID string.
     pub fn subformat_text(&self) -> Option<String> {
         self.subformat.as_ref().map(fmt_guid)
+    }
+
+    /// Typed view of the Acidizer `acid` chunk when the file carried
+    /// one with a well-formed 24-byte body. `None` when the chunk is
+    /// absent or truncated. The same fields are mirrored under the
+    /// `wav:acid.*` metadata keys for `dyn Demuxer` consumers.
+    pub fn acid(&self) -> Option<&AcidChunk> {
+        self.acid.as_ref()
     }
 }
 
@@ -2097,6 +2312,7 @@ fn open_muxer(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Box<
         sample_rate,
         shape,
         extensible: None,
+        acid: None,
         riff_size_offset: 0,
         data_size_offset: 0,
         fact_size_offset: None,
@@ -2120,6 +2336,7 @@ fn open_muxer(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Box<
 #[derive(Clone, Debug, Default)]
 pub struct WavMuxOptions {
     extensible: Option<ExtensibleOpts>,
+    acid: Option<AcidChunk>,
 }
 
 #[derive(Clone, Debug)]
@@ -2160,6 +2377,13 @@ impl WavMuxOptions {
         }
         self
     }
+
+    /// Emit an Acidizer `acid` metadata chunk (24-byte body, layout
+    /// per [`AcidChunk`]) ahead of the `data` chunk.
+    pub fn with_acid(mut self, acid: AcidChunk) -> Self {
+        self.acid = Some(acid);
+        self
+    }
 }
 
 /// Open the WAV muxer with caller-controlled `WAVEFORMATEXTENSIBLE`
@@ -2192,6 +2416,7 @@ pub fn open_muxer_with(
         sample_rate,
         shape,
         extensible: opts.extensible,
+        acid: opts.acid,
         riff_size_offset: 0,
         data_size_offset: 0,
         fact_size_offset: None,
@@ -2275,6 +2500,9 @@ struct WavMuxer {
     sample_rate: u32,
     shape: WireShape,
     extensible: Option<ExtensibleOpts>,
+    /// Caller-supplied Acidizer metadata, emitted as a 24-byte `acid`
+    /// chunk between the format chunks and `data` when present.
+    acid: Option<AcidChunk>,
     riff_size_offset: u64,
     data_size_offset: u64,
     /// Offset of the `dwFileSize` field inside the `fact` chunk we
@@ -2354,6 +2582,16 @@ impl Muxer for WavMuxer {
             self.output.write_all(&4u32.to_le_bytes())?;
             self.fact_size_offset = Some(self.output.stream_position()?);
             self.output.write_all(&0u32.to_le_bytes())?; // placeholder dwFileSize
+        }
+
+        // `acid` chunk: caller-supplied Acidizer loop/tempo metadata
+        // (24-byte fixed body — see [`AcidChunk`]). Even-sized, so no
+        // pad byte is needed.
+        if let Some(acid) = &self.acid {
+            self.output.write_all(b"acid")?;
+            self.output
+                .write_all(&(AcidChunk::BODY_LEN as u32).to_le_bytes())?;
+            self.output.write_all(&acid.to_bytes())?;
         }
 
         self.output.write_all(b"data")?;
@@ -3552,6 +3790,219 @@ mod tests {
         assert_eq!(md.get("wav:smpl.midi_unity_note"), Some(&"64".to_string()));
         assert_eq!(md.get("wav:inst.unshifted_note"), Some(&"64".to_string()));
         assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
+    }
+
+    /// Build a minimal valid PCM WAV with a caller-supplied raw `acid`
+    /// chunk inserted between `fmt ` and `data`. Mirrors
+    /// `wav_with_smpl_and_inst`.
+    fn wav_with_acid(acid_body: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"RIFF");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(b"WAVE");
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&16u32.to_le_bytes());
+        buf.extend_from_slice(&FMT_PCM.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&8_000u32.to_le_bytes());
+        buf.extend_from_slice(&16_000u32.to_le_bytes());
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(&16u16.to_le_bytes());
+        buf.extend_from_slice(b"acid");
+        buf.extend_from_slice(&(acid_body.len() as u32).to_le_bytes());
+        buf.extend_from_slice(acid_body);
+        if acid_body.len() % 2 == 1 {
+            buf.push(0);
+        }
+        buf.extend_from_slice(b"data");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf
+    }
+
+    /// `AcidChunk::to_bytes` is pinned byte-for-byte against the
+    /// documented little-endian layout (flags @0, root note @4,
+    /// reserved @6, beats @12, meter @16, tempo @20) and
+    /// `AcidChunk::parse` inverts it exactly.
+    #[test]
+    fn acid_chunk_byte_layout_pinned() {
+        let acid = AcidChunk {
+            flags: ACID_FLAG_ROOT_NOTE_SET | ACID_FLAG_STRETCH,
+            root_note: 57, // A
+            reserved: [0x80, 0x00, 0x01, 0x02, 0x03, 0x04],
+            num_beats: 16,
+            meter: 4,
+            tempo: 120.5,
+        };
+        let bytes = acid.to_bytes();
+        #[rustfmt::skip]
+        let expected: [u8; 24] = [
+            0x06, 0x00, 0x00, 0x00,             // flags = 0x00000006
+            0x39, 0x00,                         // root note = 57
+            0x80, 0x00, 0x01, 0x02, 0x03, 0x04, // reserved, verbatim
+            0x10, 0x00, 0x00, 0x00,             // beats = 16
+            0x04, 0x00, 0x00, 0x00,             // meter = 4
+            0x00, 0x00, 0xF1, 0x42,             // 120.5f32 LE
+        ];
+        assert_eq!(bytes, expected);
+        assert_eq!(AcidChunk::parse(&bytes), Some(acid));
+    }
+
+    /// Full `acid` read path: every documented field surfaces under the
+    /// `wav:acid.*` metadata keys, flag bits decode per the staged
+    /// Acidizer table, and the root-note name table resolves.
+    #[test]
+    fn acid_full_metadata() {
+        let acid = AcidChunk {
+            flags: ACID_FLAG_ONE_SHOT | ACID_FLAG_ROOT_NOTE_SET | ACID_FLAG_HIGH_OCTAVE,
+            root_note: 60, // High C
+            reserved: [0; 6],
+            num_beats: 32,
+            meter: 4,
+            tempo: 95.0,
+        };
+        let bytes = wav_with_acid(&acid.to_bytes());
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:acid.flags"), Some(&"0x00000013".to_string()));
+        assert_eq!(md.get("wav:acid.one_shot"), Some(&"1".to_string()));
+        assert_eq!(md.get("wav:acid.root_note_set"), Some(&"1".to_string()));
+        assert_eq!(md.get("wav:acid.stretch"), Some(&"0".to_string()));
+        assert_eq!(md.get("wav:acid.disk_based"), Some(&"0".to_string()));
+        assert_eq!(md.get("wav:acid.high_octave"), Some(&"1".to_string()));
+        assert_eq!(md.get("wav:acid.root_note"), Some(&"60".to_string()));
+        assert_eq!(
+            md.get("wav:acid.root_note_name"),
+            Some(&"High C".to_string())
+        );
+        assert_eq!(md.get("wav:acid.num_beats"), Some(&"32".to_string()));
+        assert_eq!(md.get("wav:acid.meter"), Some(&"4".to_string()));
+        assert_eq!(md.get("wav:acid.tempo"), Some(&"95".to_string()));
+        // All-zero reserved bytes → no reserved key, exact-size body →
+        // no body_len key.
+        assert_eq!(md.get("wav:acid.reserved"), None);
+        assert_eq!(md.get("wav:acid.body_len"), None);
+        assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
+    }
+
+    /// Out-of-table root note (not in 48..=71) surfaces the raw value
+    /// but no name; nonzero reserved bytes and oversize bodies surface
+    /// their observability keys.
+    #[test]
+    fn acid_out_of_table_root_note_and_extras() {
+        let acid = AcidChunk {
+            flags: 0,
+            root_note: 0,
+            reserved: [0xAA, 0, 0, 0, 0, 0xBB],
+            num_beats: 8,
+            meter: 4,
+            tempo: 133.25,
+        };
+        assert_eq!(acid.root_note_name(), None);
+        let mut body = acid.to_bytes().to_vec();
+        body.extend_from_slice(&[0xEE, 0xFF]); // future-extension bytes
+        let bytes = wav_with_acid(&body);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:acid.root_note"), Some(&"0".to_string()));
+        assert_eq!(md.get("wav:acid.root_note_name"), None);
+        assert_eq!(md.get("wav:acid.tempo"), Some(&"133.25".to_string()));
+        assert_eq!(
+            md.get("wav:acid.reserved"),
+            Some(&"AA00000000BB".to_string())
+        );
+        assert_eq!(md.get("wav:acid.body_len"), Some(&"26".to_string()));
+    }
+
+    /// A body shorter than the 24-byte fixed struct is opaque-skipped:
+    /// no `wav:acid.*` keys, stream still opens.
+    #[test]
+    fn acid_truncated_is_skipped() {
+        let bytes = wav_with_acid(&[0u8; 23]);
+        let dmx = open_demux_from_bytes(bytes);
+        assert!(!dmx
+            .metadata()
+            .iter()
+            .any(|(k, _)| k.starts_with("wav:acid")));
+        assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
+    }
+
+    /// Write→read round-trip through the public muxer/demuxer paths:
+    /// `WavMuxOptions::with_acid` emits the chunk, the demuxer's typed
+    /// accessor and metadata keys return the identical values, and the
+    /// PCM payload is untouched.
+    #[test]
+    fn acid_round_trip() {
+        let acid = AcidChunk {
+            flags: ACID_FLAG_ROOT_NOTE_SET,
+            root_note: 50, // D
+            reserved: [0; 6],
+            num_beats: 64,
+            meter: 4,
+            tempo: 174.0,
+        };
+        let payload: Vec<u8> = (0..400u32).flat_map(|i| (i as i16).to_le_bytes()).collect();
+        let stream = make_stream(SampleFormat::S16, 1, 44_100);
+        let opts = WavMuxOptions::default().with_acid(acid);
+        let bytes = mux_to_bytes(&stream, &payload, opts, "acid-rt");
+        // The serialized chunk (header + 24-byte body) appears verbatim.
+        let mut chunk = b"acid".to_vec();
+        chunk.extend_from_slice(&24u32.to_le_bytes());
+        chunk.extend_from_slice(&acid.to_bytes());
+        assert!(bytes.windows(chunk.len()).any(|w| w == &chunk[..]));
+
+        let mut dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:acid.root_note"), Some(&"50".to_string()));
+        assert_eq!(md.get("wav:acid.root_note_name"), Some(&"D".to_string()));
+        assert_eq!(md.get("wav:acid.num_beats"), Some(&"64".to_string()));
+        assert_eq!(md.get("wav:acid.tempo"), Some(&"174".to_string()));
+        let mut out = Vec::new();
+        loop {
+            match dmx.next_packet() {
+                Ok(p) => out.extend_from_slice(&p.data),
+                Err(Error::Eof) => break,
+                Err(e) => panic!("demux error: {e}"),
+            }
+        }
+        assert_eq!(out, payload);
+    }
+
+    /// Typed `WavDemuxer::acid()` accessor (via the concrete
+    /// `open_wav_demuxer` path) returns the parsed struct field-for-
+    /// field, including the verbatim reserved bytes; absent chunk →
+    /// `None`.
+    #[test]
+    fn acid_typed_accessor() {
+        let acid = AcidChunk {
+            flags: ACID_FLAG_ONE_SHOT | ACID_FLAG_DISK_BASED,
+            root_note: 71, // High B — last entry of the table
+            reserved: [1, 2, 3, 4, 5, 6],
+            num_beats: 4,
+            meter: 3,
+            tempo: 60.0,
+        };
+        let bytes = wav_with_acid(&acid.to_bytes());
+        use std::io::Cursor;
+        let dmx = open_wav_demuxer(Box::new(Cursor::new(bytes))).unwrap();
+        assert_eq!(dmx.acid(), Some(&acid));
+        let got = dmx.acid().unwrap();
+        assert!(got.one_shot() && got.disk_based());
+        assert!(!got.root_note_set() && !got.stretch() && !got.high_octave());
+        assert_eq!(got.root_note_name(), Some("High B"));
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(
+            md.get("wav:acid.reserved"),
+            Some(&"010203040506".to_string())
+        );
+
+        // No `acid` chunk → typed accessor is None.
+        let plain = wav_with_smpl_and_inst(None, None);
+        let dmx = open_wav_demuxer(Box::new(Cursor::new(plain))).unwrap();
+        assert_eq!(dmx.acid(), None);
     }
 
     /// Build a minimal valid PCM WAV with a caller-supplied raw `plst`
