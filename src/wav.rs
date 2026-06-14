@@ -30,8 +30,11 @@
 //! The extension fields are also exposed verbatim through
 //! `Demuxer::metadata` under the keys
 //! `wav:fmt.valid_bits_per_sample` / `wav:fmt.channel_mask` /
-//! `wav:fmt.subformat` (matching the round-75 `oxideav-avi` shape, but
-//! single-stream so no per-stream index).
+//! `wav:fmt.channel_layout` / `wav:fmt.subformat` (matching the
+//! round-75 `oxideav-avi` shape, but single-stream so no per-stream
+//! index). `wav:fmt.channel_layout` is the `dwChannelMask` bitmap
+//! decoded into a `+`-separated list of `SPEAKER_*` positions per
+//! `docs/container/riff/waveformatextensible/ms-waveformatextensible.html`.
 
 use oxideav_core::{
     CodecId, CodecParameters, CodecResolver, Error, MediaType, Packet, Result, SampleFormat,
@@ -255,6 +258,67 @@ fn fmt_guid(g: &[u8; 16]) -> String {
         g[14],
         g[15],
     )
+}
+
+/// `WAVEFORMATEXTENSIBLE.dwChannelMask` `SPEAKER_*` flag bits, ordered
+/// least-significant-bit first. Per
+/// `docs/container/riff/waveformatextensible/ms-waveformatextensible.html`
+/// §"dwChannelMask": the LSB is the front-left speaker, the next bit the
+/// front-right speaker, and so on through bit 17 (`SPEAKER_TOP_BACK_RIGHT`,
+/// `0x20000`). The interleaved PCM samples appear in this same
+/// least-significant-bit-up order.
+const SPEAKER_FLAGS: [(u32, &str); 18] = [
+    (0x1, "FRONT_LEFT"),
+    (0x2, "FRONT_RIGHT"),
+    (0x4, "FRONT_CENTER"),
+    (0x8, "LOW_FREQUENCY"),
+    (0x10, "BACK_LEFT"),
+    (0x20, "BACK_RIGHT"),
+    (0x40, "FRONT_LEFT_OF_CENTER"),
+    (0x80, "FRONT_RIGHT_OF_CENTER"),
+    (0x100, "BACK_CENTER"),
+    (0x200, "SIDE_LEFT"),
+    (0x400, "SIDE_RIGHT"),
+    (0x800, "TOP_CENTER"),
+    (0x1000, "TOP_FRONT_LEFT"),
+    (0x2000, "TOP_FRONT_CENTER"),
+    (0x4000, "TOP_FRONT_RIGHT"),
+    (0x8000, "TOP_BACK_LEFT"),
+    (0x10000, "TOP_BACK_CENTER"),
+    (0x20000, "TOP_BACK_RIGHT"),
+];
+
+/// Decode a `WAVEFORMATEXTENSIBLE.dwChannelMask` bitmap into a
+/// human-readable, `+`-separated list of `SPEAKER_*` positions in the
+/// canonical least-significant-bit-first order
+/// (`FRONT_LEFT+FRONT_RIGHT+...`).
+///
+/// Returns `None` when `mask == 0` (no assigned speaker positions —
+/// "use direct-out / discrete channels"). Any bits set above the highest
+/// defined flag (`0x20000`) that aren't recognised are reported as
+/// `UNKNOWN(0x...)` so the round-trip information isn't silently dropped.
+///
+/// Per
+/// `docs/container/riff/waveformatextensible/ms-waveformatextensible.html`,
+/// the number of set bits should equal `WAVEFORMATEX.nChannels`; this
+/// function only decodes the mask and does not enforce that invariant.
+fn channel_mask_layout(mask: u32) -> Option<String> {
+    if mask == 0 {
+        return None;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    let mut known: u32 = 0;
+    for (bit, name) in SPEAKER_FLAGS {
+        if mask & bit != 0 {
+            parts.push(name.to_string());
+            known |= bit;
+        }
+    }
+    let unknown = mask & !known;
+    if unknown != 0 {
+        parts.push(format!("UNKNOWN(0x{unknown:X})"));
+    }
+    Some(parts.join("+"))
 }
 
 // --- Demuxer ---------------------------------------------------------------
@@ -565,6 +629,9 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
         }
         if let Some(mask) = fmt.channel_mask {
             metadata.push(("wav:fmt.channel_mask".to_string(), format!("0x{mask:08X}")));
+            if let Some(layout) = channel_mask_layout(mask) {
+                metadata.push(("wav:fmt.channel_layout".to_string(), layout));
+            }
         }
         if let Some(sub) = &fmt.subformat {
             metadata.push(("wav:fmt.subformat".to_string(), fmt_guid(sub)));
@@ -2186,6 +2253,20 @@ impl WavDemuxer {
         self.channel_mask
     }
 
+    /// Human-readable speaker layout decoded from
+    /// [`Self::channel_mask`] — a `+`-separated list of `SPEAKER_*`
+    /// positions in canonical least-significant-bit-first order
+    /// (e.g. `"FRONT_LEFT+FRONT_RIGHT+FRONT_CENTER+LOW_FREQUENCY"`).
+    ///
+    /// `None` when the stream is non-EXTENSIBLE, or when the mask is `0`
+    /// (no assigned speaker positions). The same value is mirrored under
+    /// the `wav:fmt.channel_layout` metadata key for `dyn Demuxer`
+    /// consumers. See
+    /// `docs/container/riff/waveformatextensible/ms-waveformatextensible.html`.
+    pub fn channel_layout(&self) -> Option<String> {
+        self.channel_mask.and_then(channel_mask_layout)
+    }
+
     /// `WAVEFORMATEXTENSIBLE.SubFormat` — 16-byte GUID (the actual
     /// codec identifier when `format_tag == WAVE_FORMAT_EXTENSIBLE`).
     /// Returned in on-wire byte order (first three groups
@@ -2892,6 +2973,16 @@ mod tests {
             md.get("wav:fmt.subformat"),
             Some(&"00000001-0000-0010-8000-00AA00389B71".to_string())
         );
+        // 0x3F == FRONT_LEFT | FRONT_RIGHT | FRONT_CENTER |
+        // LOW_FREQUENCY | BACK_LEFT | BACK_RIGHT (the canonical 5.1
+        // layout), decoded LSB-first.
+        assert_eq!(
+            md.get("wav:fmt.channel_layout"),
+            Some(
+                &"FRONT_LEFT+FRONT_RIGHT+FRONT_CENTER+LOW_FREQUENCY+BACK_LEFT+BACK_RIGHT"
+                    .to_string()
+            )
+        );
     }
 
     /// Typed accessors on the concrete `WavDemuxer` carry the same
@@ -2906,7 +2997,7 @@ mod tests {
 
         let opts = WavMuxOptions::default().with_extensible(MASK_STEREO);
         let bytes = mux_to_bytes(&stream, &payload, opts, "ext-stereo-md");
-        let dmx = open_demux_from_bytes(bytes);
+        let dmx = open_demux_from_bytes(bytes.clone());
         let md: std::collections::HashMap<String, String> =
             dmx.metadata().iter().cloned().collect();
         assert_eq!(
@@ -2916,6 +3007,68 @@ mod tests {
         assert_eq!(
             md.get("wav:fmt.valid_bits_per_sample"),
             Some(&"16".to_string())
+        );
+        // The metadata key and the typed accessor agree. Open the same
+        // bytes through the concrete `WavDemuxer` to reach the typed
+        // `channel_layout` / `channel_mask` accessors.
+        assert_eq!(
+            md.get("wav:fmt.channel_layout"),
+            Some(&"FRONT_LEFT+FRONT_RIGHT".to_string())
+        );
+        let typed = open_wav_demuxer(Box::new(std::io::Cursor::new(bytes))).unwrap();
+        assert_eq!(
+            typed.channel_layout(),
+            Some("FRONT_LEFT+FRONT_RIGHT".to_string())
+        );
+        assert_eq!(typed.channel_mask(), Some(MASK_STEREO));
+    }
+
+    /// `channel_mask_layout` decodes the `SPEAKER_*` bitmap exactly per
+    /// `docs/container/riff/waveformatextensible/ms-waveformatextensible.html`
+    /// §"dwChannelMask": LSB-first, `+`-joined, with each documented bit
+    /// mapping to its flag name (0x1..=0x20000).
+    #[test]
+    fn channel_mask_layout_decoding() {
+        // Mask 0 => no assigned positions.
+        assert_eq!(channel_mask_layout(0), None);
+
+        // Single bits across the whole defined range.
+        assert_eq!(channel_mask_layout(0x1), Some("FRONT_LEFT".to_string()));
+        assert_eq!(channel_mask_layout(0x8), Some("LOW_FREQUENCY".to_string()));
+        assert_eq!(
+            channel_mask_layout(0x20000),
+            Some("TOP_BACK_RIGHT".to_string())
+        );
+
+        // Mono (FRONT_CENTER only).
+        assert_eq!(channel_mask_layout(0x4), Some("FRONT_CENTER".to_string()));
+
+        // Quad (FL+FR+BL+BR) — note ordering follows bit significance,
+        // not the mask literal's textual order.
+        assert_eq!(
+            channel_mask_layout(0x33),
+            Some("FRONT_LEFT+FRONT_RIGHT+BACK_LEFT+BACK_RIGHT".to_string())
+        );
+
+        // 7.1 (FL+FR+FC+LFE+BL+BR+SL+SR == 0x63F).
+        assert_eq!(
+            channel_mask_layout(0x63F),
+            Some(
+                "FRONT_LEFT+FRONT_RIGHT+FRONT_CENTER+LOW_FREQUENCY\
+                 +BACK_LEFT+BACK_RIGHT+SIDE_LEFT+SIDE_RIGHT"
+                    .to_string()
+            )
+        );
+
+        // Bits above the highest defined flag are surfaced verbatim so
+        // the round-trip information isn't lost.
+        assert_eq!(
+            channel_mask_layout(0x40001),
+            Some("FRONT_LEFT+UNKNOWN(0x40000)".to_string())
+        );
+        assert_eq!(
+            channel_mask_layout(0x80000000),
+            Some("UNKNOWN(0x80000000)".to_string())
         );
     }
 

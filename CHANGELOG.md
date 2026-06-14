@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- WAV `WAVEFORMATEXTENSIBLE.dwChannelMask` decoding — the channel
+  bitmap is now expanded into a human-readable `SPEAKER_*` layout
+  string (`FRONT_LEFT+FRONT_RIGHT+...`), joined least-significant-bit
+  first per the 18 documented flag bits (`SPEAKER_FRONT_LEFT 0x1` ..
+  `SPEAKER_TOP_BACK_RIGHT 0x20000`) in
+  `docs/container/riff/waveformatextensible/ms-waveformatextensible.html`.
+  Surfaced through the new `wav:fmt.channel_layout` metadata key and a
+  typed `WavDemuxer::channel_layout()` accessor. A `0` mask (no
+  assigned positions) yields `None`; bits above the highest defined
+  flag are preserved verbatim as `UNKNOWN(0x...)` so no round-trip
+  information is dropped.
 - WAV Acidizer `acid` chunk — read AND write sides with a typed
   accessor surface, layout per
   `docs/container/riff/metadata/exiftool-riff-tags.html` § "RIFF

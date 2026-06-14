@@ -27,7 +27,14 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework â€
   is parsed end-to-end â€” the 22-byte extension's `wValidBitsPerSample`,
   `dwChannelMask` and SubFormat GUID are surfaced through both
   `wav:fmt.*` metadata keys and typed accessors on the concrete
-  `WavDemuxer`. Well-known `KSDATAFORMAT_SUBTYPE_*` GUIDs (PCM,
+  `WavDemuxer`. The `dwChannelMask` bitmap is also decoded into a
+  human-readable `SPEAKER_*` layout (`wav:fmt.channel_layout` +
+  `WavDemuxer::channel_layout`), `+`-joined least-significant-bit-first
+  per the 18 documented flag bits (`FRONT_LEFT 0x1` ..
+  `TOP_BACK_RIGHT 0x20000`) in
+  `docs/container/riff/waveformatextensible/ms-waveformatextensible.html`;
+  bits above the highest defined flag are preserved as
+  `UNKNOWN(0x...)`. Well-known `KSDATAFORMAT_SUBTYPE_*` GUIDs (PCM,
   IEEE_FLOAT, ALAW, MULAW) resolve to the same codec ids the legacy
   `WAVEFORMATEX` path would have produced; unknown GUIDs synthesise a
   `wav:guid_<canonical-text>` id. `WavMuxOptions::with_extensible(mask)`
