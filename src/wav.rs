@@ -375,11 +375,20 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
             metadata.push(("wav:rf64.riff_size32".to_string(), on_wire_riff.to_string()));
         }
     }
-    let data_offset: u64;
-    let data_size: u64;
+    let mut data_offset: Option<u64> = None;
+    let mut data_size: Option<u64> = None;
     loop {
         let mut chdr = [0u8; 8];
-        input.read_exact(&mut chdr)?;
+        // A `wavl`-form file has no top-level `data` chunk to break on, so
+        // the scan walks every remaining chunk and terminates at a clean
+        // end-of-stream. A short/absent header at EOF after a `wavl` LIST
+        // already anchored the cursor is the normal termination; only an
+        // EOF before any waveform is anchored is malformed (caught below).
+        match input.read_exact(&mut chdr) {
+            Ok(()) => {}
+            Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e.into()),
+        }
         let id_arr: [u8; 4] = [chdr[0], chdr[1], chdr[2], chdr[3]];
         let id = &chdr[0..4];
         let on_wire_size = u32::from_le_bytes([chdr[4], chdr[5], chdr[6], chdr[7]]);
@@ -438,9 +447,36 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
                 }
             }
             b"LIST" => {
+                // The LIST chunk body opens with a 4-byte list type. The
+                // `wavl` (wave-list) type per Microsoft RIFF MCI §3
+                // "Storage of WAVE Data" is the segmented waveform
+                // container —
+                // `LIST('wavl' { <data-ck> | <silence-ck> }... )` —
+                // alternating `data` payloads with `slnt` silence
+                // counts. We need byte offsets for the embedded `data`
+                // sub-chunks, so capture the LIST body's absolute start
+                // and resolve the first `data` segment as the decode
+                // anchor; `INFO` / `adtl` LISTs are pure metadata and
+                // stay on the buffered path.
+                let list_start = input.stream_position()?;
                 let mut buf = vec![0u8; size as usize];
                 input.read_exact(&mut buf)?;
-                parse_list_chunk(&buf, &mut metadata);
+                if buf.len() >= 4 && &buf[0..4] == b"wavl" {
+                    if let Some((off, sz)) = parse_wavl_list(&buf, list_start, &mut metadata) {
+                        // The §3 grammar lets `<wave-data>` be a `wavl`
+                        // LIST instead of a top-level `data` chunk. Anchor
+                        // the decode cursor at the first `data` segment so
+                        // the leading audio is readable; later segments
+                        // (and embedded silence) are surfaced as
+                        // `wav:wavl.*` metadata for downstream walking.
+                        if data_offset.is_none() {
+                            data_offset = Some(off);
+                            data_size = Some(sz);
+                        }
+                    }
+                } else {
+                    parse_list_chunk(&buf, &mut metadata);
+                }
                 if size % 2 == 1 {
                     input.seek(SeekFrom::Current(1))?;
                 }
@@ -557,8 +593,8 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
                 }
             }
             b"data" => {
-                data_offset = input.stream_position()?;
-                data_size = size;
+                data_offset = Some(input.stream_position()?);
+                data_size = Some(size);
                 break;
             }
             _ => {
@@ -568,6 +604,11 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
         }
     }
     let fmt = fmt.ok_or_else(|| Error::invalid("WAV missing fmt chunk"))?;
+    // Either a top-level `data` chunk (the common case) or the first
+    // `data` sub-chunk of a `wavl` LIST must have anchored the cursor.
+    let data_offset =
+        data_offset.ok_or_else(|| Error::invalid("WAV missing data / wavl waveform"))?;
+    let data_size = data_size.unwrap_or(0);
 
     let codec_id = resolve_codec(&fmt)?;
     // Sample format hint for the decoded shape (NOT the on-wire layout
@@ -681,6 +722,98 @@ fn parse_list_chunk(buf: &[u8], out: &mut Vec<(String, String)>) {
         b"adtl" => parse_adtl_list(&buf[4..], out),
         _ => {}
     }
+}
+
+/// Parse a `LIST('wavl' ...)` wave-list body per Microsoft RIFF MCI §3
+/// "Storage of WAVE Data":
+///
+/// > `<wave-data>` ➝ `{ <data-ck> | <data-list> }`
+/// > `<wave-list>` ➝ `LIST( 'wavl' { <data-ck> | <silence-ck> }... )`
+/// > `<silence-ck>` ➝ `slnt( <dwSamples:DWORD> )`
+///
+/// The `wavl` form interleaves runs of real PCM (`data` sub-chunks) with
+/// `slnt` silence-count markers, letting a writer encode long silent
+/// stretches sparsely instead of storing zeroed samples. The §3 note is
+/// explicit that `slnt` is a *count of silent samples*, not a baseline
+/// fill, so we do not synthesise samples — silence is surfaced through
+/// the same `wav:slnt.*` accounting used for top-level `slnt` chunks.
+///
+/// `buf` is the LIST body (starting at the `wavl` list type); `list_start`
+/// is the absolute stream offset of that first body byte, so the returned
+/// `(offset, size)` of the first `data` sub-chunk is an absolute file
+/// offset the demuxer can seek to. Returns `None` when the LIST holds no
+/// `data` segment (a silence-only `wavl`, which carries no decodable
+/// audio but is still fully surfaced as metadata).
+///
+/// Surfaced keys:
+/// * `wav:wavl.segment_count` — total `data` + `slnt` sub-chunks walked.
+/// * `wav:wavl.data_count` — number of `data` segments.
+/// * `wav:wavl.data_bytes` — cumulative payload bytes across `data`
+///   segments (excludes the 8-byte sub-chunk headers and word-align
+///   padding).
+/// * `wav:wavl.<n>.kind` / `.length` — per-segment type (`data`/`slnt`)
+///   and on-wire body length, indexed zero-based by encounter order.
+/// * embedded `slnt` segments additionally feed `wav:slnt.*` so the
+///   silent-sample totals match a top-level-`slnt` file.
+fn parse_wavl_list(
+    buf: &[u8],
+    list_start: u64,
+    out: &mut Vec<(String, String)>,
+) -> Option<(u64, u64)> {
+    // Skip the 4-byte 'wavl' list type.
+    let mut i = 4usize;
+    let mut first_data: Option<(u64, u64)> = None;
+    let mut segment_count: u64 = 0;
+    let mut data_count: u64 = 0;
+    let mut data_bytes: u64 = 0;
+    while i + 8 <= buf.len() {
+        let id: [u8; 4] = [buf[i], buf[i + 1], buf[i + 2], buf[i + 3]];
+        let size = u32::from_le_bytes([buf[i + 4], buf[i + 5], buf[i + 6], buf[i + 7]]) as usize;
+        let body = i + 8;
+        if body + size > buf.len() {
+            break;
+        }
+        let idx = segment_count;
+        match &id {
+            b"data" => {
+                out.push((format!("wav:wavl.{idx}.kind"), "data".to_string()));
+                out.push((format!("wav:wavl.{idx}.length"), size.to_string()));
+                data_count += 1;
+                data_bytes = data_bytes.saturating_add(size as u64);
+                if first_data.is_none() {
+                    // Absolute offset = LIST body start + sub-chunk body
+                    // offset within the body.
+                    first_data = Some((list_start + body as u64, size as u64));
+                }
+            }
+            b"slnt" => {
+                out.push((format!("wav:wavl.{idx}.kind"), "slnt".to_string()));
+                out.push((format!("wav:wavl.{idx}.length"), size.to_string()));
+                surface_slnt_metadata(out, &buf[body..body + size]);
+            }
+            // The §3 grammar admits only `data` and `slnt` inside `wavl`;
+            // anything else is an unknown forward extension — record its
+            // presence so the file stays observable, but don't anchor on
+            // it.
+            _ => {
+                out.push((
+                    format!("wav:wavl.{idx}.kind"),
+                    String::from_utf8_lossy(&id).trim().to_string(),
+                ));
+                out.push((format!("wav:wavl.{idx}.length"), size.to_string()));
+            }
+        }
+        segment_count += 1;
+        // RIFF word-alignment: sub-chunks are padded to an even length.
+        i = body + size + (size & 1);
+    }
+    out.push((
+        "wav:wavl.segment_count".to_string(),
+        segment_count.to_string(),
+    ));
+    out.push(("wav:wavl.data_count".to_string(), data_count.to_string()));
+    out.push(("wav:wavl.data_bytes".to_string(), data_bytes.to_string()));
+    first_data
 }
 
 fn parse_info_list(buf: &[u8], out: &mut Vec<(String, String)>) {
@@ -5682,6 +5815,167 @@ mod tests {
         assert_eq!(md.get("wav:junk.count"), Some(&"1".to_string()));
         assert_eq!(md.get("title"), Some(&"T".to_string()));
         assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
+    }
+
+    /// A `wavl`-form sub-chunk descriptor for the test builder: a 4-byte
+    /// FOURCC (`data` / `slnt`) plus a verbatim body. `data` bodies carry
+    /// PCM; `slnt` bodies carry the 4-byte `dwSamples` count.
+    enum WavlSeg<'a> {
+        Data(&'a [u8]),
+        Slnt(u32),
+    }
+
+    /// Build a minimal valid WAV whose waveform is stored as a
+    /// `LIST('wavl' ...)` wave-list (Microsoft RIFF MCI §3 "Storage of
+    /// WAVE Data") instead of a top-level `data` chunk. `fmt ` is
+    /// PCM-S16 mono; a `fact` chunk carries the authoritative total
+    /// sample count (the spec requires `fact` whenever the data lives in
+    /// a `wavl` LIST). No top-level `data` chunk is emitted.
+    fn wav_with_wavl(segs: &[WavlSeg], fact_samples: u32) -> Vec<u8> {
+        // Build the wavl LIST body first so we can size the LIST chunk.
+        let mut wavl = Vec::new();
+        wavl.extend_from_slice(b"wavl");
+        for seg in segs {
+            match seg {
+                WavlSeg::Data(body) => {
+                    wavl.extend_from_slice(b"data");
+                    wavl.extend_from_slice(&(body.len() as u32).to_le_bytes());
+                    wavl.extend_from_slice(body);
+                    if body.len() % 2 == 1 {
+                        wavl.push(0);
+                    }
+                }
+                WavlSeg::Slnt(samples) => {
+                    wavl.extend_from_slice(b"slnt");
+                    wavl.extend_from_slice(&4u32.to_le_bytes());
+                    wavl.extend_from_slice(&samples.to_le_bytes());
+                }
+            }
+        }
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"RIFF");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(b"WAVE");
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&16u32.to_le_bytes());
+        buf.extend_from_slice(&FMT_PCM.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&8_000u32.to_le_bytes());
+        buf.extend_from_slice(&16_000u32.to_le_bytes());
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(&16u16.to_le_bytes());
+        // fact chunk — required for wavl-form data.
+        buf.extend_from_slice(b"fact");
+        buf.extend_from_slice(&4u32.to_le_bytes());
+        buf.extend_from_slice(&fact_samples.to_le_bytes());
+        // The wavl LIST itself.
+        buf.extend_from_slice(b"LIST");
+        buf.extend_from_slice(&(wavl.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&wavl);
+        buf
+    }
+
+    /// A single-`data`-segment `wavl` LIST is decodable: the demuxer
+    /// anchors the cursor at the embedded `data` payload and yields it
+    /// byte-for-byte, exactly as a top-level `data` chunk would.
+    #[test]
+    fn wavl_single_data_segment_decodes() {
+        let pcm: Vec<u8> = (0..40u8).collect();
+        let bytes = wav_with_wavl(&[WavlSeg::Data(&pcm)], 20);
+        let mut dmx = open_demux_from_bytes(bytes);
+        assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
+        let mut out = Vec::new();
+        loop {
+            match dmx.next_packet() {
+                Ok(p) => out.extend_from_slice(&p.data),
+                Err(Error::Eof) => break,
+                Err(e) => panic!("demux error: {e}"),
+            }
+        }
+        assert_eq!(out, pcm);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:wavl.segment_count"), Some(&"1".to_string()));
+        assert_eq!(md.get("wav:wavl.data_count"), Some(&"1".to_string()));
+        assert_eq!(md.get("wav:wavl.data_bytes"), Some(&"40".to_string()));
+        assert_eq!(md.get("wav:wavl.0.kind"), Some(&"data".to_string()));
+        assert_eq!(md.get("wav:wavl.0.length"), Some(&"40".to_string()));
+    }
+
+    /// A `data`/`slnt`/`data` `wavl` LIST surfaces every segment, anchors
+    /// the decode cursor at the FIRST `data` segment, and routes the
+    /// embedded `slnt` through the shared `wav:slnt.*` accounting so the
+    /// silent-sample total matches a top-level-`slnt` file. The `fact`
+    /// chunk is the authoritative duration (data_size/block_align is
+    /// meaningless for a segmented waveform).
+    #[test]
+    fn wavl_interleaved_data_silence_surfaces_segments() {
+        let a: Vec<u8> = (0..8u8).collect();
+        let b: Vec<u8> = (100..108u8).collect();
+        let bytes = wav_with_wavl(
+            &[WavlSeg::Data(&a), WavlSeg::Slnt(500), WavlSeg::Data(&b)],
+            1000,
+        );
+        let mut dmx = open_demux_from_bytes(bytes);
+        // First data segment is the decode anchor.
+        let mut out = Vec::new();
+        loop {
+            match dmx.next_packet() {
+                Ok(p) => out.extend_from_slice(&p.data),
+                Err(Error::Eof) => break,
+                Err(e) => panic!("demux error: {e}"),
+            }
+        }
+        assert_eq!(out, a);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:wavl.segment_count"), Some(&"3".to_string()));
+        assert_eq!(md.get("wav:wavl.data_count"), Some(&"2".to_string()));
+        assert_eq!(md.get("wav:wavl.data_bytes"), Some(&"16".to_string()));
+        assert_eq!(md.get("wav:wavl.0.kind"), Some(&"data".to_string()));
+        assert_eq!(md.get("wav:wavl.1.kind"), Some(&"slnt".to_string()));
+        assert_eq!(md.get("wav:wavl.2.kind"), Some(&"data".to_string()));
+        // Embedded slnt feeds the shared silence accounting.
+        assert_eq!(md.get("wav:slnt.count"), Some(&"1".to_string()));
+        assert_eq!(md.get("wav:slnt.total_samples"), Some(&"500".to_string()));
+        assert_eq!(md.get("wav:slnt.0.samples"), Some(&"500".to_string()));
+        // fact-derived duration: 1000 samples at 8000 Hz.
+        let s = &dmx.streams()[0];
+        assert_eq!(s.duration, Some(1000));
+    }
+
+    /// A silence-only `wavl` LIST (no `data` segment) carries no
+    /// decodable audio. The §3 grammar permits it; the demuxer must
+    /// reject the file as having no waveform rather than panicking, while
+    /// still having surfaced the segment metadata it walked.
+    #[test]
+    fn wavl_silence_only_has_no_waveform() {
+        let bytes = wav_with_wavl(&[WavlSeg::Slnt(1000), WavlSeg::Slnt(2000)], 3000);
+        use std::io::Cursor;
+        let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+        match open_demuxer(rs, &oxideav_core::NullCodecResolver) {
+            Ok(_) => panic!("silence-only wavl must be rejected as having no waveform"),
+            Err(Error::InvalidData(_)) => {}
+            Err(e) => panic!("expected InvalidData, got {e:?}"),
+        }
+    }
+
+    /// An odd-length `data` segment inside a `wavl` LIST forces a 1-byte
+    /// word-align pad; a following segment must still be located. RIFF
+    /// MCI §2 word-alignment applies to sub-chunks inside a LIST too.
+    #[test]
+    fn wavl_odd_data_segment_padding() {
+        let a: Vec<u8> = (0..7u8).collect(); // odd length → 1 pad byte
+        let b: Vec<u8> = (50..54u8).collect();
+        let bytes = wav_with_wavl(&[WavlSeg::Data(&a), WavlSeg::Data(&b)], 100);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:wavl.segment_count"), Some(&"2".to_string()));
+        assert_eq!(md.get("wav:wavl.0.length"), Some(&"7".to_string()));
+        assert_eq!(md.get("wav:wavl.1.kind"), Some(&"data".to_string()));
+        assert_eq!(md.get("wav:wavl.1.length"), Some(&"4".to_string()));
     }
 
     /// Locate the first chunk with the given 4-byte FOURCC in a

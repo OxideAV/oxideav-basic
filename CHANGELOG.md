@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- WAV `LIST('wavl')` wave-list waveform container — the segmented
+  waveform form per Microsoft RIFF MCI §3 "Storage of WAVE Data"
+  (`<wave-data> -> { <data-ck> | <data-list> }`,
+  `<wave-list> -> LIST('wavl' { <data-ck> | <silence-ck> }... )`).
+  Previously a `wavl`-form WAV had no decodable audio (the LIST type
+  fell through and no `data` anchor was set). The demuxer now resolves
+  the first embedded `data` sub-chunk as the decode anchor and walks
+  every segment. New keys: `wav:wavl.segment_count`,
+  `wav:wavl.data_count`, `wav:wavl.data_bytes`, and per-segment
+  `wav:wavl.<n>.kind` (`data`/`slnt`) / `.length`. Embedded `slnt`
+  silence segments feed the shared `wav:slnt.*` accounting so the
+  silent-sample totals match a top-level-`slnt` file (no zero/baseline
+  samples are synthesised — §3 is explicit that `slnt` is a *count* of
+  silent samples). A silence-only `wavl` (no `data` segment) is
+  rejected as having no waveform; odd-length `data` segments respect
+  RIFF word-alignment.
 - WAV `WAVEFORMATEXTENSIBLE.dwChannelMask` decoding — the channel
   bitmap is now expanded into a human-readable `SPEAKER_*` layout
   string (`FRONT_LEFT+FRONT_RIGHT+...`), joined least-significant-bit

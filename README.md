@@ -161,7 +161,23 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework �
   4-byte field are counted but treated as opaque (no `samples` key);
   over-length bodies decode the leading DWORD and tolerate trailing
   forward-extension bytes. Files with no `slnt` chunk emit no
-  `wav:slnt.*` keys at all. The Acidizer `acid` chunk (layout per the
+  `wav:slnt.*` keys at all. The `LIST 'wavl'` wave-list waveform
+  container (RIFF MCI §3 "Storage of WAVE Data" —
+  `<wave-data> -> { <data-ck> | <data-list> }`,
+  `<wave-list> -> LIST('wavl' { <data-ck> | <silence-ck> }... )`) is
+  parsed end-to-end: the segmented form interleaves runs of PCM
+  (`data` sub-chunks) with `slnt` silence-count markers, so the
+  demuxer resolves the FIRST embedded `data` sub-chunk as the decode
+  anchor (a `wavl`-form file is now decodable rather than yielding no
+  audio) and surfaces every segment as `wav:wavl.segment_count` /
+  `wav:wavl.data_count` / `wav:wavl.data_bytes` plus per-segment
+  `wav:wavl.<n>.kind` (`data`/`slnt`) / `.length`. Embedded `slnt`
+  segments feed the same `wav:slnt.*` accounting as top-level `slnt`
+  chunks (silence is a count, never synthesised baseline samples);
+  the `fact` chunk (required by §3 for `wavl`-form data) remains the
+  authoritative duration. A silence-only `wavl` (no `data` segment)
+  is rejected as having no waveform; odd-length `data` segments
+  respect RIFF word-alignment. The Acidizer `acid` chunk (layout per the
   staged byte-indexed Acidizer table in
   `docs/container/riff/metadata/exiftool-riff-tags.html`) is supported
   on BOTH the read and write sides through the typed `wav::AcidChunk`
