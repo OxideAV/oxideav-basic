@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/OxideAV/oxideav-basic/compare/v0.0.8...v0.0.9) - 2026-06-15
+
+### Other
+
+- resolve every DEFINE_WAVEFORMATEX_GUID SubFormat through the legacy wFormatTag path
+- parse LIST('wavl') wave-list waveform container (RIFF MCI §3)
+- decode WAVEFORMATEXTENSIBLE dwChannelMask into SPEAKER_* layout
+- Acidizer acid chunk read+write with typed AcidChunk surface
+- complete LIST adtl coverage — file sub-chunk + ltxt locale WORDs per RIFF MCI §3
+- parse slnt (Silence) chunk per Microsoft RIFF MCI §3
+- parse _PMX (Adobe XMP packet) chunk for AVI/WAV files
+- parse <axml> chunk per EBU Tech 3285 Supplement 5
+- drop release-plz.toml — use release-plz defaults across the workspace
+- parse JUNK (Filler) chunk per Microsoft RIFF MCI §2
+- typed scalar Reinhard 2002 simple global tone-mapping operator
+- RF64 / BW64 64-bit-extended form + ds64 chunk (EBU Tech 3306)
+- full RIFF MCI §3 INFO List Chunk baseline (12 added sub-IDs)
+- parse CSET (Character Set) chunk per Microsoft RIFF MCI §3
+- parse iXML chunk — third-party production-recorder metadata
+- parse fact chunk (RIFF MCI §3) — authoritative per-channel sample count
+
 ### Added
 
 - WAV `WAVE_FORMAT_EXTENSIBLE` SubFormat-GUID resolution now implements
