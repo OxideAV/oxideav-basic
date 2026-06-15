@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- WAV `WAVE_FORMAT_EXTENSIBLE` SubFormat-GUID resolution now implements
+  the `KSMedia.h` `DEFINE_WAVEFORMATEX_GUID(x)` /
+  `IS_VALID_WAVEFORMATEX_GUID` / `EXTRACT_WAVEFORMATEX_ID` macros (per
+  `docs/container/riff/waveformatextensible/ms-converting-format-tags-and-subformat-guids.md`):
+  any SubFormat GUID of the form `{0000xxxx-0000-0010-8000-00AA00389B71}`
+  is recognised as equivalent to the legacy `wFormatTag` `x` and
+  dispatches through the same `codec_for_tag` route the `WAVEFORMATEX`
+  path uses. Generalises the four previously hand-listed GUID constants
+  (PCM/IEEE_FLOAT/ALAW/MULAW) to every tag-derived GUID and surfaces the
+  embedded legacy tag as `wav:fmt.subformat_tag` (e.g. `0x0055` for an
+  EXTENSIBLE MP3-tagged file). Non-template GUIDs and template GUIDs
+  whose embedded tag isn't a directly-mapped format still synthesise the
+  `wav:guid_<canonical-text>` id.
+
 - WAV `LIST('wavl')` wave-list waveform container — the segmented
   waveform form per Microsoft RIFF MCI §3 "Storage of WAVE Data"
   (`<wave-data> -> { <data-ck> | <data-list> }`,

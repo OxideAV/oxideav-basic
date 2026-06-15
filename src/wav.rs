@@ -239,6 +239,46 @@ const GUID_MULAW: [u8; 16] = [
     0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71,
 ];
 
+/// The 14 trailing bytes of `KSDATAFORMAT_SUBTYPE_WAVEFORMATEX`
+/// (`{00000000-0000-0010-8000-00aa00389b71}`) — i.e. the GUID with its
+/// leading 16-bit `Data1` field (the embedded `wFormatTag`) removed.
+///
+/// Per
+/// `docs/container/riff/waveformatextensible/ms-converting-format-tags-and-subformat-guids.md`,
+/// the `KSMedia.h` macro `DEFINE_WAVEFORMATEX_GUID(x)` constructs a
+/// SubFormat GUID as `(USHORT)(x), 0x0000, 0x0010, 0x80, 0x00, 0x00,
+/// 0xaa, 0x00, 0x38, 0x9b, 0x71` — the legacy `wFormatTag` `x` occupies
+/// the low 16 bits of `Data1`, the high 16 bits of `Data1` are zero, and
+/// the remaining twelve bytes are the fixed "WAVEFORMATEX" base. The
+/// companion `IS_VALID_WAVEFORMATEX_GUID(Guid)` macro tests a candidate
+/// GUID by comparing every byte *after* the leading `USHORT` (i.e. bytes
+/// `[2..16]`) against this base; `EXTRACT_WAVEFORMATEX_ID(Guid)` then
+/// reads the legacy tag from `(USHORT)(Guid->Data1)` (bytes `[0..2]`,
+/// little-endian).
+const GUID_WAVEFORMATEX_TAIL: [u8; 14] = [
+    0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71,
+];
+
+/// If `g` is a SubFormat GUID produced by the `KSMedia.h`
+/// `DEFINE_WAVEFORMATEX_GUID(x)` template (a "WAVEFORMATEX GUID"),
+/// return the embedded legacy `wFormatTag` `x`; otherwise `None`.
+///
+/// Implements `IS_VALID_WAVEFORMATEX_GUID` + `EXTRACT_WAVEFORMATEX_ID`
+/// from
+/// `docs/container/riff/waveformatextensible/ms-converting-format-tags-and-subformat-guids.md`:
+/// the validity test compares the fourteen bytes after the leading
+/// `Data1` low half — bytes `[2..16]` — against the fixed
+/// `KSDATAFORMAT_SUBTYPE_WAVEFORMATEX` tail (which includes the zero high
+/// half of `Data1` at byte `[2..4]`), and the tag is the little-endian
+/// `u16` at bytes `[0..2]`.
+fn waveformatex_tag(g: &[u8; 16]) -> Option<u16> {
+    if g[2..16] == GUID_WAVEFORMATEX_TAIL {
+        Some(u16::from_le_bytes([g[0], g[1]]))
+    } else {
+        None
+    }
+}
+
 /// Format the 16-byte SubFormat GUID for diagnostic strings as
 /// `XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX` (canonical text representation
 /// used by `mmreg.h` GUID definitions). The first three groups are
@@ -676,6 +716,16 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
         }
         if let Some(sub) = &fmt.subformat {
             metadata.push(("wav:fmt.subformat".to_string(), fmt_guid(sub)));
+            // When the GUID follows the KSMedia.h DEFINE_WAVEFORMATEX_GUID
+            // template, surface the embedded legacy wFormatTag it is
+            // equivalent to (per
+            // docs/.../ms-converting-format-tags-and-subformat-guids.md).
+            // Lets a downstream tool see that e.g. an EXTENSIBLE file with
+            // subformat {00000055-...} is MP3-tagged without re-deriving
+            // the mapping.
+            if let Some(tag) = waveformatex_tag(sub) {
+                metadata.push(("wav:fmt.subformat_tag".to_string(), format!("0x{tag:04X}")));
+            }
         }
     }
 
@@ -2248,43 +2298,72 @@ fn parse_fmt(buf: &[u8]) -> Result<WaveFmt> {
     })
 }
 
+/// Resolve a legacy `wFormatTag` + decode precision to a concrete PCM /
+/// G.711 codec id, or `None` if the tag is not one of the formats this
+/// crate maps directly. `bits` is the active precision (the container
+/// `wBitsPerSample` on the legacy path, or the EXTENSIBLE union's
+/// `wValidBitsPerSample` when that is non-zero).
+///
+/// Shared by the legacy `WAVEFORMATEX` path and the EXTENSIBLE path: per
+/// `docs/container/riff/waveformatextensible/ms-converting-format-tags-and-subformat-guids.md`,
+/// a SubFormat GUID built from `DEFINE_WAVEFORMATEX_GUID(x)` is exactly
+/// equivalent to the legacy tag `x`, so both routes dispatch identically.
+fn codec_for_tag(tag: u16, bits: u16) -> Result<Option<CodecId>> {
+    Ok(match tag {
+        FMT_PCM => Some(CodecId::new(pcm_int_codec(bits)?)),
+        FMT_IEEE_FLOAT => Some(CodecId::new(pcm_float_codec(bits)?)),
+        FMT_ALAW => Some(CodecId::new("pcm_alaw")),
+        FMT_MULAW => Some(CodecId::new("pcm_mulaw")),
+        _ => None,
+    })
+}
+
 fn resolve_codec(fmt: &WaveFmt) -> Result<CodecId> {
-    match fmt.format_tag {
-        FMT_PCM => Ok(CodecId::new(pcm_int_codec(fmt.bits_per_sample)?)),
-        FMT_IEEE_FLOAT => Ok(CodecId::new(pcm_float_codec(fmt.bits_per_sample)?)),
-        FMT_ALAW => Ok(CodecId::new("pcm_alaw")),
-        FMT_MULAW => Ok(CodecId::new("pcm_mulaw")),
-        FMT_EXTENSIBLE => {
-            let sub = fmt
-                .subformat
-                .ok_or_else(|| Error::invalid("extensible WAV missing subformat"))?;
-            // Per docs/container/riff/waveformatextensible/README.md
-            // §"On using these specs": the actual codec precision is the
-            // SubFormat union's wValidBitsPerSample, NOT the WAVEFORMATEX
-            // wBitsPerSample (the container size). Fall back to the
-            // container size only when the union is zero — some writers
-            // leave it unset.
-            let depth = fmt
-                .valid_bits_per_sample
-                .filter(|&v| v > 0)
-                .unwrap_or(fmt.bits_per_sample);
-            match sub {
-                GUID_PCM => Ok(CodecId::new(pcm_int_codec(depth)?)),
-                GUID_IEEE_FLOAT => Ok(CodecId::new(pcm_float_codec(depth)?)),
-                GUID_ALAW => Ok(CodecId::new("pcm_alaw")),
-                GUID_MULAW => Ok(CodecId::new("pcm_mulaw")),
-                // Unknown SubFormat — synthesise a `wav:guid_<text>` id
-                // so downstream make_decoder fails naming the actual
-                // GUID rather than the opaque 0xFFFE tag. Mirrors the
-                // `avi:guid_<...>` pattern in oxideav-avi.
-                other => Ok(CodecId::new(format!("wav:guid_{}", fmt_guid(&other)))),
+    if fmt.format_tag != FMT_EXTENSIBLE {
+        return match codec_for_tag(fmt.format_tag, fmt.bits_per_sample)? {
+            Some(id) => Ok(id),
+            None => Err(Error::unsupported(format!(
+                "unsupported WAV format tag 0x{:04x}",
+                fmt.format_tag
+            ))),
+        };
+    }
+
+    let sub = fmt
+        .subformat
+        .ok_or_else(|| Error::invalid("extensible WAV missing subformat"))?;
+    // Per docs/container/riff/waveformatextensible/README.md
+    // §"On using these specs": the actual codec precision is the
+    // SubFormat union's wValidBitsPerSample, NOT the WAVEFORMATEX
+    // wBitsPerSample (the container size). Fall back to the
+    // container size only when the union is zero — some writers
+    // leave it unset.
+    let depth = fmt
+        .valid_bits_per_sample
+        .filter(|&v| v > 0)
+        .unwrap_or(fmt.bits_per_sample);
+    // Any SubFormat GUID built from the `KSMedia.h`
+    // `DEFINE_WAVEFORMATEX_GUID(x)` template carries the legacy
+    // `wFormatTag` `x` in its leading 16 bits and is, per
+    // ms-converting-format-tags-and-subformat-guids.md, equivalent to the
+    // legacy tag — so it dispatches through the SAME `codec_for_tag`
+    // path the `WAVEFORMATEX` route uses. This generalises the four
+    // hand-listed GUID constants (PCM 0x0001 / IEEE_FLOAT 0x0003 /
+    // ALAW 0x0006 / MULAW 0x0007) to every tag-derived GUID. The
+    // recursion guard (`tag != FMT_EXTENSIBLE`) rejects the degenerate
+    // GUID whose embedded tag is 0xFFFE itself.
+    if let Some(tag) = waveformatex_tag(&sub) {
+        if tag != FMT_EXTENSIBLE {
+            if let Some(id) = codec_for_tag(tag, depth)? {
+                return Ok(id);
             }
         }
-        other => Err(Error::unsupported(format!(
-            "unsupported WAV format tag 0x{:04x}",
-            other
-        ))),
     }
+    // Not a (mappable) WAVEFORMATEX-template GUID — synthesise a
+    // `wav:guid_<text>` id so downstream make_decoder fails naming the
+    // actual GUID rather than the opaque 0xFFFE tag. Mirrors the
+    // `avi:guid_<...>` pattern in oxideav-avi.
+    Ok(CodecId::new(format!("wav:guid_{}", fmt_guid(&sub))))
 }
 
 fn pcm_int_codec(bits: u16) -> Result<&'static str> {
@@ -3280,6 +3359,106 @@ mod tests {
         assert!(
             id.contains("EFBEADDE-FECA-BEBA"),
             "synthesised id must carry the canonical GUID text, got {id:?}"
+        );
+    }
+
+    /// Hand-build a minimal EXTENSIBLE WAV carrying `guid` as its
+    /// SubFormat, `bits` as both `wBitsPerSample` and the union's
+    /// `wValidBitsPerSample`, and an empty `data` chunk. Bypasses the
+    /// muxer so the SubFormat GUID can be chosen directly.
+    fn extensible_wav_with_guid(guid: &[u8; 16], bits: u16) -> Vec<u8> {
+        let block_align = bits / 8;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"RIFF");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(b"WAVE");
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&40u32.to_le_bytes());
+        buf.extend_from_slice(&FMT_EXTENSIBLE.to_le_bytes()); // wFormatTag
+        buf.extend_from_slice(&1u16.to_le_bytes()); // channels
+        buf.extend_from_slice(&44_100u32.to_le_bytes()); // sample_rate
+        buf.extend_from_slice(&(44_100 * block_align as u32).to_le_bytes()); // byte_rate
+        buf.extend_from_slice(&block_align.to_le_bytes()); // block_align
+        buf.extend_from_slice(&bits.to_le_bytes()); // bits_per_sample
+        buf.extend_from_slice(&22u16.to_le_bytes()); // cbSize
+        buf.extend_from_slice(&bits.to_le_bytes()); // wValidBitsPerSample
+        buf.extend_from_slice(&0x00004u32.to_le_bytes()); // dwChannelMask (FC)
+        buf.extend_from_slice(guid); // SubFormat
+        buf.extend_from_slice(b"data");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf
+    }
+
+    /// `waveformatex_tag` extracts the embedded legacy `wFormatTag` from
+    /// any GUID built by the `KSMedia.h` `DEFINE_WAVEFORMATEX_GUID(x)`
+    /// template, and returns `None` for a GUID with a non-matching tail.
+    /// Per
+    /// docs/container/riff/waveformatextensible/ms-converting-format-tags-and-subformat-guids.md.
+    #[test]
+    fn waveformatex_tag_extracts_embedded_format_tag() {
+        assert_eq!(waveformatex_tag(&GUID_PCM), Some(0x0001));
+        assert_eq!(waveformatex_tag(&GUID_IEEE_FLOAT), Some(0x0003));
+        assert_eq!(waveformatex_tag(&GUID_ALAW), Some(0x0006));
+        assert_eq!(waveformatex_tag(&GUID_MULAW), Some(0x0007));
+        // A tag never hand-listed as a constant — MP3 (0x0055) — still
+        // resolves through the generic template.
+        let mut mp3_guid = GUID_PCM;
+        mp3_guid[0] = 0x55;
+        mp3_guid[1] = 0x00;
+        assert_eq!(waveformatex_tag(&mp3_guid), Some(0x0055));
+        // A GUID whose tail does not match the WAVEFORMATEX base is not
+        // a template GUID at all.
+        let bogus: [u8; 16] = [
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38,
+            0x9B, 0x72, // last byte differs from the 0x71 base
+        ];
+        assert_eq!(waveformatex_tag(&bogus), None);
+    }
+
+    /// An EXTENSIBLE stream whose SubFormat is the IEEE-float template
+    /// GUID dispatches identically to the legacy `WAVE_FORMAT_IEEE_FLOAT`
+    /// path — i.e. through the shared `codec_for_tag` route, not the four
+    /// hand-listed constants. Surfaces `wav:fmt.subformat_tag = 0x0003`.
+    #[test]
+    fn extensible_template_guid_dispatches_through_legacy_tag() {
+        let buf = extensible_wav_with_guid(&GUID_IEEE_FLOAT, 32);
+        use std::io::Cursor;
+        let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(buf));
+        let dmx = open_demuxer(rs, &oxideav_core::NullCodecResolver)
+            .expect("IEEE-float template GUID resolves");
+        let s = &dmx.streams()[0];
+        assert_eq!(s.params.codec_id.as_str(), "pcm_f32le");
+        let md: std::collections::HashMap<_, _> = dmx.metadata().iter().cloned().collect();
+        assert_eq!(
+            md.get("wav:fmt.subformat_tag").map(String::as_str),
+            Some("0x0003")
+        );
+    }
+
+    /// A WAVEFORMATEX-template GUID carrying a legacy `wFormatTag` this
+    /// crate does not map directly (e.g. MP3, 0x0055) is NOT mistaken for
+    /// PCM: it falls through to a synthesised `wav:guid_<text>` id, while
+    /// still surfacing `wav:fmt.subformat_tag = 0x0055` so a downstream
+    /// tool can identify it.
+    #[test]
+    fn extensible_template_guid_unmapped_tag_surfaces_tag() {
+        let mut mp3_guid = GUID_PCM;
+        mp3_guid[0] = 0x55; // 0x0055 == MP3
+        let buf = extensible_wav_with_guid(&mp3_guid, 16);
+        use std::io::Cursor;
+        let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(buf));
+        let dmx = open_demuxer(rs, &oxideav_core::NullCodecResolver)
+            .expect("MP3 template GUID still parses");
+        let s = &dmx.streams()[0];
+        assert!(
+            s.params.codec_id.as_str().starts_with("wav:guid_"),
+            "unmapped tag must synthesise wav:guid_<text>, got {:?}",
+            s.params.codec_id.as_str()
+        );
+        let md: std::collections::HashMap<_, _> = dmx.metadata().iter().cloned().collect();
+        assert_eq!(
+            md.get("wav:fmt.subformat_tag").map(String::as_str),
+            Some("0x0055")
         );
     }
 

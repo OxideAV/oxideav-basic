@@ -34,10 +34,22 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework �
   `TOP_BACK_RIGHT 0x20000`) in
   `docs/container/riff/waveformatextensible/ms-waveformatextensible.html`;
   bits above the highest defined flag are preserved as
-  `UNKNOWN(0x...)`. Well-known `KSDATAFORMAT_SUBTYPE_*` GUIDs (PCM,
-  IEEE_FLOAT, ALAW, MULAW) resolve to the same codec ids the legacy
-  `WAVEFORMATEX` path would have produced; unknown GUIDs synthesise a
-  `wav:guid_<canonical-text>` id. `WavMuxOptions::with_extensible(mask)`
+  `UNKNOWN(0x...)`. Any SubFormat GUID built from the `KSMedia.h`
+  `DEFINE_WAVEFORMATEX_GUID(x)` template — `{0000xxxx-0000-0010-8000-
+  00AA00389B71}`, where the leading 16 bits carry the legacy
+  `wFormatTag` `x` — resolves through the SAME `wFormatTag` dispatch the
+  legacy `WAVEFORMATEX` path uses, implementing the documented
+  `IS_VALID_WAVEFORMATEX_GUID` / `EXTRACT_WAVEFORMATEX_ID` macros from
+  `docs/container/riff/waveformatextensible/ms-converting-format-tags-and-subformat-guids.md`.
+  This generalises the four hand-listed `KSDATAFORMAT_SUBTYPE_*` GUIDs
+  (PCM `0x0001`, IEEE_FLOAT `0x0003`, ALAW `0x0006`, MULAW `0x0007`) to
+  every tag-derived GUID, and surfaces the embedded tag as
+  `wav:fmt.subformat_tag` (e.g. an EXTENSIBLE file whose SubFormat is
+  `{00000055-...}` is observably MP3-tagged even though this crate
+  doesn't decode MP3). Template GUIDs whose embedded tag isn't a format
+  this crate maps directly, and non-template (unknown) GUIDs, both
+  synthesise a `wav:guid_<canonical-text>` id.
+  `WavMuxOptions::with_extensible(mask)`
   opts the muxer into writing a 40-byte EXTENSIBLE `fmt ` chunk. The
   `bext` Broadcast Audio Extension chunk (EBU Tech 3285) is parsed and
   surfaced through `wav:bext.*` metadata keys — description, originator,
