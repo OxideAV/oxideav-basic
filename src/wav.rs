@@ -2055,6 +2055,20 @@ fn parse_cset_chunk(buf: &[u8], out: &mut Vec<(String, String)>) {
 /// `ITRK` (Track Number) is not in the §3 baseline but is the
 /// canonical non-baseline tag every WAV-handling tool surfaces; we
 /// keep it for compatibility with the existing public-API behaviour.
+///
+/// Beyond the 1991 baseline, this function also recognises the
+/// **extended `INFO` sub-ID namespace** catalogued in
+/// `docs/container/riff/metadata/exiftool-riff-tags.html`
+/// (ExifTool's "RIFF Info Tags" table — the practical enumeration of
+/// every `INFO`-LIST sub-ID encountered in production WAV/AVI files,
+/// including the Microsoft "more info" / Windows-Media set, the
+/// per-stream audio-language slots, and the common production-credit
+/// tags). Each is a plain ZSTR text field exactly like the baseline
+/// entries, so the parser surfaces it under a spec-derived snake_case
+/// key taken from the ExifTool tag name. These remain distinct from
+/// the baseline group so a caller can still tell a 1991-baseline tag
+/// from a vendor extension by the documented key set.
+///
 /// Sub-IDs outside this set return `None`; their bytes are skipped
 /// by `parse_info_list` rather than surfaced under a synthetic key.
 fn info_id_to_key(id: &[u8; 4]) -> Option<&'static str> {
@@ -2085,6 +2099,45 @@ fn info_id_to_key(id: &[u8; 4]) -> Option<&'static str> {
         b"ITCH" => Some("technician"),
         // Non-baseline but ubiquitous in tag-writer output.
         b"ITRK" => Some("track"),
+        // Extended `INFO` sub-IDs catalogued in ExifTool's RIFF Info
+        // Tags table (`exiftool-riff-tags.html`). Keys are the
+        // snake_case form of the documented ExifTool tag name.
+        b"IAS1" => Some("first_language"),
+        b"IAS2" => Some("second_language"),
+        b"IAS3" => Some("third_language"),
+        b"IAS4" => Some("fourth_language"),
+        b"IAS5" => Some("fifth_language"),
+        b"IAS6" => Some("sixth_language"),
+        b"IAS7" => Some("seventh_language"),
+        b"IAS8" => Some("eighth_language"),
+        b"IAS9" => Some("ninth_language"),
+        b"IBSU" => Some("base_url"),
+        b"ICAS" => Some("default_audio_stream"),
+        b"ICDS" => Some("costume_designer"),
+        b"ICNM" => Some("cinematographer"),
+        b"ICNT" => Some("country"),
+        b"IDIT" => Some("date_time_original"),
+        b"IDST" => Some("distributed_by"),
+        b"IEDT" => Some("edited_by"),
+        b"IENC" => Some("encoded_by"),
+        b"ILGU" => Some("logo_url"),
+        b"ILIU" => Some("logo_icon_url"),
+        b"ILNG" => Some("language"),
+        b"IMBI" => Some("more_info_banner_image"),
+        b"IMBU" => Some("more_info_banner_url"),
+        b"IMIT" => Some("more_info_text"),
+        b"IMIU" => Some("more_info_url"),
+        b"IMUS" => Some("music_by"),
+        b"IPDS" => Some("production_designer"),
+        b"IPRO" => Some("produced_by"),
+        b"IRIP" => Some("ripped_by"),
+        b"IRTD" => Some("rating"),
+        b"ISGN" => Some("secondary_genre"),
+        b"ISMP" => Some("time_code"),
+        b"ISTD" => Some("production_studio"),
+        b"ISTR" => Some("starring"),
+        b"IWMU" => Some("watermark_url"),
+        b"IWRI" => Some("written_by"),
         _ => None,
     }
 }
@@ -6366,6 +6419,135 @@ mod tests {
         assert_eq!(info_id_to_key(b"ZZZZ"), None);
         // Negative: easy typo of IARL.
         assert_eq!(info_id_to_key(b"IRAL"), None);
+    }
+
+    /// Every extended `INFO` sub-ID from ExifTool's RIFF Info Tags
+    /// table (`docs/container/riff/metadata/exiftool-riff-tags.html`)
+    /// resolves to its documented snake_case key. The mapping covers
+    /// the per-stream audio-language slots (`IAS1`..`IAS9`), the
+    /// Windows-Media "more info" set, and the common production-credit
+    /// tags — each a plain ZSTR field surfaced exactly like a baseline
+    /// entry. End-to-end through the demuxer so the `parse_info_list`
+    /// path is exercised, not just the lookup table.
+    #[test]
+    fn info_list_extended_subids_round_trip() {
+        let entries: &[(&[u8; 4], &str)] = &[
+            (b"IAS1", "English"),
+            (b"IAS2", "French"),
+            (b"IAS3", "German"),
+            (b"IAS4", "Spanish"),
+            (b"IAS5", "Italian"),
+            (b"IAS6", "Dutch"),
+            (b"IAS7", "Polish"),
+            (b"IAS8", "Czech"),
+            (b"IAS9", "Greek"),
+            (b"IBSU", "https://example.com/"),
+            (b"ICAS", "2"),
+            (b"ICDS", "Edith Head"),
+            (b"ICNM", "Gregg Toland"),
+            (b"ICNT", "US"),
+            (b"IDIT", "2026:06:16 12:00:00"),
+            (b"IDST", "Acme Distribution"),
+            (b"IEDT", "Walter Murch"),
+            (b"IENC", "FooEncoder 1.0"),
+            (b"ILGU", "https://example.com/logo"),
+            (b"ILIU", "https://example.com/icon.png"),
+            (b"ILNG", "eng"),
+            (b"IMBI", "banner.png"),
+            (b"IMBU", "https://example.com/banner"),
+            (b"IMIT", "See website for details"),
+            (b"IMIU", "https://example.com/info"),
+            (b"IMUS", "John Williams"),
+            (b"IPDS", "Hermann Warm"),
+            (b"IPRO", "Jane Producer"),
+            (b"IRIP", "RipTool"),
+            (b"IRTD", "5"),
+            (b"ISGN", "Documentary"),
+            (b"ISMP", "01:23:45:12"),
+            (b"ISTD", "Pacific Studios"),
+            (b"ISTR", "A. Actor, B. Actor"),
+            (b"IWMU", "https://example.com/wm"),
+            (b"IWRI", "C. Writer"),
+        ];
+
+        let bytes = wav_with_info_entries(entries);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+
+        let expected: &[(&str, &str)] = &[
+            ("first_language", "English"),
+            ("second_language", "French"),
+            ("third_language", "German"),
+            ("fourth_language", "Spanish"),
+            ("fifth_language", "Italian"),
+            ("sixth_language", "Dutch"),
+            ("seventh_language", "Polish"),
+            ("eighth_language", "Czech"),
+            ("ninth_language", "Greek"),
+            ("base_url", "https://example.com/"),
+            ("default_audio_stream", "2"),
+            ("costume_designer", "Edith Head"),
+            ("cinematographer", "Gregg Toland"),
+            ("country", "US"),
+            ("date_time_original", "2026:06:16 12:00:00"),
+            ("distributed_by", "Acme Distribution"),
+            ("edited_by", "Walter Murch"),
+            ("encoded_by", "FooEncoder 1.0"),
+            ("logo_url", "https://example.com/logo"),
+            ("logo_icon_url", "https://example.com/icon.png"),
+            ("language", "eng"),
+            ("more_info_banner_image", "banner.png"),
+            ("more_info_banner_url", "https://example.com/banner"),
+            ("more_info_text", "See website for details"),
+            ("more_info_url", "https://example.com/info"),
+            ("music_by", "John Williams"),
+            ("production_designer", "Hermann Warm"),
+            ("produced_by", "Jane Producer"),
+            ("ripped_by", "RipTool"),
+            ("rating", "5"),
+            ("secondary_genre", "Documentary"),
+            ("time_code", "01:23:45:12"),
+            ("production_studio", "Pacific Studios"),
+            ("starring", "A. Actor, B. Actor"),
+            ("watermark_url", "https://example.com/wm"),
+            ("written_by", "C. Writer"),
+        ];
+        for (key, value) in expected {
+            assert_eq!(
+                md.get(*key),
+                Some(&(*value).to_string()),
+                "extended INFO key {key:?} missing or wrong; got {:?}",
+                md.get(*key)
+            );
+        }
+    }
+
+    /// The extended `INFO` sub-IDs do not collide with the baseline
+    /// group: each extended FOURCC resolves to a `Some` key distinct
+    /// from every baseline key, and a representative non-`I` FOURCC
+    /// still returns `None`.
+    #[test]
+    fn info_id_to_key_extended_completeness() {
+        const EXTENDED: &[&[u8; 4]] = &[
+            b"IAS1", b"IAS2", b"IAS3", b"IAS4", b"IAS5", b"IAS6", b"IAS7", b"IAS8", b"IAS9",
+            b"IBSU", b"ICAS", b"ICDS", b"ICNM", b"ICNT", b"IDIT", b"IDST", b"IEDT", b"IENC",
+            b"ILGU", b"ILIU", b"ILNG", b"IMBI", b"IMBU", b"IMIT", b"IMIU", b"IMUS", b"IPDS",
+            b"IPRO", b"IRIP", b"IRTD", b"ISGN", b"ISMP", b"ISTD", b"ISTR", b"IWMU", b"IWRI",
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for id in EXTENDED {
+            let key = info_id_to_key(id).unwrap_or_else(|| {
+                panic!(
+                    "extended INFO sub-ID {:?} missing from info_id_to_key",
+                    std::str::from_utf8(*id).unwrap()
+                )
+            });
+            assert!(
+                seen.insert(key),
+                "extended INFO key {key:?} collides with another sub-ID"
+            );
+        }
     }
 
     /// A `LIST INFO` chunk that contains an unknown sub-ID alongside

@@ -20,7 +20,24 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework �
   `palette_setting`, `IPRD` → `album`, `ISBJ` → `subject`, `ISFT` →
   `encoder`, `ISHP` → `sharpness`, `ISRC` → `source`, `ISRF` →
   `source_form`, `ITCH` → `technician`; non-baseline `ITRK` → `track`
-  retained for compatibility; unknown sub-IDs are skipped silently).
+  retained for compatibility). Also recognises the extended `INFO`
+  sub-ID namespace catalogued in ExifTool's RIFF Info Tags table
+  (`docs/container/riff/metadata/exiftool-riff-tags.html`): the
+  per-stream audio-language slots `IAS1`..`IAS9` →
+  `first_language`..`ninth_language`, the Windows-Media "more info"
+  set (`IBSU` → `base_url`, `ICAS` → `default_audio_stream`, `ILGU` →
+  `logo_url`, `ILIU` → `logo_icon_url`, `IMBI` →
+  `more_info_banner_image`, `IMBU` → `more_info_banner_url`, `IMIT` →
+  `more_info_text`, `IMIU` → `more_info_url`, `IWMU` →
+  `watermark_url`), and the common production-credit / cataloguing
+  tags (`ICDS` → `costume_designer`, `ICNM` → `cinematographer`,
+  `ICNT` → `country`, `IDIT` → `date_time_original`, `IDST` →
+  `distributed_by`, `IEDT` → `edited_by`, `IENC` → `encoded_by`,
+  `ILNG` → `language`, `IMUS` → `music_by`, `IPDS` →
+  `production_designer`, `IPRO` → `produced_by`, `IRIP` → `ripped_by`,
+  `IRTD` → `rating`, `ISGN` → `secondary_genre`, `ISMP` → `time_code`,
+  `ISTD` → `production_studio`, `ISTR` → `starring`, `IWRI` →
+  `written_by`); unknown sub-IDs are skipped silently).
   Dispatches `WAVE_FORMAT_ALAW (0x0006)` /
   `WAVE_FORMAT_MULAW (0x0007)` to the `pcm_alaw` / `pcm_mulaw` codecs
   (host runtime applies G.711 decode). `WAVE_FORMAT_EXTENSIBLE (0xFFFE)`
