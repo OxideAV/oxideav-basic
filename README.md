@@ -221,11 +221,26 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework �
   skipped-as-opaque; the mux→demux round-trip is pinned byte-for-byte
   in tests. The concrete demuxer is now publicly constructible via
   `wav::open_wav_demuxer` so every typed accessor is reachable without
-  downcasting. ADM `chna` (channel-allocation) support is blocked on a
-  docs gap: the staged ITU-R BS.2076-1 §7 defines only the logical
-  record content (Table 46) and defers the binary chunk layout to
-  ITU-R BS.2088, which is not yet staged under
-  `docs/container/riff/metadata/`.
+  downcasting. The BW64/ADM `chna` (channel-allocation) chunk is now
+  supported on BOTH read and write sides per the staged binary layout
+  in `docs/container/riff/metadata/bs2088-chna-chunk-layout.md`
+  (ITU-R BS.2088-2 §8.1): the typed `wav::ChnaChunk` / `wav::AudioId`
+  structs (4-byte `numTracks`+`numUIDs` pre-amble followed by `N`
+  fixed 40-byte `audioID` records — `trackIndex` u16 @0, `UID`[12]
+  `ATU_…` @2, `trackRef`[14] `AT_…`/`AC_…` @14, `packRef`[11] `AP_…`
+  or 11 NULs @28, `pad` @39) carry `parse` / `to_bytes` and the
+  over-provisioning rule (`N = (ckSize−4)/40 ≥ numUIDs`, spare records
+  marked `trackIndex == 0` round-trip verbatim). The demuxer surfaces
+  `wav:chna.num_tracks` / `.num_uids` / `.record_count` /
+  `.defined_count` plus per-defined-record
+  `wav:chna.<n>.{track_index,uid,track_ref,pack_ref}` (fixed-width
+  char fields rendered up to the first NUL, omitted when entirely
+  NUL) and `wav:chna.body_len` when trailing extension bytes ride
+  along; the typed view is reachable via `WavDemuxer::chna()` and the
+  muxer writes the chunk via `WavMuxOptions::with_chna`. Bodies
+  shorter than the 4-byte pre-amble are skipped-as-opaque; the
+  mux→demux round-trip and the BS.2088-2 §8.3.1 stereo worked example
+  are pinned byte-for-byte in tests.
 - **slin** container: Asterisk-style headerless `.sln*` / `.slin*` raw
   S16LE PCM (extension drives the sample rate).
 - **Y4M (YUV4MPEG2)** container: rawvideo demuxer + muxer for `.y4m` files,

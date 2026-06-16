@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- BW64/ADM chna (channel-allocation) chunk read+write with typed ChnaChunk/AudioId surface (ITU-R BS.2088-2 §8.1)
 - recognise extended LIST INFO sub-IDs (ExifTool RIFF Info Tags) — IAS1..IAS9 audio-language slots, Windows-Media "more info" set, production-credit tags
 
 ## [0.0.9](https://github.com/OxideAV/oxideav-basic/compare/v0.0.8...v0.0.9) - 2026-06-15

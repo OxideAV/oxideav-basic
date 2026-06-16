@@ -395,6 +395,9 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
     let mut fact_sample_count: Option<u64> = None;
     // Typed Acidizer view, populated when an `acid` chunk parses.
     let mut acid: Option<AcidChunk> = None;
+    // Typed BW64/ADM channel-allocation view, populated when a `chna`
+    // chunk parses (ITU-R BS.2088-2 §8.1).
+    let mut chna: Option<ChnaChunk> = None;
     // RF64/BW64 ds64 (EBU Tech 3306 §3 / Annex A.2): mandatory first
     // chunk after the form header when the magic is RF64 or BW64;
     // otherwise must be absent.
@@ -565,6 +568,20 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
                 let mut buf = vec![0u8; size as usize];
                 input.read_exact(&mut buf)?;
                 acid = parse_acid_chunk(&buf, &mut metadata);
+                if size % 2 == 1 {
+                    input.seek(SeekFrom::Current(1))?;
+                }
+            }
+            b"chna" => {
+                // ITU-R BS.2088-2 §8.1: the BW64/ADM channel-allocation
+                // chunk maps each track in the `data` interleave to its
+                // ADM audioTrackUID / audioTrackFormatID /
+                // audioPackFormatID references. Body is a 4-byte count
+                // pre-amble followed by N fixed 40-byte `audioID`
+                // records.
+                let mut buf = vec![0u8; size as usize];
+                input.read_exact(&mut buf)?;
+                chna = parse_chna_chunk(&buf, &mut metadata);
                 if size % 2 == 1 {
                     input.seek(SeekFrom::Current(1))?;
                 }
@@ -753,6 +770,7 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
         channel_mask: fmt.channel_mask,
         subformat: fmt.subformat,
         acid,
+        chna,
     })
 }
 
@@ -1542,6 +1560,239 @@ fn parse_acid_chunk(buf: &[u8], out: &mut Vec<(String, String)>) -> Option<AcidC
         out.push(("wav:acid.body_len".to_string(), buf.len().to_string()));
     }
     Some(acid)
+}
+
+/// One `audioID` record inside a BW64/ADM `chna` chunk — 40 bytes,
+/// fixed layout per ITU-R BS.2088-2 §8.1
+/// (`docs/container/riff/metadata/bs2088-chna-chunk-layout.md` §1.2):
+///
+/// ```text
+/// struct audioID {                 // 40 bytes
+///     WORD     trackIndex;         // off 0  — 1-based index into <data>; 0 = unused
+///     CHAR[12] UID;                // off 2  — audioTrackUID  "ATU_xxxxxxxx"
+///     CHAR[14] trackRef;           // off 14 — audioTrackFormatID "AT_xxxxxxxx_xx"
+///                                  //          (or audioChannelFormat "AC_xxxxxxxx_00")
+///     CHAR[11] packRef;            // off 28 — audioPackFormatID "AP_xxxxxxxx" (or 11 NULs)
+///     CHAR     pad;                // off 39 — padding, makes the record even-sized
+/// }
+/// ```
+///
+/// The character-array fields are fixed-width, **not** NUL-terminated
+/// ASCII (§1.1); unused records (`track_index == 0`) zero every field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AudioId {
+    /// `trackIndex` (off 0) — 1-based index of the track in the `data`
+    /// chunk interleave. `0` marks an unused (spare) record.
+    pub track_index: u16,
+    /// `UID` (off 2) — 12-byte `audioTrackUID`, format `ATU_xxxxxxxx`.
+    /// Fixed-width raw bytes (all-zero for an unused record).
+    pub uid: [u8; 12],
+    /// `trackRef` (off 14) — 14-byte `audioTrackFormatID` reference
+    /// (`AT_xxxxxxxx_xx`), or an `audioChannelFormat` ref
+    /// (`AC_xxxxxxxx_00`) for linear-PCM essence.
+    pub track_ref: [u8; 14],
+    /// `packRef` (off 28) — 11-byte `audioPackFormatID` reference
+    /// (`AP_xxxxxxxx`). All 11 bytes NUL when no pack is required.
+    pub pack_ref: [u8; 11],
+    /// `pad` (off 39) — single trailing padding byte (§1.2 uses `\0`),
+    /// carried verbatim so a read→write pass is byte-lossless.
+    pub pad: u8,
+}
+
+impl AudioId {
+    /// Fixed on-disk size of one `audioID` record in bytes (§1.2).
+    pub const SIZE: usize = 40;
+
+    /// `true` when this record is the spare/unused marker
+    /// (`track_index == 0`) — readers skip these (§1.3).
+    pub fn is_unused(&self) -> bool {
+        self.track_index == 0
+    }
+
+    /// Decode one 40-byte `audioID` record. Returns `None` when `buf`
+    /// is shorter than [`Self::SIZE`].
+    pub fn parse(buf: &[u8]) -> Option<AudioId> {
+        if buf.len() < Self::SIZE {
+            return None;
+        }
+        let mut uid = [0u8; 12];
+        uid.copy_from_slice(&buf[2..14]);
+        let mut track_ref = [0u8; 14];
+        track_ref.copy_from_slice(&buf[14..28]);
+        let mut pack_ref = [0u8; 11];
+        pack_ref.copy_from_slice(&buf[28..39]);
+        Some(AudioId {
+            track_index: u16::from_le_bytes([buf[0], buf[1]]),
+            uid,
+            track_ref,
+            pack_ref,
+            pad: buf[39],
+        })
+    }
+
+    /// Serialize the 40-byte `audioID` record (little-endian
+    /// `track_index`, fixed-width raw char arrays, trailing `pad`).
+    pub fn to_bytes(&self) -> [u8; 40] {
+        let mut out = [0u8; 40];
+        out[0..2].copy_from_slice(&self.track_index.to_le_bytes());
+        out[2..14].copy_from_slice(&self.uid);
+        out[14..28].copy_from_slice(&self.track_ref);
+        out[28..39].copy_from_slice(&self.pack_ref);
+        out[39] = self.pad;
+        out
+    }
+}
+
+/// Render a fixed-width `audioID` char-array field as text: ASCII bytes
+/// up to the first NUL (or the full width when there is no NUL),
+/// dropping any trailing NUL padding. Returns `None` when the field is
+/// entirely NUL (e.g. a `pack_ref` with no pack, or an unused record).
+fn audio_id_text(field: &[u8]) -> Option<String> {
+    let end = field.iter().position(|&b| b == 0).unwrap_or(field.len());
+    if end == 0 {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&field[..end]).into_owned())
+}
+
+/// Typed view of the BW64/ADM `chna` (channel allocation) chunk per
+/// ITU-R BS.2088-2 §8.1
+/// (`docs/container/riff/metadata/bs2088-chna-chunk-layout.md`):
+///
+/// ```text
+/// <chna-ck> -> chna( <numTracks:WORD> <numUIDs:WORD> <audioID[N]> )
+/// ```
+///
+/// where the record count `N = (ckSize - 4) / 40` (§1.1). `N` may
+/// exceed `num_uids` because writers over-provision spare records for
+/// later in-place editing (§1.3); the spare records have
+/// `track_index == 0` and are carried verbatim so a read→write pass is
+/// byte-lossless.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChnaChunk {
+    /// `numTracks` (off 0) — number of tracks used in the file. A track
+    /// carrying multiple ID sets still counts as one (§1.1).
+    pub num_tracks: u16,
+    /// `numUIDs` (off 2) — number of UIDs used; equals the number of
+    /// defined (non-zero) `ID[]` records and may exceed `num_tracks`
+    /// (§1.1).
+    pub num_uids: u16,
+    /// The `audioID` record array (`N` entries, `N >= num_uids`).
+    /// Includes any spare (`track_index == 0`) records so the chunk
+    /// round-trips byte-for-byte.
+    pub ids: Vec<AudioId>,
+}
+
+impl ChnaChunk {
+    /// Fixed size of the `num_tracks` + `num_uids` pre-amble in bytes
+    /// (§1.1). `ckSize == PREAMBLE_LEN + N * AudioId::SIZE`.
+    pub const PREAMBLE_LEN: usize = 4;
+
+    /// Decode a `chna` chunk body. Returns `None` when the body is
+    /// shorter than the 4-byte `num_tracks`+`num_uids` pre-amble. The
+    /// record count is derived from the body length
+    /// (`N = (body.len() - 4) / 40`); any trailing bytes that do not
+    /// fill a whole 40-byte record are ignored (§1.1, §1.3).
+    pub fn parse(buf: &[u8]) -> Option<ChnaChunk> {
+        if buf.len() < Self::PREAMBLE_LEN {
+            return None;
+        }
+        let num_tracks = u16::from_le_bytes([buf[0], buf[1]]);
+        let num_uids = u16::from_le_bytes([buf[2], buf[3]]);
+        let n = (buf.len() - Self::PREAMBLE_LEN) / AudioId::SIZE;
+        let mut ids = Vec::with_capacity(n);
+        for i in 0..n {
+            let off = Self::PREAMBLE_LEN + i * AudioId::SIZE;
+            // `AudioId::parse` cannot fail here — the slice is exactly
+            // `SIZE` bytes by construction of `n`.
+            if let Some(rec) = AudioId::parse(&buf[off..off + AudioId::SIZE]) {
+                ids.push(rec);
+            }
+        }
+        Some(ChnaChunk {
+            num_tracks,
+            num_uids,
+            ids,
+        })
+    }
+
+    /// On-disk size of the chunk **data section** in bytes (the `ckSize`
+    /// value, excluding the 8-byte `ckID`+`ckSize` header) — §1.1.
+    pub fn body_len(&self) -> usize {
+        Self::PREAMBLE_LEN + self.ids.len() * AudioId::SIZE
+    }
+
+    /// Serialize the `chna` chunk body (`num_tracks`, `num_uids`, then
+    /// every `audioID` record). The body is always even-sized so no
+    /// inter-chunk pad byte is needed (§1.4).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.body_len());
+        out.extend_from_slice(&self.num_tracks.to_le_bytes());
+        out.extend_from_slice(&self.num_uids.to_le_bytes());
+        for rec in &self.ids {
+            out.extend_from_slice(&rec.to_bytes());
+        }
+        out
+    }
+
+    /// Iterator over the *defined* (non-spare) records — those whose
+    /// `track_index != 0` (§1.3).
+    pub fn defined_ids(&self) -> impl Iterator<Item = &AudioId> {
+        self.ids.iter().filter(|r| !r.is_unused())
+    }
+}
+
+/// Parse a `chna` chunk body, surface `wav:chna.*` metadata keys and
+/// return the typed view for [`WavDemuxer::chna`]. Keys:
+///
+/// - `wav:chna.num_tracks` / `wav:chna.num_uids` — the two pre-amble
+///   counts.
+/// - `wav:chna.record_count` — `N`, the total `audioID` records
+///   (including spares); equals `(body_len - 4) / 40`.
+/// - `wav:chna.defined_count` — number of records with a non-zero
+///   `track_index` (the in-use entries).
+/// - `wav:chna.<n>.track_index` / `.uid` / `.track_ref` / `.pack_ref`
+///   for every *defined* record, zero-based `<n>` by encounter order
+///   (spare records are not surfaced individually). `.uid` /
+///   `.track_ref` / `.pack_ref` are emitted only when the field is not
+///   entirely NUL.
+/// - `wav:chna.body_len` — only when the on-wire body exceeds the
+///   record-aligned size (trailing extension bytes riding along).
+fn parse_chna_chunk(buf: &[u8], out: &mut Vec<(String, String)>) -> Option<ChnaChunk> {
+    let chna = ChnaChunk::parse(buf)?;
+    out.push((
+        "wav:chna.num_tracks".to_string(),
+        chna.num_tracks.to_string(),
+    ));
+    out.push(("wav:chna.num_uids".to_string(), chna.num_uids.to_string()));
+    out.push((
+        "wav:chna.record_count".to_string(),
+        chna.ids.len().to_string(),
+    ));
+    let defined = chna.defined_ids().count();
+    out.push(("wav:chna.defined_count".to_string(), defined.to_string()));
+    for (n, rec) in chna.defined_ids().enumerate() {
+        out.push((
+            format!("wav:chna.{n}.track_index"),
+            rec.track_index.to_string(),
+        ));
+        if let Some(uid) = audio_id_text(&rec.uid) {
+            out.push((format!("wav:chna.{n}.uid"), uid));
+        }
+        if let Some(tref) = audio_id_text(&rec.track_ref) {
+            out.push((format!("wav:chna.{n}.track_ref"), tref));
+        }
+        if let Some(pref) = audio_id_text(&rec.pack_ref) {
+            out.push((format!("wav:chna.{n}.pack_ref"), pref));
+        }
+    }
+    // The §1.1 record count `N` is derived from the floor division, so a
+    // body whose length isn't `4 + N*40` carries trailing extension
+    // bytes; surface the raw on-wire length so they're observable.
+    if buf.len() > chna.body_len() {
+        out.push(("wav:chna.body_len".to_string(), buf.len().to_string()));
+    }
+    Some(chna)
 }
 
 /// Parse a `fact` chunk body per
@@ -2491,6 +2742,7 @@ pub struct WavDemuxer {
     channel_mask: Option<u32>,
     subformat: Option<[u8; 16]>,
     acid: Option<AcidChunk>,
+    chna: Option<ChnaChunk>,
 }
 
 impl WavDemuxer {
@@ -2553,6 +2805,15 @@ impl WavDemuxer {
     /// `wav:acid.*` metadata keys for `dyn Demuxer` consumers.
     pub fn acid(&self) -> Option<&AcidChunk> {
         self.acid.as_ref()
+    }
+
+    /// Typed view of the BW64/ADM `chna` (channel-allocation) chunk
+    /// when the file carried one with a well-formed body (ITU-R
+    /// BS.2088-2 §8.1). `None` when the chunk is absent or shorter than
+    /// the 4-byte count pre-amble. The same data is mirrored under the
+    /// `wav:chna.*` metadata keys for `dyn Demuxer` consumers.
+    pub fn chna(&self) -> Option<&ChnaChunk> {
+        self.chna.as_ref()
     }
 }
 
@@ -2659,6 +2920,7 @@ fn open_muxer(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Box<
         shape,
         extensible: None,
         acid: None,
+        chna: None,
         riff_size_offset: 0,
         data_size_offset: 0,
         fact_size_offset: None,
@@ -2683,6 +2945,7 @@ fn open_muxer(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Box<
 pub struct WavMuxOptions {
     extensible: Option<ExtensibleOpts>,
     acid: Option<AcidChunk>,
+    chna: Option<ChnaChunk>,
 }
 
 #[derive(Clone, Debug)]
@@ -2730,6 +2993,14 @@ impl WavMuxOptions {
         self.acid = Some(acid);
         self
     }
+
+    /// Emit a BW64/ADM `chna` (channel-allocation) chunk ahead of the
+    /// `data` chunk (layout per [`ChnaChunk`] / ITU-R BS.2088-2 §8.1).
+    /// The chunk body is always even-sized, so no pad byte is written.
+    pub fn with_chna(mut self, chna: ChnaChunk) -> Self {
+        self.chna = Some(chna);
+        self
+    }
 }
 
 /// Open the WAV muxer with caller-controlled `WAVEFORMATEXTENSIBLE`
@@ -2763,6 +3034,7 @@ pub fn open_muxer_with(
         shape,
         extensible: opts.extensible,
         acid: opts.acid,
+        chna: opts.chna,
         riff_size_offset: 0,
         data_size_offset: 0,
         fact_size_offset: None,
@@ -2849,6 +3121,10 @@ struct WavMuxer {
     /// Caller-supplied Acidizer metadata, emitted as a 24-byte `acid`
     /// chunk between the format chunks and `data` when present.
     acid: Option<AcidChunk>,
+    /// Caller-supplied BW64/ADM channel-allocation metadata, emitted as
+    /// a `chna` chunk ahead of `data` when present (ITU-R BS.2088-2
+    /// §8.1).
+    chna: Option<ChnaChunk>,
     riff_size_offset: u64,
     data_size_offset: u64,
     /// Offset of the `dwFileSize` field inside the `fact` chunk we
@@ -2938,6 +3214,16 @@ impl Muxer for WavMuxer {
             self.output
                 .write_all(&(AcidChunk::BODY_LEN as u32).to_le_bytes())?;
             self.output.write_all(&acid.to_bytes())?;
+        }
+
+        // `chna` chunk: caller-supplied BW64/ADM channel-allocation
+        // records (ITU-R BS.2088-2 §8.1). The body is `4 + N*40` bytes,
+        // always even, so no inter-chunk pad byte is needed.
+        if let Some(chna) = &self.chna {
+            let body = chna.to_bytes();
+            self.output.write_all(b"chna")?;
+            self.output.write_all(&(body.len() as u32).to_le_bytes())?;
+            self.output.write_all(&body)?;
         }
 
         self.output.write_all(b"data")?;
@@ -4521,6 +4807,239 @@ mod tests {
         let plain = wav_with_smpl_and_inst(None, None);
         let dmx = open_wav_demuxer(Box::new(Cursor::new(plain))).unwrap();
         assert_eq!(dmx.acid(), None);
+    }
+
+    /// Build a minimal valid PCM WAV with a caller-supplied raw `chna`
+    /// chunk inserted between `fmt ` and `data`. Mirrors
+    /// `wav_with_acid`.
+    fn wav_with_chna(chna_body: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"RIFF");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(b"WAVE");
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&16u32.to_le_bytes());
+        buf.extend_from_slice(&FMT_PCM.to_le_bytes());
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(&48_000u32.to_le_bytes());
+        buf.extend_from_slice(&192_000u32.to_le_bytes());
+        buf.extend_from_slice(&4u16.to_le_bytes());
+        buf.extend_from_slice(&16u16.to_le_bytes());
+        buf.extend_from_slice(b"chna");
+        buf.extend_from_slice(&(chna_body.len() as u32).to_le_bytes());
+        buf.extend_from_slice(chna_body);
+        if chna_body.len() % 2 == 1 {
+            buf.push(0);
+        }
+        buf.extend_from_slice(b"data");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf
+    }
+
+    /// Construct an `audioID` record from text fields (right-padding the
+    /// fixed-width char arrays with NUL the way an ADM writer does).
+    fn audio_id(track_index: u16, uid: &str, track_ref: &str, pack_ref: &str) -> AudioId {
+        fn pad<const N: usize>(s: &str) -> [u8; N] {
+            let mut out = [0u8; N];
+            let b = s.as_bytes();
+            out[..b.len()].copy_from_slice(b);
+            out
+        }
+        AudioId {
+            track_index,
+            uid: pad::<12>(uid),
+            track_ref: pad::<14>(track_ref),
+            pack_ref: pad::<11>(pack_ref),
+            pad: 0,
+        }
+    }
+
+    /// `ChnaChunk::to_bytes` is pinned byte-for-byte against the
+    /// BS.2088-2 §8.3.1 stereo worked example (numTracks=2, numUIDs=2,
+    /// two 40-byte `audioID` records, ckSize=84) and `ChnaChunk::parse`
+    /// inverts it exactly.
+    #[test]
+    fn chna_chunk_byte_layout_pinned() {
+        let chna = ChnaChunk {
+            num_tracks: 2,
+            num_uids: 2,
+            ids: vec![
+                audio_id(1, "ATU_00000001", "AT_00010001_01", "AP_00010002"),
+                audio_id(2, "ATU_00000002", "AT_00010002_01", "AP_00010002"),
+            ],
+        };
+        let bytes = chna.to_bytes();
+        // ckSize = 4 + N*40 = 4 + 2*40 = 84 (§2 worked example).
+        assert_eq!(bytes.len(), 84);
+        assert_eq!(chna.body_len(), 84);
+        // Pre-amble: numTracks=2, numUIDs=2 (LE WORDs).
+        assert_eq!(&bytes[0..4], &[0x02, 0x00, 0x02, 0x00]);
+        // First record: trackIndex=1 then the three fixed-width refs.
+        assert_eq!(&bytes[4..6], &[0x01, 0x00]);
+        assert_eq!(&bytes[6..18], b"ATU_00000001");
+        assert_eq!(&bytes[18..32], b"AT_00010001_01");
+        assert_eq!(&bytes[32..43], b"AP_00010002");
+        assert_eq!(bytes[43], 0); // pad
+        assert_eq!(ChnaChunk::parse(&bytes), Some(chna));
+    }
+
+    /// Full `chna` read path: counts and every defined record's fields
+    /// surface under the `wav:chna.*` keys; PCM stream still resolves.
+    #[test]
+    fn chna_full_metadata() {
+        let chna = ChnaChunk {
+            num_tracks: 2,
+            num_uids: 2,
+            ids: vec![
+                audio_id(1, "ATU_00000001", "AT_00010001_01", "AP_00010002"),
+                // Linear-PCM essence references an audioChannelFormat
+                // (`AC_..._00`) and carries no pack (11 NULs).
+                audio_id(2, "ATU_00000002", "AC_00010002_00", ""),
+            ],
+        };
+        let bytes = wav_with_chna(&chna.to_bytes());
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:chna.num_tracks"), Some(&"2".to_string()));
+        assert_eq!(md.get("wav:chna.num_uids"), Some(&"2".to_string()));
+        assert_eq!(md.get("wav:chna.record_count"), Some(&"2".to_string()));
+        assert_eq!(md.get("wav:chna.defined_count"), Some(&"2".to_string()));
+        assert_eq!(md.get("wav:chna.0.track_index"), Some(&"1".to_string()));
+        assert_eq!(md.get("wav:chna.0.uid"), Some(&"ATU_00000001".to_string()));
+        assert_eq!(
+            md.get("wav:chna.0.track_ref"),
+            Some(&"AT_00010001_01".to_string())
+        );
+        assert_eq!(
+            md.get("wav:chna.0.pack_ref"),
+            Some(&"AP_00010002".to_string())
+        );
+        assert_eq!(md.get("wav:chna.1.track_index"), Some(&"2".to_string()));
+        assert_eq!(
+            md.get("wav:chna.1.track_ref"),
+            Some(&"AC_00010002_00".to_string())
+        );
+        // No pack on record 1 (all-NUL pack_ref) → key omitted.
+        assert_eq!(md.get("wav:chna.1.pack_ref"), None);
+        // Exact-size body → no body_len key.
+        assert_eq!(md.get("wav:chna.body_len"), None);
+        assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
+    }
+
+    /// Over-provisioned chunk (§1.3): N=4 records but only 2 are
+    /// defined; spare (`track_index == 0`) records are counted but not
+    /// surfaced individually, and round-trip is byte-lossless.
+    #[test]
+    fn chna_over_provisioned_spares() {
+        let spare = AudioId {
+            track_index: 0,
+            uid: [0; 12],
+            track_ref: [0; 14],
+            pack_ref: [0; 11],
+            pad: 0,
+        };
+        let chna = ChnaChunk {
+            num_tracks: 2,
+            num_uids: 2,
+            ids: vec![
+                audio_id(1, "ATU_00000001", "AT_00010001_01", "AP_00010002"),
+                audio_id(2, "ATU_00000002", "AT_00010002_01", "AP_00010002"),
+                spare,
+                spare,
+            ],
+        };
+        // N = (ckSize - 4) / 40 = 4.
+        assert_eq!(chna.body_len(), 4 + 4 * 40);
+        let bytes = wav_with_chna(&chna.to_bytes());
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:chna.record_count"), Some(&"4".to_string()));
+        assert_eq!(md.get("wav:chna.defined_count"), Some(&"2".to_string()));
+        // Only the two defined records get per-record keys.
+        assert_eq!(md.get("wav:chna.1.track_index"), Some(&"2".to_string()));
+        assert_eq!(md.get("wav:chna.2.track_index"), None);
+        // Round-trip through parse keeps the spares verbatim.
+        assert_eq!(ChnaChunk::parse(&chna.to_bytes()), Some(chna));
+    }
+
+    /// A body shorter than the 4-byte count pre-amble is opaque-skipped:
+    /// no `wav:chna.*` keys, stream still opens.
+    #[test]
+    fn chna_truncated_is_skipped() {
+        let bytes = wav_with_chna(&[0u8; 3]);
+        let dmx = open_demux_from_bytes(bytes);
+        assert!(!dmx
+            .metadata()
+            .iter()
+            .any(|(k, _)| k.starts_with("wav:chna")));
+        assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
+    }
+
+    /// A body with trailing bytes that don't fill a whole 40-byte
+    /// record: the partial record is ignored and `wav:chna.body_len`
+    /// surfaces the raw on-wire length for observability.
+    #[test]
+    fn chna_trailing_partial_record_surfaces_body_len() {
+        let chna = ChnaChunk {
+            num_tracks: 1,
+            num_uids: 1,
+            ids: vec![audio_id(1, "ATU_00000001", "AT_00010001_01", "AP_00010002")],
+        };
+        let mut body = chna.to_bytes();
+        body.extend_from_slice(&[0xEE, 0xFF]); // < 40, ignored
+        let bytes = wav_with_chna(&body);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:chna.record_count"), Some(&"1".to_string()));
+        // body_len = 4 + 40 + 2 = 46.
+        assert_eq!(md.get("wav:chna.body_len"), Some(&"46".to_string()));
+    }
+
+    /// Write→read round-trip through the public muxer/demuxer paths:
+    /// `WavMuxOptions::with_chna` emits the chunk, the demuxer's typed
+    /// accessor and metadata keys return identical values, PCM is
+    /// untouched.
+    #[test]
+    fn chna_round_trip() {
+        let chna = ChnaChunk {
+            num_tracks: 1,
+            num_uids: 1,
+            ids: vec![audio_id(1, "ATU_0000000A", "AT_0001000A_01", "AP_0001000B")],
+        };
+        let payload: Vec<u8> = (0..400u32).flat_map(|i| (i as i16).to_le_bytes()).collect();
+        let stream = make_stream(SampleFormat::S16, 1, 44_100);
+        let opts = WavMuxOptions::default().with_chna(chna.clone());
+        let bytes = mux_to_bytes(&stream, &payload, opts, "chna-rt");
+        // The serialized chunk (header + body) appears verbatim.
+        let body = chna.to_bytes();
+        let mut chunk = b"chna".to_vec();
+        chunk.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        chunk.extend_from_slice(&body);
+        assert!(bytes.windows(chunk.len()).any(|w| w == &chunk[..]));
+
+        use std::io::Cursor;
+        let mut dmx = open_wav_demuxer(Box::new(Cursor::new(bytes))).unwrap();
+        assert_eq!(dmx.chna(), Some(&chna));
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:chna.0.uid"), Some(&"ATU_0000000A".to_string()));
+        let mut out = Vec::new();
+        loop {
+            match dmx.next_packet() {
+                Ok(p) => out.extend_from_slice(&p.data),
+                Err(Error::Eof) => break,
+                Err(e) => panic!("demux error: {e}"),
+            }
+        }
+        assert_eq!(out, payload);
+
+        // No `chna` chunk → typed accessor is None.
+        let plain = wav_with_smpl_and_inst(None, None);
+        let dmx = open_wav_demuxer(Box::new(Cursor::new(plain))).unwrap();
+        assert_eq!(dmx.chna(), None);
     }
 
     /// Build a minimal valid PCM WAV with a caller-supplied raw `plst`
