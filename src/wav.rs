@@ -602,6 +602,14 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
                     input.seek(SeekFrom::Current(1))?;
                 }
             }
+            b"bxml" => {
+                let mut buf = vec![0u8; size as usize];
+                input.read_exact(&mut buf)?;
+                parse_bxml_chunk(&buf, &mut metadata);
+                if size % 2 == 1 {
+                    input.seek(SeekFrom::Current(1))?;
+                }
+            }
             b"_PMX" => {
                 let mut buf = vec![0u8; size as usize];
                 input.read_exact(&mut buf)?;
@@ -1927,6 +1935,86 @@ fn parse_axml_chunk(buf: &[u8], out: &mut Vec<(String, String)>) {
     let text = String::from_utf8_lossy(&buf[..end]).trim().to_string();
     if !text.is_empty() {
         out.push(("wav:axml".to_string(), text));
+    }
+}
+
+/// Parse a `<bxml>` chunk body and surface its (optionally compressed)
+/// XML payload through the metadata table.
+///
+/// The `<bxml>` chunk is the compressed-XML counterpart of `<axml>`,
+/// defined in ITU-R BS.2088-2 §6 "BXML chunk"
+/// (`docs/container/riff/metadata/R-REC-BS.2088.pdf`):
+///
+/// > The <bxml> chunk may contain the compressed XML data instead of
+/// > the <axml> chunk. The <bxml> chunk consists of a header followed
+/// > by the XML data compressed by the compression method specified in
+/// > the fmtType.
+/// >
+/// > struct bxml_chunk {
+/// >     CHAR  ckID[4];     // {'b','x','m','l'}
+/// >     DWORD ckSize;      // size of the <bxml> chunk in bytes
+/// >     WORD  fmtType;     // type of compression method,
+/// >                        // 0x0001="gzip", etc.
+/// >     CHAR  xmlData[];   // XML text data compressed by the method
+/// > };
+///
+/// Per §6.2 the `fmtType` value `0x0000` means the `xmlData` payload is
+/// *uncompressed* XML text, while `0x0001` selects gzip (IETF RFC 1952).
+/// The body may legitimately exceed 4 GiB (§6.1), in which case the
+/// 32-bit on-wire `ckSize` carries the `0xFFFFFFFF` sentinel and the
+/// true size rides in the `<ds64>` chunk's `table` array keyed on the
+/// `bxml` chunk-ID — the demuxer's existing `ds64` sentinel-promotion
+/// path already resolves this before the chunk body is read.
+///
+/// Surface shape mirrors `parse_axml_chunk` (its uncompressed sibling)
+/// with the two compression-header fields added:
+///
+/// * `wav:bxml.body_len` — raw on-wire chunk-body length (includes the
+///   2-byte `fmtType` header). Always emitted when the chunk is present
+///   so a NUL-reserved placeholder block is observable, mirroring the
+///   `<axml>` contract. Excludes the 8-byte chunk header and the RIFF
+///   §2 word-align pad byte.
+/// * `wav:bxml.fmt_type` — the raw 16-bit `fmtType` value as `0x%04X`.
+///   Always emitted when the 2-byte header is present.
+/// * `wav:bxml.compression` — a human-readable label for the documented
+///   `fmtType` codes (`none` for `0x0000`, `gzip` for `0x0001`);
+///   omitted for any other (private / future) compression code so the
+///   raw `fmt_type` is the unambiguous source of truth.
+/// * `wav:bxml` — the UTF-8 XML text payload, surfaced **only** when
+///   `fmtType == 0x0000` (uncompressed). Trimmed at the first NUL byte
+///   and stripped of surrounding whitespace, exactly like `<axml>`.
+///   For compressed payloads the bytes are not decompressed here (no
+///   schema interpretation at the container layer — a higher-level
+///   ADM-aware consumer applies RFC 1952 inflation if needed), so only
+///   `body_len` / `fmt_type` / `compression` are surfaced.
+///
+/// Bodies shorter than the 2-byte `fmtType` header are skipped as
+/// opaque: only `wav:bxml.body_len` is emitted so the malformed/empty
+/// placeholder remains observable.
+fn parse_bxml_chunk(buf: &[u8], out: &mut Vec<(String, String)>) {
+    out.push(("wav:bxml.body_len".to_string(), buf.len().to_string()));
+    if buf.len() < 2 {
+        return;
+    }
+    let fmt_type = u16::from_le_bytes([buf[0], buf[1]]);
+    out.push(("wav:bxml.fmt_type".to_string(), format!("0x{fmt_type:04X}")));
+    match fmt_type {
+        0x0000 => out.push(("wav:bxml.compression".to_string(), "none".to_string())),
+        0x0001 => out.push(("wav:bxml.compression".to_string(), "gzip".to_string())),
+        _ => {}
+    }
+    // The textual XML is only directly readable for the uncompressed
+    // form; compressed payloads are surfaced via the header fields only.
+    if fmt_type == 0x0000 {
+        let payload = &buf[2..];
+        let end = payload
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(payload.len());
+        let text = String::from_utf8_lossy(&payload[..end]).trim().to_string();
+        if !text.is_empty() {
+            out.push(("wav:bxml".to_string(), text));
+        }
     }
 }
 
@@ -5708,6 +5796,167 @@ mod tests {
         );
         assert_eq!(md.get("wav:axml.body_len"), Some(&"25".to_string()));
         assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
+    }
+
+    /// Build a minimal valid PCM WAV with a caller-supplied raw `<bxml>`
+    /// chunk inserted between `fmt ` and `data`. The body is the on-wire
+    /// `bxml` payload (2-byte `fmtType` header + XML data), per ITU-R
+    /// BS.2088-2 §6 (`docs/container/riff/metadata/R-REC-BS.2088.pdf`).
+    fn wav_with_bxml(bxml_body: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"RIFF");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(b"WAVE");
+        // fmt : 16-byte PCM s16 mono 8000 Hz.
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&16u32.to_le_bytes());
+        buf.extend_from_slice(&FMT_PCM.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&8_000u32.to_le_bytes());
+        buf.extend_from_slice(&16_000u32.to_le_bytes());
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(&16u16.to_le_bytes());
+        // bxml chunk.
+        buf.extend_from_slice(b"bxml");
+        buf.extend_from_slice(&(bxml_body.len() as u32).to_le_bytes());
+        buf.extend_from_slice(bxml_body);
+        if bxml_body.len() % 2 == 1 {
+            buf.push(0);
+        }
+        // empty data chunk
+        buf.extend_from_slice(b"data");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf
+    }
+
+    /// Helper: build a `<bxml>` on-wire body = LE `fmtType` WORD followed
+    /// by the raw `payload` bytes (the XML data, compressed or not).
+    fn bxml_body(fmt_type: u16, payload: &[u8]) -> Vec<u8> {
+        let mut b = fmt_type.to_le_bytes().to_vec();
+        b.extend_from_slice(payload);
+        b
+    }
+
+    /// An uncompressed (`fmtType == 0x0000`) `<bxml>` chunk surfaces its
+    /// XML text under `wav:bxml`, the `none` compression label, the raw
+    /// `0x0000` `fmt_type`, and a `body_len` that includes the 2-byte
+    /// header — per ITU-R BS.2088-2 §6.2.
+    #[test]
+    fn bxml_uncompressed_surfaces_xml_text() {
+        let xml = r#"<ebuCoreMain xmlns="urn:ebu:metadata-schema:ebucore">
+  <coreMetadata>
+    <format>
+      <audioFormatExtended>
+        <audioProgramme audioProgrammeID="APR_1001"/>
+      </audioFormatExtended>
+    </format>
+  </coreMetadata>
+</ebuCoreMain>"#;
+        let body = bxml_body(0x0000, xml.as_bytes());
+        let bytes = wav_with_bxml(&body);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:bxml.body_len"), Some(&body.len().to_string()));
+        assert_eq!(md.get("wav:bxml.fmt_type"), Some(&"0x0000".to_string()));
+        assert_eq!(md.get("wav:bxml.compression"), Some(&"none".to_string()));
+        assert_eq!(md.get("wav:bxml").map(|s| s.as_str()), Some(xml.trim()));
+        // chunk-walk still resolves fmt + data after the bxml hop.
+        assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
+    }
+
+    /// A gzip-flagged (`fmtType == 0x0001`) `<bxml>` chunk surfaces the
+    /// `gzip` compression label and raw `fmt_type` but does NOT attempt
+    /// to expose `wav:bxml` text — the container layer leaves RFC 1952
+    /// inflation to a higher-level ADM-aware consumer (§6.2). The
+    /// payload bytes here are an opaque (non-XML) gzip stub: the parser
+    /// must not choke on them.
+    #[test]
+    fn bxml_gzip_surfaces_header_but_not_text() {
+        // gzip magic 1f 8b + deflate method 08 + flags/mtime stub.
+        let body = bxml_body(0x0001, &[0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        let bytes = wav_with_bxml(&body);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:bxml.body_len"), Some(&body.len().to_string()));
+        assert_eq!(md.get("wav:bxml.fmt_type"), Some(&"0x0001".to_string()));
+        assert_eq!(md.get("wav:bxml.compression"), Some(&"gzip".to_string()));
+        assert!(
+            !md.contains_key("wav:bxml"),
+            "compressed payload must not surface as text"
+        );
+        assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
+    }
+
+    /// A `<bxml>` chunk with an undocumented (private/future) `fmtType`
+    /// surfaces the raw `fmt_type` but omits the `compression` label
+    /// (the raw value is the unambiguous source of truth) and surfaces
+    /// no text.
+    #[test]
+    fn bxml_unknown_fmt_type_omits_compression_label() {
+        let body = bxml_body(0x00FF, b"\x01\x02\x03\x04");
+        let bytes = wav_with_bxml(&body);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:bxml.fmt_type"), Some(&"0x00FF".to_string()));
+        assert!(!md.contains_key("wav:bxml.compression"));
+        assert!(!md.contains_key("wav:bxml"));
+    }
+
+    /// A NUL-padded uncompressed `<bxml>` body (a writer reserving a
+    /// fixed-size block for later in-place ADM editing) surfaces only the
+    /// pre-NUL text; `body_len` still reflects the full on-wire span so
+    /// the reserved region is observable. Mirrors the `<axml>` contract.
+    #[test]
+    fn bxml_uncompressed_trailing_nuls_trimmed_body_len_kept() {
+        let mut payload = b"<root><id>X</id></root>".to_vec();
+        payload.resize(payload.len() + 64, 0);
+        let body = bxml_body(0x0000, &payload);
+        let bytes = wav_with_bxml(&body);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(
+            md.get("wav:bxml"),
+            Some(&"<root><id>X</id></root>".to_string())
+        );
+        assert_eq!(md.get("wav:bxml.body_len"), Some(&body.len().to_string()));
+    }
+
+    /// A `<bxml>` chunk whose body is shorter than the 2-byte `fmtType`
+    /// header is skipped-as-opaque: only `wav:bxml.body_len` surfaces,
+    /// and the chunk-walk still finds the following `data` chunk.
+    #[test]
+    fn bxml_truncated_header_skipped_as_opaque() {
+        // 1-byte body (odd → exercises the pad-byte path too).
+        let body = vec![0x00u8];
+        let bytes = wav_with_bxml(&body);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:bxml.body_len"), Some(&"1".to_string()));
+        assert!(!md.contains_key("wav:bxml.fmt_type"));
+        assert!(!md.contains_key("wav:bxml.compression"));
+        assert!(!md.contains_key("wav:bxml"));
+        assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
+    }
+
+    /// An uncompressed `<bxml>` whose XML payload is empty (header only)
+    /// surfaces `body_len = 2`, the `fmt_type` / `compression` header
+    /// keys, but no `wav:bxml` text key.
+    #[test]
+    fn bxml_uncompressed_empty_payload_omits_text() {
+        let body = bxml_body(0x0000, &[]);
+        let bytes = wav_with_bxml(&body);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:bxml.body_len"), Some(&"2".to_string()));
+        assert_eq!(md.get("wav:bxml.fmt_type"), Some(&"0x0000".to_string()));
+        assert_eq!(md.get("wav:bxml.compression"), Some(&"none".to_string()));
+        assert!(!md.contains_key("wav:bxml"));
     }
 
     /// Build a minimal valid PCM WAV with a caller-supplied raw `_PMX`

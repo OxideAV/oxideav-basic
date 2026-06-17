@@ -129,7 +129,21 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework �
   `wav:axml` (text payload trimmed at the first NUL + surrounding
   whitespace, schema-agnostic) and `wav:axml.body_len` (always
   emitted when the chunk is present, so a NUL-padded ADM reservation
-  block reserved for in-place editing is observable). The `_PMX`
+  block reserved for in-place editing is observable). The `<bxml>`
+  chunk (ITU-R BS.2088-2 §6) is the compressed-XML counterpart of
+  `<axml>`: a 2-byte LE `fmtType` header (`0x0000` = uncompressed,
+  `0x0001` = gzip per RFC 1952) precedes the (optionally compressed)
+  XML payload. It surfaces `wav:bxml.fmt_type` (raw `0x%04X`),
+  `wav:bxml.compression` (`none` / `gzip` label, omitted for
+  private/future codes so the raw `fmt_type` stays authoritative),
+  `wav:bxml.body_len` (full on-wire span including the 2-byte header,
+  so a NUL-reserved in-place-edit block is observable), and — only for
+  the uncompressed form — the `wav:bxml` text payload (trimmed at the
+  first NUL + surrounding whitespace, exactly like `<axml>`).
+  Compressed payloads are not inflated at the container layer (RFC 1952
+  decode is left to a higher-level ADM-aware consumer); bodies shorter
+  than the 2-byte `fmtType` header are skipped-as-opaque (only
+  `body_len`). The `_PMX`
   chunk (Adobe XMP packet, the WAV/AVI carrier for an XMP serialised
   packet — FOURCC is little-endian "XMP_" reversed; catalogued in
   exiftool-riff-tags.html § "RIFF Main tags" entry `'_PMX'`, scope
