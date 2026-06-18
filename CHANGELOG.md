@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- BWF bext (Broadcast Audio Extension) chunk read+write with typed BextChunk surface (EBU Tech 3285 v2 §2.3) — WavMuxOptions::with_bext writer, WavDemuxer::bext() accessor, byte-exact parse/to_bytes round-trip
 - parse BW64/ADM bxml (compressed XML) chunk per ITU-R BS.2088-2 §6 — fmtType header + uncompressed-XML text surface
 - BW64/ADM chna (channel-allocation) chunk read+write with typed ChnaChunk/AudioId surface (ITU-R BS.2088-2 §8.1)
 - recognise extended LIST INFO sub-IDs (ExifTool RIFF Info Tags) — IAS1..IAS9 audio-language slots, Windows-Media "more info" set, production-credit tags

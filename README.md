@@ -68,13 +68,23 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework �
   synthesise a `wav:guid_<canonical-text>` id.
   `WavMuxOptions::with_extensible(mask)`
   opts the muxer into writing a 40-byte EXTENSIBLE `fmt ` chunk. The
-  `bext` Broadcast Audio Extension chunk (EBU Tech 3285) is parsed and
-  surfaced through `wav:bext.*` metadata keys — description, originator,
+  `bext` Broadcast Audio Extension chunk (EBU Tech 3285 v2 §2.3) is
+  supported on BOTH the read and write sides through the typed
+  `wav::BextChunk` struct (602-byte fixed body + optional variable-length
+  `CodingHistory` tail). The demuxer
+  surfaces `wav:bext.*` metadata keys — description, originator,
   origination date/time, 64-bit `TimeReference`, BWF version, SMPTE-330M
   UMID (v1+) and the v2 loudness fields (`LoudnessValue`,
   `LoudnessRange`, `MaxTruePeakLevel`, `MaxMomentaryLoudness`,
   `MaxShortTermLoudness`, each ×100 fixed-point rendered to two
-  decimals) plus `CodingHistory`. The `fact` chunk (RIFF MCI §3
+  decimals) plus `CodingHistory` — and the typed view is reachable via
+  `WavDemuxer::bext()` (raw loudness WORDs + fixed-width UMID exposed for
+  lossless round-trip); the muxer writes the chunk via
+  `WavMuxOptions::with_bext` (fixed-width string slots NUL-padded per
+  §2.3, an odd-length `CodingHistory` triggers the RIFF word-alignment
+  pad byte). Bodies shorter than the 602-byte fixed struct are
+  skipped-as-opaque; the `parse`/`to_bytes` pair and the mux→demux
+  round-trip are pinned byte-for-byte in tests. The `fact` chunk (RIFF MCI §3
   "FACT Chunk") is parsed — `dwFileSize` (per-channel sample count)
   surfaces as `wav:fact.sample_count` and becomes the authoritative
   `StreamInfo::duration` (matters for compressed streams where

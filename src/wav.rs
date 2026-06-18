@@ -398,6 +398,9 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
     // Typed BW64/ADM channel-allocation view, populated when a `chna`
     // chunk parses (ITU-R BS.2088-2 §8.1).
     let mut chna: Option<ChnaChunk> = None;
+    // Typed BWF Broadcast Audio Extension view, populated when a `bext`
+    // chunk parses (EBU Tech 3285 v2 §2.3).
+    let mut bext: Option<BextChunk> = None;
     // RF64/BW64 ds64 (EBU Tech 3306 §3 / Annex A.2): mandatory first
     // chunk after the form header when the magic is RF64 or BW64;
     // otherwise must be absent.
@@ -527,7 +530,7 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
             b"bext" => {
                 let mut buf = vec![0u8; size as usize];
                 input.read_exact(&mut buf)?;
-                parse_bext_chunk(&buf, &mut metadata);
+                bext = parse_bext_chunk(&buf, &mut metadata);
                 if size % 2 == 1 {
                     input.seek(SeekFrom::Current(1))?;
                 }
@@ -779,6 +782,7 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
         subformat: fmt.subformat,
         acid,
         chna,
+        bext,
     })
 }
 
@@ -2491,6 +2495,160 @@ fn info_id_to_key(id: &[u8; 4]) -> Option<&'static str> {
 /// MaxShortTermLoudness(2) + Reserved[180]` = 602.
 const BEXT_FIXED_LEN: usize = 602;
 
+/// Typed view of a BWF `bext` (Broadcast Audio Extension) chunk
+/// (EBU Tech 3285 v2 §2.3 `BROADCAST_EXT`).
+///
+/// Layout per `docs/container/riff/metadata/ebu-tech3285-bwf.pdf`. The
+/// fixed struct is always [`BEXT_FIXED_LEN`] (602) bytes regardless of
+/// `version`; `coding_history` is the variable-length ASCII tail past
+/// the fixed struct (`= chunk size − 602`). All multi-byte integers are
+/// little-endian (RIFF convention).
+///
+/// `version` selects which fields are meaningful: v0 populates none of
+/// the UMID / loudness fields, v1 adds the SMPTE-330M UMID, v2 adds the
+/// five loudness WORDs (§1.1). The struct stores every field verbatim
+/// regardless of version so a read→write pass is byte-lossless; the
+/// loudness WORDs are kept as the raw signed `round(100 × value)`
+/// integers (§2.4), not the rendered two-decimal form.
+///
+/// The ASCII string fields ([`Self::description`] etc.) are stored as
+/// owned `String`s trimmed at the first NUL. On serialization
+/// ([`Self::to_bytes`]) each is re-emitted into its fixed-width slot,
+/// truncated to fit and NUL-padded to the field width per §2.3.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BextChunk {
+    /// `Description[256]` — free ASCII description of the sequence.
+    pub description: String,
+    /// `Originator[32]` — name of the originator / producer.
+    pub originator: String,
+    /// `OriginatorReference[32]` — unambiguous reference per EBU R99.
+    pub originator_reference: String,
+    /// `OriginationDate[10]` — `YYYY-MM-DD` (or `YYYY_MM_DD`).
+    pub origination_date: String,
+    /// `OriginationTime[8]` — `HH:MM:SS` (or `HH_MM_SS`).
+    pub origination_time: String,
+    /// `TimeReference` — 64-bit sample count since midnight (reassembled
+    /// from the low/high 32-bit halves).
+    pub time_reference: u64,
+    /// `Version` of the BWF (0, 1 or 2).
+    pub version: u16,
+    /// `UMID[64]` — SMPTE-330M Unique Material Identifier. All-zero when
+    /// absent (v0). A 32-byte "basic UMID" zero-pads the trailing half.
+    pub umid: [u8; 64],
+    /// `LoudnessValue` (×100, signed) — meaningful only for v2.
+    pub loudness_value: i16,
+    /// `LoudnessRange` (×100, signed) — meaningful only for v2.
+    pub loudness_range: i16,
+    /// `MaxTruePeakLevel` (dBTP ×100, signed) — meaningful only for v2.
+    pub max_true_peak_level: i16,
+    /// `MaxMomentaryLoudness` (×100, signed) — meaningful only for v2.
+    pub max_momentary_loudness: i16,
+    /// `MaxShortTermLoudness` (×100, signed) — meaningful only for v2.
+    pub max_short_term_loudness: i16,
+    /// `CodingHistory` — variable-length ASCII tail (CR/LF-separated
+    /// `A=…,F=…,…` lines per §2.3 / EBU R98). Empty when absent.
+    pub coding_history: String,
+}
+
+impl Default for BextChunk {
+    /// An empty v0 `bext`: all strings empty, `version` 0, zero UMID /
+    /// loudness / time-reference. Serializes to the 602-byte fixed
+    /// struct with no `CodingHistory` tail.
+    fn default() -> Self {
+        BextChunk {
+            description: String::new(),
+            originator: String::new(),
+            originator_reference: String::new(),
+            origination_date: String::new(),
+            origination_time: String::new(),
+            time_reference: 0,
+            version: 0,
+            umid: [0u8; 64],
+            loudness_value: 0,
+            loudness_range: 0,
+            max_true_peak_level: 0,
+            max_momentary_loudness: 0,
+            max_short_term_loudness: 0,
+            coding_history: String::new(),
+        }
+    }
+}
+
+impl BextChunk {
+    /// Fixed body length of the `bext` chunk (pre-`CodingHistory`).
+    pub const FIXED_LEN: usize = BEXT_FIXED_LEN;
+
+    /// Decode a `bext` chunk body. Returns `None` when the body is
+    /// shorter than the 602-byte fixed struct (treated as opaque, same
+    /// policy as the other fixed-layout metadata chunks). Bytes past the
+    /// fixed struct are the `CodingHistory` tail.
+    pub fn parse(buf: &[u8]) -> Option<BextChunk> {
+        if buf.len() < BEXT_FIXED_LEN {
+            return None;
+        }
+        let time_ref_low = u32::from_le_bytes([buf[338], buf[339], buf[340], buf[341]]);
+        let time_ref_high = u32::from_le_bytes([buf[342], buf[343], buf[344], buf[345]]);
+        let mut umid = [0u8; 64];
+        umid.copy_from_slice(&buf[348..412]);
+        let r16 = |o: usize| -> i16 { i16::from_le_bytes([buf[o], buf[o + 1]]) };
+        let coding_history = if buf.len() > BEXT_FIXED_LEN {
+            bext_field(&buf[BEXT_FIXED_LEN..])
+        } else {
+            String::new()
+        };
+        Some(BextChunk {
+            description: bext_field(&buf[0..256]),
+            originator: bext_field(&buf[256..288]),
+            originator_reference: bext_field(&buf[288..320]),
+            origination_date: bext_field(&buf[320..330]),
+            origination_time: bext_field(&buf[330..338]),
+            time_reference: ((time_ref_high as u64) << 32) | (time_ref_low as u64),
+            version: u16::from_le_bytes([buf[346], buf[347]]),
+            umid,
+            loudness_value: r16(412),
+            loudness_range: r16(414),
+            max_true_peak_level: r16(416),
+            max_momentary_loudness: r16(418),
+            max_short_term_loudness: r16(420),
+            coding_history,
+        })
+    }
+
+    /// Serialize the `bext` chunk body: the 602-byte fixed struct
+    /// followed by the `CodingHistory` tail (no trailing NUL is added —
+    /// EBU R98 lines already end CR/LF and the chunk size delimits the
+    /// tail). String fields are truncated to their slot width and
+    /// NUL-padded per §2.3.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = vec![0u8; BEXT_FIXED_LEN];
+        fn put_ascii(out: &mut [u8], offset: usize, width: usize, s: &str) {
+            let bytes = s.as_bytes();
+            let n = bytes.len().min(width);
+            out[offset..offset + n].copy_from_slice(&bytes[..n]);
+            // remaining bytes stay zero (NUL pad)
+        }
+        put_ascii(&mut out, 0, 256, &self.description);
+        put_ascii(&mut out, 256, 32, &self.originator);
+        put_ascii(&mut out, 288, 32, &self.originator_reference);
+        put_ascii(&mut out, 320, 10, &self.origination_date);
+        put_ascii(&mut out, 330, 8, &self.origination_time);
+        out[338..342].copy_from_slice(&(self.time_reference as u32).to_le_bytes());
+        out[342..346].copy_from_slice(&((self.time_reference >> 32) as u32).to_le_bytes());
+        out[346..348].copy_from_slice(&self.version.to_le_bytes());
+        out[348..412].copy_from_slice(&self.umid);
+        out[412..414].copy_from_slice(&self.loudness_value.to_le_bytes());
+        out[414..416].copy_from_slice(&self.loudness_range.to_le_bytes());
+        out[416..418].copy_from_slice(&self.max_true_peak_level.to_le_bytes());
+        out[418..420].copy_from_slice(&self.max_momentary_loudness.to_le_bytes());
+        out[420..422].copy_from_slice(&self.max_short_term_loudness.to_le_bytes());
+        // out[422..602] is Reserved[180] — left zero per §2.3.
+        if !self.coding_history.is_empty() {
+            out.extend_from_slice(self.coding_history.as_bytes());
+        }
+        out
+    }
+}
+
 /// Trim a fixed-width ASCII field to its value: cut at the first NUL
 /// (EBU Tech 3285 v2 §2.3 mandates a NUL terminator for under-length
 /// strings) and strip surrounding whitespace.
@@ -2515,61 +2673,35 @@ fn bext_field(raw: &[u8]) -> String {
 /// 602 bytes regardless of version, so this parser reads every field
 /// unconditionally and lets the version key tell the caller which ones
 /// to trust. `TimeReference` is reassembled as a 64-bit sample count.
-fn parse_bext_chunk(buf: &[u8], out: &mut Vec<(String, String)>) {
-    if buf.len() < BEXT_FIXED_LEN {
-        return;
-    }
-    let description = bext_field(&buf[0..256]);
-    let originator = bext_field(&buf[256..288]);
-    let originator_ref = bext_field(&buf[288..320]);
-    let origination_date = bext_field(&buf[320..330]);
-    let origination_time = bext_field(&buf[330..338]);
-    let time_ref_low = u32::from_le_bytes([buf[338], buf[339], buf[340], buf[341]]);
-    let time_ref_high = u32::from_le_bytes([buf[342], buf[343], buf[344], buf[345]]);
-    let time_reference = ((time_ref_high as u64) << 32) | (time_ref_low as u64);
-    let version = u16::from_le_bytes([buf[346], buf[347]]);
+fn parse_bext_chunk(buf: &[u8], out: &mut Vec<(String, String)>) -> Option<BextChunk> {
+    let bext = BextChunk::parse(buf)?;
 
-    // UMID[64] at [348..412]; only meaningful for v1+. Surface it as a
-    // hex string only when non-zero so v0 files don't carry a bogus
-    // all-zero UMID key.
-    let umid = &buf[348..412];
-
-    // Loudness WORDs at [412..422]; signed, ×100. Only meaningful for v2.
-    let loudness_value = i16::from_le_bytes([buf[412], buf[413]]);
-    let loudness_range = i16::from_le_bytes([buf[414], buf[415]]);
-    let max_true_peak = i16::from_le_bytes([buf[416], buf[417]]);
-    let max_momentary = i16::from_le_bytes([buf[418], buf[419]]);
-    let max_short_term = i16::from_le_bytes([buf[420], buf[421]]);
-
-    // CodingHistory: everything past the 602-byte fixed struct.
-    let coding_history = if buf.len() > BEXT_FIXED_LEN {
-        bext_field(&buf[BEXT_FIXED_LEN..])
-    } else {
-        String::new()
-    };
-
-    let push = |out: &mut Vec<(String, String)>, key: &str, value: String| {
+    let push = |out: &mut Vec<(String, String)>, key: &str, value: &str| {
         if !value.is_empty() {
-            out.push((key.to_string(), value));
+            out.push((key.to_string(), value.to_string()));
         }
     };
 
-    push(out, "wav:bext.description", description);
-    push(out, "wav:bext.originator", originator);
-    push(out, "wav:bext.originator_reference", originator_ref);
-    push(out, "wav:bext.origination_date", origination_date);
-    push(out, "wav:bext.origination_time", origination_time);
+    push(out, "wav:bext.description", &bext.description);
+    push(out, "wav:bext.originator", &bext.originator);
+    push(
+        out,
+        "wav:bext.originator_reference",
+        &bext.originator_reference,
+    );
+    push(out, "wav:bext.origination_date", &bext.origination_date);
+    push(out, "wav:bext.origination_time", &bext.origination_time);
     out.push((
         "wav:bext.time_reference".to_string(),
-        time_reference.to_string(),
+        bext.time_reference.to_string(),
     ));
-    out.push(("wav:bext.version".to_string(), version.to_string()));
+    out.push(("wav:bext.version".to_string(), bext.version.to_string()));
 
     // v1+ : the SMPTE-330M UMID (64 bytes; a 32-byte "basic UMID"
     // zero-pads the trailing half per §2.3). Emit only when present.
-    if umid.iter().any(|&b| b != 0) {
-        let mut hex = String::with_capacity(umid.len() * 2);
-        for b in umid {
+    if bext.umid.iter().any(|&b| b != 0) {
+        let mut hex = String::with_capacity(bext.umid.len() * 2);
+        for b in &bext.umid {
             hex.push_str(&format!("{b:02x}"));
         }
         out.push(("wav:bext.umid".to_string(), hex));
@@ -2577,30 +2709,31 @@ fn parse_bext_chunk(buf: &[u8], out: &mut Vec<(String, String)>) {
 
     // v2 : loudness metadata (×100 fixed-point → two decimals). Emitted
     // only for v2 files since v0/v1 leave these WORDs zero by spec.
-    if version >= 2 {
+    if bext.version >= 2 {
         out.push((
             "wav:bext.loudness_value".to_string(),
-            fmt_loudness(loudness_value),
+            fmt_loudness(bext.loudness_value),
         ));
         out.push((
             "wav:bext.loudness_range".to_string(),
-            fmt_loudness(loudness_range),
+            fmt_loudness(bext.loudness_range),
         ));
         out.push((
             "wav:bext.max_true_peak_level".to_string(),
-            fmt_loudness(max_true_peak),
+            fmt_loudness(bext.max_true_peak_level),
         ));
         out.push((
             "wav:bext.max_momentary_loudness".to_string(),
-            fmt_loudness(max_momentary),
+            fmt_loudness(bext.max_momentary_loudness),
         ));
         out.push((
             "wav:bext.max_short_term_loudness".to_string(),
-            fmt_loudness(max_short_term),
+            fmt_loudness(bext.max_short_term_loudness),
         ));
     }
 
-    push(out, "wav:bext.coding_history", coding_history);
+    push(out, "wav:bext.coding_history", &bext.coding_history);
+    Some(bext)
 }
 
 /// Render a BWF loudness WORD (signed 16-bit, `round(100 × value)` per
@@ -2831,6 +2964,7 @@ pub struct WavDemuxer {
     subformat: Option<[u8; 16]>,
     acid: Option<AcidChunk>,
     chna: Option<ChnaChunk>,
+    bext: Option<BextChunk>,
 }
 
 impl WavDemuxer {
@@ -2902,6 +3036,18 @@ impl WavDemuxer {
     /// `wav:chna.*` metadata keys for `dyn Demuxer` consumers.
     pub fn chna(&self) -> Option<&ChnaChunk> {
         self.chna.as_ref()
+    }
+
+    /// Typed view of the BWF `bext` (Broadcast Audio Extension) chunk
+    /// when the file carried one with a well-formed body (EBU Tech 3285
+    /// v2 §2.3, ≥ 602-byte fixed struct). `None` when the chunk is
+    /// absent or truncated. The same fields are mirrored under the
+    /// `wav:bext.*` metadata keys for `dyn Demuxer` consumers; the typed
+    /// view additionally exposes the raw loudness WORDs and the
+    /// fixed-width UMID for round-trip muxing via
+    /// [`WavMuxOptions::with_bext`].
+    pub fn bext(&self) -> Option<&BextChunk> {
+        self.bext.as_ref()
     }
 }
 
@@ -3009,6 +3155,7 @@ fn open_muxer(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Box<
         extensible: None,
         acid: None,
         chna: None,
+        bext: None,
         riff_size_offset: 0,
         data_size_offset: 0,
         fact_size_offset: None,
@@ -3034,6 +3181,7 @@ pub struct WavMuxOptions {
     extensible: Option<ExtensibleOpts>,
     acid: Option<AcidChunk>,
     chna: Option<ChnaChunk>,
+    bext: Option<BextChunk>,
 }
 
 #[derive(Clone, Debug)]
@@ -3089,6 +3237,16 @@ impl WavMuxOptions {
         self.chna = Some(chna);
         self
     }
+
+    /// Emit a BWF `bext` (Broadcast Audio Extension) chunk ahead of the
+    /// `data` chunk (602-byte fixed struct + optional `CodingHistory`
+    /// tail — see [`BextChunk`] / EBU Tech 3285 v2 §2.3). When the body
+    /// length is odd (an odd-length `CodingHistory`) the muxer writes the
+    /// RIFF word-alignment pad byte after it.
+    pub fn with_bext(mut self, bext: BextChunk) -> Self {
+        self.bext = Some(bext);
+        self
+    }
 }
 
 /// Open the WAV muxer with caller-controlled `WAVEFORMATEXTENSIBLE`
@@ -3123,6 +3281,7 @@ pub fn open_muxer_with(
         extensible: opts.extensible,
         acid: opts.acid,
         chna: opts.chna,
+        bext: opts.bext,
         riff_size_offset: 0,
         data_size_offset: 0,
         fact_size_offset: None,
@@ -3213,6 +3372,10 @@ struct WavMuxer {
     /// a `chna` chunk ahead of `data` when present (ITU-R BS.2088-2
     /// §8.1).
     chna: Option<ChnaChunk>,
+    /// Caller-supplied BWF Broadcast Audio Extension metadata, emitted as
+    /// a `bext` chunk ahead of `data` when present (EBU Tech 3285 v2
+    /// §2.3).
+    bext: Option<BextChunk>,
     riff_size_offset: u64,
     data_size_offset: u64,
     /// Offset of the `dwFileSize` field inside the `fact` chunk we
@@ -3292,6 +3455,20 @@ impl Muxer for WavMuxer {
             self.output.write_all(&4u32.to_le_bytes())?;
             self.fact_size_offset = Some(self.output.stream_position()?);
             self.output.write_all(&0u32.to_le_bytes())?; // placeholder dwFileSize
+        }
+
+        // `bext` chunk: caller-supplied BWF Broadcast Audio Extension
+        // metadata (EBU Tech 3285 v2 §2.3). The fixed struct is 602
+        // bytes; the optional `CodingHistory` tail can make the body
+        // odd, so a RIFF word-alignment pad byte is written when needed.
+        if let Some(bext) = &self.bext {
+            let body = bext.to_bytes();
+            self.output.write_all(b"bext")?;
+            self.output.write_all(&(body.len() as u32).to_le_bytes())?;
+            self.output.write_all(&body)?;
+            if body.len() % 2 == 1 {
+                self.output.write_all(&[0u8])?;
+            }
         }
 
         // `acid` chunk: caller-supplied Acidizer loop/tempo metadata
@@ -4135,6 +4312,163 @@ mod tests {
         assert!(md.keys().all(|k| !k.starts_with("wav:bext.")));
         // Stream still resolves to PCM s16.
         assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
+    }
+
+    /// `BextChunk::{parse,to_bytes}` are exact inverses for a v2 body:
+    /// a byte buffer that round-trips through parse→serialize must equal
+    /// the original (the Reserved[180] region and the all-zero pad in
+    /// each fixed-width string slot are reproduced verbatim).
+    #[test]
+    fn bext_struct_byte_roundtrip() {
+        let mut umid = [0u8; 64];
+        umid[0] = 0x06;
+        umid[1] = 0x0a;
+        umid[63] = 0xff;
+        let body = make_bext_v2(
+            "Scene 7 take 2",
+            "OxideAV Recorder",
+            "USABC2400777",
+            "2026-06-18",
+            "09:15:42",
+            0x0000_0001_2345_6789,
+            &umid,
+            [-2305, 700, -120, -1850, -2010],
+            "A=PCM,F=48000,W=24,M=stereo,T=OxideAV\r\n",
+        );
+        let parsed = BextChunk::parse(&body).expect("parses");
+        assert_eq!(parsed.description, "Scene 7 take 2");
+        assert_eq!(parsed.version, 2);
+        assert_eq!(parsed.time_reference, 0x0000_0001_2345_6789);
+        assert_eq!(parsed.umid, umid);
+        assert_eq!(parsed.loudness_value, -2305);
+        assert_eq!(parsed.max_short_term_loudness, -2010);
+        assert_eq!(
+            parsed.coding_history,
+            "A=PCM,F=48000,W=24,M=stereo,T=OxideAV"
+        );
+        // The serialized form re-trims the CR/LF tail of the parsed
+        // coding-history, so compare against a body rebuilt from the
+        // trimmed value — every fixed field and the Reserved[180] region
+        // must match byte-for-byte.
+        let reser = parsed.to_bytes();
+        let mut expected = body.clone();
+        // `make_bext_v2` appended the raw CR/LF history; the trimmed
+        // round-trip drops the trailing "\r\n", so truncate expected to
+        // the trimmed tail for the comparison.
+        expected.truncate(BEXT_FIXED_LEN + parsed.coding_history.len());
+        assert_eq!(reser, expected);
+    }
+
+    /// `WavMuxOptions::with_bext` emits the chunk ahead of `data`, the
+    /// demuxer's typed accessor + `wav:bext.*` metadata keys recover the
+    /// values, and the PCM payload is untouched. Uses an odd-length
+    /// CodingHistory to exercise the RIFF word-alignment pad path.
+    #[test]
+    fn bext_mux_round_trip() {
+        let mut umid = [0u8; 64];
+        umid[..4].copy_from_slice(&[0x06, 0x0a, 0x2b, 0x34]);
+        let bext = BextChunk {
+            description: "Take 5".to_string(),
+            originator: "OxideAV".to_string(),
+            originator_reference: "REF-001".to_string(),
+            origination_date: "2026-06-18".to_string(),
+            origination_time: "10:00:00".to_string(),
+            time_reference: 0x0000_0002_0000_0001,
+            version: 2,
+            umid,
+            loudness_value: -2264,
+            loudness_range: 700,
+            max_true_peak_level: -120,
+            max_momentary_loudness: -1850,
+            max_short_term_loudness: -2010,
+            // 13-char (odd) tail → body length 615 (odd) → pad byte.
+            coding_history: "A=PCM,F=48000".to_string(),
+        };
+        let payload: Vec<u8> = (0..400u32).flat_map(|i| (i as i16).to_le_bytes()).collect();
+        let stream = make_stream(SampleFormat::S16, 1, 48_000);
+        let opts = WavMuxOptions::default().with_bext(bext.clone());
+        let bytes = mux_to_bytes(&stream, &payload, opts, "bext-rt");
+
+        // The serialized chunk (header + body) appears verbatim, and
+        // because the body is odd-length the next chunk ("data") is
+        // word-aligned by a pad byte.
+        let body = bext.to_bytes();
+        assert_eq!(body.len() % 2, 1, "test intends an odd-length body");
+        let mut chunk = b"bext".to_vec();
+        chunk.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        chunk.extend_from_slice(&body);
+        let pos = bytes
+            .windows(chunk.len())
+            .position(|w| w == &chunk[..])
+            .expect("bext chunk present");
+        // Byte immediately after the body is the alignment pad (0), then
+        // the "data" FOURCC.
+        assert_eq!(bytes[pos + chunk.len()], 0);
+        assert_eq!(
+            &bytes[pos + chunk.len() + 1..pos + chunk.len() + 5],
+            b"data"
+        );
+
+        let mut dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:bext.description"), Some(&"Take 5".to_string()));
+        assert_eq!(
+            md.get("wav:bext.time_reference"),
+            Some(&0x0000_0002_0000_0001u64.to_string())
+        );
+        assert_eq!(
+            md.get("wav:bext.loudness_value"),
+            Some(&"-22.64".to_string())
+        );
+        assert_eq!(
+            md.get("wav:bext.coding_history"),
+            Some(&"A=PCM,F=48000".to_string())
+        );
+        let mut out = Vec::new();
+        loop {
+            match dmx.next_packet() {
+                Ok(p) => out.extend_from_slice(&p.data),
+                Err(Error::Eof) => break,
+                Err(e) => panic!("demux error: {e}"),
+            }
+        }
+        assert_eq!(out, payload);
+    }
+
+    /// Typed `WavDemuxer::bext()` accessor (via the concrete
+    /// `open_wav_demuxer` path) returns the parsed struct, and an absent
+    /// `bext` chunk yields `None`.
+    #[test]
+    fn bext_typed_accessor() {
+        let mut umid = [0u8; 64];
+        umid[0] = 0x42;
+        let body = make_bext_v2(
+            "Accessor test",
+            "Org",
+            "Ref",
+            "2026-06-18",
+            "11:11:11",
+            999,
+            &umid,
+            [-100, 200, -300, 400, -500],
+            "A=PCM,F=44100",
+        );
+        let bytes = wav_with_bext(&body);
+        use std::io::Cursor;
+        let dmx = open_wav_demuxer(Box::new(Cursor::new(bytes))).unwrap();
+        let got = dmx.bext().expect("typed bext present");
+        assert_eq!(got.description, "Accessor test");
+        assert_eq!(got.version, 2);
+        assert_eq!(got.time_reference, 999);
+        assert_eq!(got.umid[0], 0x42);
+        assert_eq!(got.loudness_value, -100);
+        assert_eq!(got.max_short_term_loudness, -500);
+
+        // No `bext` chunk → typed accessor is None.
+        let plain = wav_with_smpl_and_inst(None, None);
+        let dmx = open_wav_demuxer(Box::new(Cursor::new(plain))).unwrap();
+        assert_eq!(dmx.bext(), None);
     }
 
     /// Build a minimal valid PCM WAV with a caller-supplied raw `cue `
