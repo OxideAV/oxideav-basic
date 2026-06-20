@@ -8540,4 +8540,141 @@ mod tests {
         // The chunk right after WAVE is `fmt `, not a placeholder.
         assert_eq!(&plain[12..16], b"fmt ");
     }
+
+    /// A seekable sink that materialises only the bytes written below
+    /// `keep_below` (the header region) but still tracks a 64-bit
+    /// high-water mark for everything beyond it. This lets a test drive
+    /// the muxer through a genuine >4 GiB `data` payload — exercising the
+    /// real `Rf64Mode::Reserve` overflow→promotion branch — without
+    /// allocating gigabytes. Bytes written at or above `keep_below` are
+    /// discarded; the header bytes (and the trailer's seek-back patches)
+    /// are retained so the resulting prefix can be inspected.
+    struct SparseSink {
+        head: Vec<u8>,
+        keep_below: u64,
+        pos: u64,
+        len: u64,
+    }
+
+    impl SparseSink {
+        fn new(keep_below: u64) -> Self {
+            SparseSink {
+                head: Vec::new(),
+                keep_below,
+                pos: 0,
+                len: 0,
+            }
+        }
+    }
+
+    impl std::io::Write for SparseSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let end = self.pos + buf.len() as u64;
+            if self.pos < self.keep_below {
+                // The (possibly partial) portion that lands in the kept
+                // header region is materialised at its absolute offset.
+                let kept = (self.keep_below - self.pos).min(buf.len() as u64) as usize;
+                let start = self.pos as usize;
+                if self.head.len() < start + kept {
+                    self.head.resize(start + kept, 0);
+                }
+                self.head[start..start + kept].copy_from_slice(&buf[..kept]);
+            }
+            self.pos = end;
+            self.len = self.len.max(end);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl std::io::Seek for SparseSink {
+        fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
+            self.pos = match from {
+                SeekFrom::Start(n) => n,
+                SeekFrom::End(d) => (self.len as i64 + d) as u64,
+                SeekFrom::Current(d) => (self.pos as i64 + d) as u64,
+            };
+            Ok(self.pos)
+        }
+    }
+
+    /// `Rf64Mode::Reserve` promotes its `JUNK` placeholder to a real
+    /// `ds64` chunk and flips the magic to `RF64` once the finished
+    /// payload overflows a 32-bit size field — the BS.2088-2 §4.2
+    /// on-the-fly conversion. Driven through a sparse sink so the test
+    /// can stream a >4 GiB `data` chunk without allocating it. The sink
+    /// is shared by `Rc<RefCell<…>>` so the retained header bytes are
+    /// inspectable after the boxed muxer drops its handle.
+    #[test]
+    fn rf64_reserve_overflow_promotes_to_rf64() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let stream = make_stream(SampleFormat::S16, 1, 48_000);
+        let opts = WavMuxOptions::default().with_rf64(Rf64Mode::Reserve);
+
+        // Keep the first 64 KiB (the header + placeholder live there).
+        let sink = Rc::new(RefCell::new(SparseSink::new(64 * 1024)));
+        // 4 GiB + a little, streamed in 256 MiB zero-PCM chunks.
+        let chunk = vec![0u8; 256 * 1024 * 1024];
+        let total: u64 = 4 * 1024 * 1024 * 1024 + 8 * 1024 * 1024;
+        {
+            let ws: Box<dyn WriteSeek> = Box::new(SharedSink(Rc::clone(&sink)));
+            let mut mux = open_muxer_with(ws, std::slice::from_ref(&stream), opts).unwrap();
+            mux.write_header().unwrap();
+            let mut written: u64 = 0;
+            while written < total {
+                let n = chunk.len().min((total - written) as usize);
+                mux.write_packet(&Packet::new(0, stream.time_base, chunk[..n].to_vec()))
+                    .unwrap();
+                written += n as u64;
+            }
+            mux.write_trailer().unwrap();
+        }
+
+        let head = sink.borrow().head.clone();
+        // Magic promoted to RF64; legacy RIFF size = sentinel.
+        assert_eq!(&head[0..4], b"RF64");
+        assert_eq!(
+            u32::from_le_bytes([head[4], head[5], head[6], head[7]]),
+            SIZE64_SENTINEL
+        );
+        // The JUNK placeholder was promoted to a ds64 chunk in place.
+        assert_eq!(&head[12..16], b"ds64");
+        // `data` 32-bit size field also carries the sentinel.
+        let body = &head[20..20 + DS64_FIXED_BODY_LEN as usize];
+        let riff_size = u64::from_le_bytes(body[0..8].try_into().unwrap());
+        let data_size = u64::from_le_bytes(body[8..16].try_into().unwrap());
+        let sample_count = u64::from_le_bytes(body[16..24].try_into().unwrap());
+        assert_eq!(data_size, total);
+        // S16 mono → 1 frame == 2 bytes; per-channel sample count.
+        assert_eq!(sample_count, total / 2);
+        // riffSize = everything after the 8-byte RIFF+size header:
+        // WAVE(4) + ds64(8+28) + fmt (8+16) + data header(8) + payload.
+        let overhead = 4 + (8 + DS64_FIXED_BODY_LEN as u64) + (8 + 16) + 8;
+        assert_eq!(riff_size, total + overhead);
+    }
+
+    /// A seekable sink shared via `Rc<RefCell<…>>` so a test can read the
+    /// retained header bytes after the boxed muxer drops its handle.
+    /// Single-threaded (one test), so the `Send` bound on `WriteSeek` is
+    /// satisfied by the wrapper's manual `unsafe impl Send`.
+    struct SharedSink(std::rc::Rc<std::cell::RefCell<SparseSink>>);
+    // Used only single-threaded inside one test.
+    unsafe impl Send for SharedSink {}
+    impl std::io::Write for SharedSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.0.borrow_mut().flush()
+        }
+    }
+    impl std::io::Seek for SharedSink {
+        fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
+            self.0.borrow_mut().seek(from)
+        }
+    }
 }
