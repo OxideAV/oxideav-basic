@@ -1611,6 +1611,125 @@ pub struct AudioId {
     pub pad: u8,
 }
 
+/// Which ADM identifier an `audioID` reference field names, derived from
+/// the fixed ASCII prefix the BS.2088-2 §8.2 ID formats use:
+///
+/// - `ATU_xxxxxxxx`    → [`AdmRefKind::TrackUid`]      (`audioTrackUID`)
+/// - `AT_xxxxxxxx_xx`  → [`AdmRefKind::TrackFormat`]   (`audioTrackFormatID`)
+/// - `AC_xxxxxxxx_xx`  → [`AdmRefKind::ChannelFormat`] (`audioChannelFormat`,
+///   used in `trackRef` for linear-PCM essence — §1.2)
+/// - `AP_xxxxxxxx`     → [`AdmRefKind::PackFormat`]    (`audioPackFormatID`)
+///
+/// `Unknown` is returned for any field that doesn't start with one of the
+/// four documented prefixes (e.g. an all-NUL spare field, or a malformed
+/// writer's output).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdmRefKind {
+    /// `ATU_` — an `audioTrackUID`.
+    TrackUid,
+    /// `AT_` — an `audioTrackFormatID`.
+    TrackFormat,
+    /// `AC_` — an `audioChannelFormat` reference (linear-PCM essence path).
+    ChannelFormat,
+    /// `AP_` — an `audioPackFormatID`.
+    PackFormat,
+    /// None of the four documented prefixes matched.
+    Unknown,
+}
+
+impl AdmRefKind {
+    /// Classify a fixed-width `audioID` reference field by its leading
+    /// ASCII prefix. Order matters: `ATU_` must be tested before `AT_`
+    /// since the latter is a strict prefix of the former.
+    fn classify(field: &[u8]) -> AdmRefKind {
+        if field.starts_with(b"ATU_") {
+            AdmRefKind::TrackUid
+        } else if field.starts_with(b"AT_") {
+            AdmRefKind::TrackFormat
+        } else if field.starts_with(b"AC_") {
+            AdmRefKind::ChannelFormat
+        } else if field.starts_with(b"AP_") {
+            AdmRefKind::PackFormat
+        } else {
+            AdmRefKind::Unknown
+        }
+    }
+
+    /// Short lowercase tag used in surfaced metadata values.
+    fn as_str(self) -> &'static str {
+        match self {
+            AdmRefKind::TrackUid => "audioTrackUID",
+            AdmRefKind::TrackFormat => "audioTrackFormatID",
+            AdmRefKind::ChannelFormat => "audioChannelFormat",
+            AdmRefKind::PackFormat => "audioPackFormatID",
+            AdmRefKind::Unknown => "unknown",
+        }
+    }
+}
+
+/// Whether an ADM ID resolves to a **common** definition (built into
+/// ITU-R BS.2094 and not required in the file's XML) or a **custom**
+/// definition (carried in the file's `<axml>`/`<bxml>`/`<sxml>` chunk),
+/// per BS.2088-2 §8.1 (`bs2088-chna-chunk-layout.md` §3).
+///
+/// The discriminator is the **last four hex digits** of the ID value:
+/// `≤ 0x0FFF` → common, `≥ 0x1000` → custom.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DefinitionScope {
+    /// Trailing four hex digits `≤ 0x0FFF` — a BS.2094 common definition.
+    Common,
+    /// Trailing four hex digits `≥ 0x1000` — a file-local custom
+    /// definition (lives in the XML carrier chunk).
+    Custom,
+}
+
+impl DefinitionScope {
+    /// Lowercase tag used in surfaced metadata values.
+    fn as_str(self) -> &'static str {
+        match self {
+            DefinitionScope::Common => "common",
+            DefinitionScope::Custom => "custom",
+        }
+    }
+}
+
+/// Extract the **last four hex digits** of an ADM reference's value, as a
+/// `u16`, for the §3 common/custom classification.
+///
+/// The ID formats all encode an 8-hex-digit value after the prefix
+/// (`AT_`**`xxxxxxxx`**`_xx`, `AP_`**`xxxxxxxx`**, …). The classification
+/// (`bs2088-chna-chunk-layout.md` §3) keys only on the trailing four hex
+/// digits of that 8-digit value — i.e. the lower 16 bits. We locate the
+/// 8-hex-digit run that follows the first `_` separator and parse its
+/// last four characters. Returns `None` when the field has no parseable
+/// 8-hex value (all-NUL, malformed, or an unknown prefix).
+fn adm_id_value_low16(field: &[u8]) -> Option<u16> {
+    // Trim at the first NUL (fixed-width fields are NUL-padded).
+    let end = field.iter().position(|&b| b == 0).unwrap_or(field.len());
+    let s = &field[..end];
+    // Find the first `_`; the 8 hex digits begin immediately after it.
+    let us = s.iter().position(|&b| b == b'_')?;
+    let hex = s.get(us + 1..us + 1 + 8)?;
+    if !hex.iter().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    // The low 16 bits are the trailing four hex digits of the 8-digit run.
+    let last4 = &hex[4..8];
+    u16::from_str_radix(std::str::from_utf8(last4).ok()?, 16).ok()
+}
+
+/// Classify an ADM reference field's definition scope (§3): `Common` when
+/// the trailing four hex digits of its value are `≤ 0x0FFF`, `Custom`
+/// when `≥ 0x1000`. Returns `None` when no 8-hex value can be parsed.
+fn adm_definition_scope(field: &[u8]) -> Option<DefinitionScope> {
+    let low = adm_id_value_low16(field)?;
+    Some(if low <= 0x0FFF {
+        DefinitionScope::Common
+    } else {
+        DefinitionScope::Custom
+    })
+}
+
 impl AudioId {
     /// Fixed on-disk size of one `audioID` record in bytes (§1.2).
     pub const SIZE: usize = 40;
@@ -1619,6 +1738,34 @@ impl AudioId {
     /// (`track_index == 0`) — readers skip these (§1.3).
     pub fn is_unused(&self) -> bool {
         self.track_index == 0
+    }
+
+    /// Classify the `trackRef` field (§1.2): `AT_` =
+    /// [`AdmRefKind::TrackFormat`] or, for linear-PCM essence, `AC_` =
+    /// [`AdmRefKind::ChannelFormat`].
+    pub fn track_ref_kind(&self) -> AdmRefKind {
+        AdmRefKind::classify(&self.track_ref)
+    }
+
+    /// Classify the `packRef` field (§1.2): `AP_` =
+    /// [`AdmRefKind::PackFormat`], or [`AdmRefKind::Unknown`] when the
+    /// field is all-NUL (no pack required).
+    pub fn pack_ref_kind(&self) -> AdmRefKind {
+        AdmRefKind::classify(&self.pack_ref)
+    }
+
+    /// Definition scope of the `trackRef` (§3): `Common` (BS.2094) when
+    /// the trailing four hex digits of the ID value are `≤ 0x0FFF`,
+    /// `Custom` (in the XML carrier) when `≥ 0x1000`. `None` when the
+    /// field has no parseable 8-hex value.
+    pub fn track_ref_scope(&self) -> Option<DefinitionScope> {
+        adm_definition_scope(&self.track_ref)
+    }
+
+    /// Definition scope of the `packRef` (§3), same rule as
+    /// [`Self::track_ref_scope`]. `None` for an all-NUL pack field.
+    pub fn pack_ref_scope(&self) -> Option<DefinitionScope> {
+        adm_definition_scope(&self.pack_ref)
     }
 
     /// Decode one 40-byte `audioID` record. Returns `None` when `buf`
@@ -1793,9 +1940,32 @@ fn parse_chna_chunk(buf: &[u8], out: &mut Vec<(String, String)>) -> Option<ChnaC
         }
         if let Some(tref) = audio_id_text(&rec.track_ref) {
             out.push((format!("wav:chna.{n}.track_ref"), tref));
+            // §1.2: the trackRef names an audioTrackFormatID (`AT_`) or,
+            // for linear-PCM essence, an audioChannelFormat (`AC_`).
+            let kind = rec.track_ref_kind();
+            if kind != AdmRefKind::Unknown {
+                out.push((format!("wav:chna.{n}.track_ref_kind"), kind.as_str().into()));
+            }
+            // §3: BS.2094 common definition vs file-local custom one.
+            if let Some(scope) = rec.track_ref_scope() {
+                out.push((
+                    format!("wav:chna.{n}.track_ref_definition"),
+                    scope.as_str().into(),
+                ));
+            }
         }
         if let Some(pref) = audio_id_text(&rec.pack_ref) {
             out.push((format!("wav:chna.{n}.pack_ref"), pref));
+            let kind = rec.pack_ref_kind();
+            if kind != AdmRefKind::Unknown {
+                out.push((format!("wav:chna.{n}.pack_ref_kind"), kind.as_str().into()));
+            }
+            if let Some(scope) = rec.pack_ref_scope() {
+                out.push((
+                    format!("wav:chna.{n}.pack_ref_definition"),
+                    scope.as_str().into(),
+                ));
+            }
         }
     }
     // The §1.1 record count `N` is derived from the floor division, so a
@@ -5462,6 +5632,94 @@ mod tests {
         let plain = wav_with_smpl_and_inst(None, None);
         let dmx = open_wav_demuxer(Box::new(Cursor::new(plain))).unwrap();
         assert_eq!(dmx.chna(), None);
+    }
+
+    /// `AudioId` ADM reference classification (§1.2 prefix → kind) and the
+    /// §3 common-vs-custom definition rule (trailing four hex digits
+    /// `≤ 0x0FFF` = common BS.2094 def, `≥ 0x1000` = custom).
+    #[test]
+    fn chna_adm_ref_classification() {
+        // AT_ trackFormat, common pack (trailing 0x0002 ≤ 0x0FFF).
+        let common = audio_id(1, "ATU_00000001", "AT_00010001_01", "AP_00010002");
+        assert_eq!(common.track_ref_kind(), AdmRefKind::TrackFormat);
+        assert_eq!(common.pack_ref_kind(), AdmRefKind::PackFormat);
+        // trackRef value low-16 = 0x0001 (≤ 0x0FFF) → common.
+        assert_eq!(common.track_ref_scope(), Some(DefinitionScope::Common));
+        // packRef value low-16 = 0x0002 (≤ 0x0FFF) → common.
+        assert_eq!(common.pack_ref_scope(), Some(DefinitionScope::Common));
+
+        // AC_ channelFormat ref (linear-PCM essence), custom pack
+        // (trailing 0x1003 ≥ 0x1000), and a custom channel def
+        // (0x1001 ≥ 0x1000).
+        let custom = audio_id(2, "ATU_00000002", "AC_00011001_00", "AP_00011003");
+        assert_eq!(custom.track_ref_kind(), AdmRefKind::ChannelFormat);
+        assert_eq!(custom.track_ref_scope(), Some(DefinitionScope::Custom));
+        assert_eq!(custom.pack_ref_scope(), Some(DefinitionScope::Custom));
+
+        // Boundary: exactly 0x0FFF is still common; 0x1000 flips to custom.
+        let edge_lo = audio_id(3, "ATU_00000003", "AT_00000FFF_01", "");
+        assert_eq!(edge_lo.track_ref_scope(), Some(DefinitionScope::Common));
+        let edge_hi = audio_id(4, "ATU_00000004", "AT_00001000_01", "");
+        assert_eq!(edge_hi.track_ref_scope(), Some(DefinitionScope::Custom));
+
+        // All-NUL pack (no pack required) → Unknown kind, no scope.
+        assert_eq!(edge_lo.pack_ref_kind(), AdmRefKind::Unknown);
+        assert_eq!(edge_lo.pack_ref_scope(), None);
+    }
+
+    /// The §3 classification reaches the surfaced `wav:chna.*` metadata:
+    /// per defined record we expose `.track_ref_kind` / `.pack_ref_kind`
+    /// and `.track_ref_definition` / `.pack_ref_definition`. Record 0 is a
+    /// common BS.2094 channel def with no pack; record 1 is a custom
+    /// trackFormat with a custom pack.
+    #[test]
+    fn chna_definition_scope_metadata() {
+        let chna = ChnaChunk {
+            num_tracks: 2,
+            num_uids: 2,
+            ids: vec![
+                // Linear-PCM essence: AC_ channelFormat, common (0x0001),
+                // no pack.
+                audio_id(1, "ATU_00000001", "AC_00010001_00", ""),
+                // Custom trackFormat (0x1001) + custom pack (0x1002).
+                audio_id(2, "ATU_00000002", "AT_00011001_01", "AP_00011002"),
+            ],
+        };
+        let bytes = wav_with_chna(&chna.to_bytes());
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+
+        // Record 0: AC_ channelFormat, common, no pack keys.
+        assert_eq!(
+            md.get("wav:chna.0.track_ref_kind"),
+            Some(&"audioChannelFormat".to_string())
+        );
+        assert_eq!(
+            md.get("wav:chna.0.track_ref_definition"),
+            Some(&"common".to_string())
+        );
+        assert_eq!(md.get("wav:chna.0.pack_ref"), None);
+        assert_eq!(md.get("wav:chna.0.pack_ref_kind"), None);
+        assert_eq!(md.get("wav:chna.0.pack_ref_definition"), None);
+
+        // Record 1: AT_ trackFormat custom, AP_ pack custom.
+        assert_eq!(
+            md.get("wav:chna.1.track_ref_kind"),
+            Some(&"audioTrackFormatID".to_string())
+        );
+        assert_eq!(
+            md.get("wav:chna.1.track_ref_definition"),
+            Some(&"custom".to_string())
+        );
+        assert_eq!(
+            md.get("wav:chna.1.pack_ref_kind"),
+            Some(&"audioPackFormatID".to_string())
+        );
+        assert_eq!(
+            md.get("wav:chna.1.pack_ref_definition"),
+            Some(&"custom".to_string())
+        );
     }
 
     /// Build a minimal valid PCM WAV with a caller-supplied raw `plst`

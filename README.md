@@ -261,10 +261,18 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework �
   char fields rendered up to the first NUL, omitted when entirely
   NUL) and `wav:chna.body_len` when trailing extension bytes ride
   along; the typed view is reachable via `WavDemuxer::chna()` and the
-  muxer writes the chunk via `WavMuxOptions::with_chna`. Bodies
-  shorter than the 4-byte pre-amble are skipped-as-opaque; the
-  mux→demux round-trip and the BS.2088-2 §8.3.1 stereo worked example
-  are pinned byte-for-byte in tests.
+  muxer writes the chunk via `WavMuxOptions::with_chna`. Each defined
+  record's `trackRef` / `packRef` is additionally classified by ADM
+  prefix (`AdmRefKind`: `AT_`=audioTrackFormatID, `AC_`=audioChannelFormat
+  for linear-PCM essence, `AP_`=audioPackFormatID, `ATU_`=audioTrackUID)
+  and by definition scope (`DefinitionScope` per §3 — trailing four hex
+  digits `≤ 0x0FFF` ⇒ BS.2094 *common* definition, `≥ 0x1000` ⇒ file-local
+  *custom* definition carried in `<axml>`/`<bxml>`/`<sxml>`), exposed via
+  `AudioId::{track_ref,pack_ref}_kind()` / `_scope()` and surfaced as
+  `wav:chna.<n>.{track_ref,pack_ref}_{kind,definition}`. Bodies shorter
+  than the 4-byte pre-amble are skipped-as-opaque; the mux→demux
+  round-trip and the BS.2088-2 §8.3.1 stereo worked example are pinned
+  byte-for-byte in tests.
 - **slin** container: Asterisk-style headerless `.sln*` / `.slin*` raw
   S16LE PCM (extension drives the sample rate).
 - **Y4M (YUV4MPEG2)** container: rawvideo demuxer + muxer for `.y4m` files,
