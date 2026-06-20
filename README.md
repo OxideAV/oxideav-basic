@@ -191,6 +191,23 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework �
   override is rejected as malformed; a `ds64` body shorter than 28
   bytes is rejected. The 32-bit legacy `fact.dwFileSize` is promoted
   to the 64-bit `ds64.sampleCount` when it carries the sentinel. The
+  64-bit form is also supported on the **write** side
+  (`WavMuxOptions::with_rf64(Rf64Mode)`), giving read/write symmetry
+  for files larger than 4 GiB. `Rf64Mode::Force` always emits the
+  `ds64` chunk immediately after `WAVE`, sets the legacy RIFF / `data`
+  / `fact` size fields to the `0xFFFFFFFF` sentinel, and writes the
+  64-bit `riffSize` / `dataSize` / `sampleCount` into the 28-byte
+  `ds64` body (with an empty `ChunkSize64` table). `Rf64Mode::Reserve`
+  implements the ITU-R BS.2088-2 §3.6 / §4.2 on-the-fly conversion: a
+  `ds64`-sized `JUNK` placeholder is written ahead of `fmt ` up front,
+  then at finalisation the muxer either leaves it as an inert `JUNK`
+  chunk (the file stays a plain 32-bit `RIFF`/`WAVE`) or — if the
+  finished payload overflows a 32-bit size field — promotes it in
+  place to a `ds64` chunk and flips the top-level magic. The promoted
+  / forced magic is `BW64` (per ITU-R BS.2088) when an ADM `chna`
+  chunk is also requested, else `RF64` (per EBU Tech 3306).
+  `Rf64Mode::Never` (the default) keeps short files byte-identical to
+  the historical 32-bit muxer and errors on a >4 GiB payload. The
   `JUNK` (Filler) chunk (RIFF MCI §2 "JUNK (Filler) Chunk") is
   recognised end-to-end — the chunk body is defined as "no relevant
   data" so its bytes are not surfaced, but the demuxer accounts for

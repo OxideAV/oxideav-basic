@@ -73,6 +73,14 @@ fn probe(p: &oxideav_core::ProbeData) -> u8 {
 /// and Annex A.2 `RF64Chunk` / `DataSize64Chunk` comments).
 const SIZE64_SENTINEL: u32 = 0xFFFF_FFFF;
 
+/// The body length of the fixed (table-less) `ds64` chunk: `riffSize`
+/// (8) + `dataSize` (8) + `sampleCount`/`dummy` (8) + `tableLength`
+/// (4) = 28 bytes (ITU-R BS.2088-2 §4.1 `DataSize64Chunk`; EBU Tech
+/// 3306 v2 Annex A.2). The write side reserves exactly this much so a
+/// `JUNK` placeholder can be promoted to a `ds64` chunk in place
+/// (BS.2088-2 §3.6 "File structure with JUNK chunk" + §4.3).
+const DS64_FIXED_BODY_LEN: u32 = 28;
+
 /// `ds64` chunk decoded body. Populated only when the top-level magic
 /// is `RF64` or `BW64`; for plain `RIFF`/WAVE the file uses 32-bit
 /// sizes throughout and `Ds64` is unused.
@@ -3326,9 +3334,12 @@ fn open_muxer(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Box<
         acid: None,
         chna: None,
         bext: None,
+        rf64: Rf64Mode::Never,
         riff_size_offset: 0,
         data_size_offset: 0,
         fact_size_offset: None,
+        ds64_body_offset: None,
+        magic_is_64bit: false,
         data_bytes: 0,
         header_written: false,
         trailer_written: false,
@@ -3352,6 +3363,41 @@ pub struct WavMuxOptions {
     acid: Option<AcidChunk>,
     chna: Option<ChnaChunk>,
     bext: Option<BextChunk>,
+    rf64: Rf64Mode,
+}
+
+/// How the muxer handles the 64-bit-extended (RF64 / BW64) large-file
+/// form (EBU Tech 3306 v2 / ITU-R BS.2088-2 §3–§4).
+///
+/// A plain `RIFF`/`WAVE` file stores the top-level RIFF size, the
+/// `data` chunk size, and the `fact` sample count in 32-bit fields,
+/// so it cannot describe a payload larger than 4 GiB − 1. The 64-bit
+/// form keeps those 32-bit fields but sets each to the
+/// `0xFFFFFFFF` sentinel and carries the real 64-bit values in a
+/// mandatory `ds64` chunk placed immediately after the form type
+/// (`WAVE`). The top-level magic also changes from `RIFF` to `RF64`
+/// (or `BW64` when an ADM `chna` chunk is present — ITU-R BS.2088).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Rf64Mode {
+    /// Plain 32-bit `RIFF`/`WAVE`. `write_trailer` errors if the
+    /// payload would overflow a 32-bit size field. This is the
+    /// historical default and keeps short files byte-identical.
+    #[default]
+    Never,
+    /// Reserve a `ds64`-sized `JUNK` placeholder chunk immediately
+    /// after `WAVE` (BS.2088-2 §3.6 "File structure with JUNK chunk").
+    /// If the finished file fits in 32 bits the placeholder is left as
+    /// an inert `JUNK` chunk and the file is a normal `RIFF`/`WAVE`;
+    /// if it overflows, the placeholder is promoted in place to a
+    /// `ds64` chunk and the magic flips to `RF64`/`BW64` — the
+    /// on-the-fly conversion described in BS.2088-2 §4.2. This is the
+    /// recording-application pattern: cheap up front, never fails on
+    /// overflow.
+    Reserve,
+    /// Always emit the 64-bit form: a `ds64` chunk after `WAVE`, the
+    /// `0xFFFFFFFF` sentinel in the legacy size fields, and the
+    /// `RF64`/`BW64` magic — regardless of the final payload size.
+    Force,
 }
 
 #[derive(Clone, Debug)]
@@ -3417,6 +3463,25 @@ impl WavMuxOptions {
         self.bext = Some(bext);
         self
     }
+
+    /// Select the 64-bit-extended (RF64 / BW64) large-file behaviour —
+    /// see [`Rf64Mode`].
+    ///
+    /// - [`Rf64Mode::Never`] (default): plain `RIFF`/`WAVE`; the muxer
+    ///   errors if the payload would overflow a 32-bit size field.
+    /// - [`Rf64Mode::Reserve`]: write a `ds64`-sized `JUNK` placeholder
+    ///   up front and promote it to `ds64` + `RF64`/`BW64` only if the
+    ///   finished file overflows 32 bits (BS.2088-2 §3.6 / §4.2
+    ///   on-the-fly conversion).
+    /// - [`Rf64Mode::Force`]: always emit the 64-bit form.
+    ///
+    /// When a `chna` chunk is also requested (an ADM file), the
+    /// promoted / forced magic is `BW64` rather than `RF64` per
+    /// ITU-R BS.2088; otherwise it is `RF64` per EBU Tech 3306.
+    pub fn with_rf64(mut self, mode: Rf64Mode) -> Self {
+        self.rf64 = mode;
+        self
+    }
 }
 
 /// Open the WAV muxer with caller-controlled `WAVEFORMATEXTENSIBLE`
@@ -3452,9 +3517,12 @@ pub fn open_muxer_with(
         acid: opts.acid,
         chna: opts.chna,
         bext: opts.bext,
+        rf64: opts.rf64,
         riff_size_offset: 0,
         data_size_offset: 0,
         fact_size_offset: None,
+        ds64_body_offset: None,
+        magic_is_64bit: false,
         data_bytes: 0,
         header_written: false,
         trailer_written: false,
@@ -3546,8 +3614,25 @@ struct WavMuxer {
     /// a `bext` chunk ahead of `data` when present (EBU Tech 3285 v2
     /// §2.3).
     bext: Option<BextChunk>,
+    /// 64-bit-extended (RF64 / BW64) large-file behaviour — see
+    /// [`Rf64Mode`]. Drives whether a `ds64` chunk (or its `JUNK`
+    /// placeholder) is reserved after `WAVE` and whether the trailer
+    /// promotes the file to the 64-bit form.
+    rf64: Rf64Mode,
     riff_size_offset: u64,
     data_size_offset: u64,
+    /// File offset of the `ds64`/`JUNK` placeholder chunk *body* (the
+    /// first byte after its 8-byte header), set in `write_header` when
+    /// `rf64 != Never`. `write_trailer` writes the 64-bit size fields
+    /// here (and rewrites the chunk id to `ds64` + the magic to
+    /// `RF64`/`BW64`) when promotion is required. `None` for plain
+    /// `RIFF`/`WAVE` output.
+    ds64_body_offset: Option<u64>,
+    /// Set once `write_trailer` has flipped the top-level magic to the
+    /// 64-bit form (`Force`, or `Reserve` on overflow). Used so the
+    /// RIFF/`ds64` size patching writes the sentinel rather than the
+    /// real 32-bit value.
+    magic_is_64bit: bool,
     /// Offset of the `dwFileSize` field inside the `fact` chunk we
     /// emit ahead of `data` for non-PCM streams (G.711 A-law / μ-law,
     /// and the EXTENSIBLE escape hatch even when the SubFormat
@@ -3583,10 +3668,41 @@ impl Muxer for WavMuxer {
             self.shape.format_tag()
         };
 
+        // Top-level magic. The write-header always emits `RIFF`; for
+        // `Rf64Mode::Force` the trailer rewrites the 4 bytes to
+        // `RF64`/`BW64` once it knows whether a `chna` (ADM) chunk made
+        // it a BW64 file. For `Rf64Mode::Reserve` the magic is left as
+        // `RIFF` unless the trailer detects a 32-bit overflow.
         self.output.write_all(b"RIFF")?;
         self.riff_size_offset = self.output.stream_position()?;
         self.output.write_all(&0u32.to_le_bytes())?; // placeholder
         self.output.write_all(b"WAVE")?;
+
+        // 64-bit-extended large-file support (EBU Tech 3306 v2 / ITU-R
+        // BS.2088-2 §3–§4). The `ds64` chunk — or its `JUNK` placeholder
+        // for the deferred (`Reserve`) form — is written immediately
+        // after the `WAVE` form type and before `fmt `, per BS.2088-2
+        // §3.6 ("the <JUNK> placeholder chunk placed before the <fmt >
+        // chunk") and §4. Body is the fixed 28-byte (`riffSize` +
+        // `dataSize` + `sampleCount`/dummy + `tableLength`) struct with
+        // no `ChunkSize64` table entries — this muxer never writes a
+        // non-`data` chunk that can itself exceed 4 GiB.
+        if self.rf64 != Rf64Mode::Never {
+            // `ds64` for the always-on (`Force`) form; `JUNK` for the
+            // deferred (`Reserve`) placeholder.
+            let id: &[u8; 4] = if self.rf64 == Rf64Mode::Force {
+                b"ds64"
+            } else {
+                b"JUNK"
+            };
+            self.output.write_all(id)?;
+            self.output.write_all(&DS64_FIXED_BODY_LEN.to_le_bytes())?;
+            self.ds64_body_offset = Some(self.output.stream_position()?);
+            // 28 zero bytes — patched (and, for `Reserve`, possibly
+            // promoted) in `write_trailer`.
+            self.output
+                .write_all(&[0u8; DS64_FIXED_BODY_LEN as usize])?;
+        }
 
         // fmt chunk: 16 bytes for plain WAVEFORMAT, 40 bytes for
         // WAVEFORMATEXTENSIBLE (16 + 2 cbSize + 22 ext).
@@ -3688,38 +3804,104 @@ impl Muxer for WavMuxer {
         }
         let end = self.output.stream_position()?;
 
-        // Patch "data" chunk size.
-        let data_size_u32: u32 = self
-            .data_bytes
-            .try_into()
-            .map_err(|_| Error::other("WAV data chunk exceeds 4 GiB"))?;
-        self.output.seek(SeekFrom::Start(self.data_size_offset))?;
-        self.output.write_all(&data_size_u32.to_le_bytes())?;
+        // True 64-bit RIFF and `data` sizes (the values a `ds64` chunk
+        // carries). `riffSize` is the whole file minus the 8-byte
+        // `RIFF`/size header (EBU Tech 3306 v2 §3 / ITU-R BS.2088-2 §4.2
+        // `bw64Size`); `dataSize` is the un-padded payload length.
+        let riff_size = end - 8;
+        let data_size = self.data_bytes;
 
-        // Patch "fact" `dwFileSize` (per-channel sample count) when the
-        // chunk was emitted. For PCM/G.711 the on-wire byte rate makes
-        // `data_bytes / block_align` exact; for the EXTENSIBLE escape
-        // hatch the muxer only ships pre-framed payload so the same
-        // identity holds. Compressed bitstreams that ride EXTENSIBLE
-        // would need a caller-supplied sample count — out of scope for
-        // this muxer which only writes uncompressed shapes today.
-        if let Some(off) = self.fact_size_offset {
-            let bits_per_sample = self.shape.bits_per_sample() as u64;
-            let block_align = (bits_per_sample / 8) * self.channels as u64;
-            let sample_count = self.data_bytes.checked_div(block_align).unwrap_or(0);
-            let sample_count_u32: u32 = sample_count
-                .try_into()
-                .map_err(|_| Error::other("WAV fact sample count exceeds u32"))?;
-            self.output.seek(SeekFrom::Start(off))?;
-            self.output.write_all(&sample_count_u32.to_le_bytes())?;
+        // Per-channel sample count for the `fact` chunk (and the
+        // `ds64.sampleCount`/dummy slot). PCM/G.711/EXTENSIBLE ship
+        // pre-framed payload, so `data_bytes / block_align` is exact.
+        let bits_per_sample = self.shape.bits_per_sample() as u64;
+        let block_align = (bits_per_sample / 8) * self.channels as u64;
+        let sample_count = data_size.checked_div(block_align).unwrap_or(0);
+
+        // Decide whether the file must use the 64-bit-extended form.
+        // `Force` always does; `Reserve` promotes only on a real 32-bit
+        // overflow (BS.2088-2 §4.2 on-the-fly conversion); `Never`
+        // errors on overflow as the historical muxer did.
+        let overflow = riff_size > u32::MAX as u64 || data_size > u32::MAX as u64;
+        let use_64bit = match self.rf64 {
+            Rf64Mode::Force => true,
+            Rf64Mode::Reserve => overflow,
+            Rf64Mode::Never => {
+                if overflow {
+                    return Err(Error::other(
+                        "WAV file exceeds 4 GiB; use WavMuxOptions::with_rf64 for the \
+                         RF64/BW64 64-bit form",
+                    ));
+                }
+                false
+            }
+        };
+
+        if use_64bit {
+            // 64-bit (RF64 / BW64) form. The `ds64` placeholder was
+            // reserved in `write_header`; here we fill its body, flip a
+            // `Reserve`-mode `JUNK` id to `ds64`, set the legacy 32-bit
+            // size fields to the `0xFFFFFFFF` sentinel, and rewrite the
+            // top-level magic. BW64 when an ADM `chna` chunk is present
+            // (ITU-R BS.2088), else RF64 (EBU Tech 3306).
+            let ds64_body = self
+                .ds64_body_offset
+                .ok_or_else(|| Error::other("RF64 muxer: ds64 placeholder not reserved"))?;
+
+            // ds64 body: riffSize(8) + dataSize(8) + sampleCount(8) +
+            // tableLength(4) = 28 bytes, no ChunkSize64 entries.
+            self.output.seek(SeekFrom::Start(ds64_body))?;
+            self.output.write_all(&riff_size.to_le_bytes())?;
+            self.output.write_all(&data_size.to_le_bytes())?;
+            self.output.write_all(&sample_count.to_le_bytes())?;
+            self.output.write_all(&0u32.to_le_bytes())?; // tableLength = 0
+
+            // Promote a `Reserve`-mode `JUNK` placeholder to `ds64`
+            // (BS.2088-2 §4.2: "Replace the ckID <JUNK> with <ds64>").
+            // The `Force` path already wrote `ds64` in the header.
+            if self.rf64 == Rf64Mode::Reserve {
+                self.output.seek(SeekFrom::Start(ds64_body - 8))?;
+                self.output.write_all(b"ds64")?;
+            }
+
+            // Legacy 32-bit size fields carry the sentinel.
+            self.output.seek(SeekFrom::Start(self.riff_size_offset))?;
+            self.output.write_all(&SIZE64_SENTINEL.to_le_bytes())?;
+            self.output.seek(SeekFrom::Start(self.data_size_offset))?;
+            self.output.write_all(&SIZE64_SENTINEL.to_le_bytes())?;
+            if let Some(off) = self.fact_size_offset {
+                self.output.seek(SeekFrom::Start(off))?;
+                self.output.write_all(&SIZE64_SENTINEL.to_le_bytes())?;
+            }
+
+            // Top-level magic: BW64 for ADM (chna present) else RF64.
+            let magic: &[u8; 4] = if self.chna.is_some() {
+                b"BW64"
+            } else {
+                b"RF64"
+            };
+            self.output.seek(SeekFrom::Start(0))?;
+            self.output.write_all(magic)?;
+            self.magic_is_64bit = true;
+        } else {
+            // Plain 32-bit `RIFF`/`WAVE`. Any reserved `JUNK`
+            // placeholder is left inert (a valid, ignorable RIFF chunk).
+            let data_size_u32 = data_size as u32; // checked non-overflow above
+            self.output.seek(SeekFrom::Start(self.data_size_offset))?;
+            self.output.write_all(&data_size_u32.to_le_bytes())?;
+
+            if let Some(off) = self.fact_size_offset {
+                let sample_count_u32: u32 = sample_count
+                    .try_into()
+                    .map_err(|_| Error::other("WAV fact sample count exceeds u32"))?;
+                self.output.seek(SeekFrom::Start(off))?;
+                self.output.write_all(&sample_count_u32.to_le_bytes())?;
+            }
+
+            let riff_size_u32 = riff_size as u32; // checked non-overflow above
+            self.output.seek(SeekFrom::Start(self.riff_size_offset))?;
+            self.output.write_all(&riff_size_u32.to_le_bytes())?;
         }
-
-        // Patch "RIFF" size: total file size minus 8 (RIFF + size fields).
-        let riff_size_u32: u32 = (end - 8)
-            .try_into()
-            .map_err(|_| Error::other("WAV RIFF size exceeds 4 GiB"))?;
-        self.output.seek(SeekFrom::Start(self.riff_size_offset))?;
-        self.output.write_all(&riff_size_u32.to_le_bytes())?;
 
         self.output.seek(SeekFrom::Start(end))?;
         self.output.flush()?;
@@ -8190,5 +8372,172 @@ mod tests {
         let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(out));
         let res = open_demuxer(rs, &oxideav_core::NullCodecResolver);
         assert!(res.is_err(), "ds64 < 28 bytes must be rejected");
+    }
+
+    // --- RF64 / BW64 write side --------------------------------------------
+
+    /// `Rf64Mode::Force` always emits the 64-bit form even for a tiny
+    /// payload: the magic is `RF64`, the legacy RIFF/`data` size fields
+    /// carry the `0xFFFFFFFF` sentinel, and a `ds64` chunk holding the
+    /// real sizes is the first chunk after `WAVE`
+    /// (EBU Tech 3306 v2 §3 / ITU-R BS.2088-2 §4).
+    #[test]
+    fn rf64_force_small_file_emits_ds64() {
+        let payload = vec![0u8; 4 * 100]; // 100 stereo s16 frames
+        let stream = make_stream(SampleFormat::S16, 2, 48_000);
+        let opts = WavMuxOptions::default().with_rf64(Rf64Mode::Force);
+        let bytes = mux_to_bytes(&stream, &payload, opts, "rf64-force");
+
+        // Top-level magic flipped to RF64; legacy RIFF size = sentinel.
+        assert_eq!(&bytes[0..4], b"RF64");
+        assert_eq!(
+            u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+            SIZE64_SENTINEL
+        );
+        assert_eq!(&bytes[8..12], b"WAVE");
+
+        // ds64 is the first chunk after WAVE, 28-byte body.
+        assert_eq!(&bytes[12..16], b"ds64");
+        assert_eq!(
+            u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]),
+            DS64_FIXED_BODY_LEN
+        );
+        let body = &bytes[20..20 + DS64_FIXED_BODY_LEN as usize];
+        let riff_size = u64::from_le_bytes(body[0..8].try_into().unwrap());
+        let data_size = u64::from_le_bytes(body[8..16].try_into().unwrap());
+        let sample_count = u64::from_le_bytes(body[16..24].try_into().unwrap());
+        let table_len = u32::from_le_bytes(body[24..28].try_into().unwrap());
+        assert_eq!(data_size, payload.len() as u64);
+        // 100 frames * 2ch * 2 bytes/sample → 100 per-channel samples.
+        assert_eq!(sample_count, 100);
+        assert_eq!(riff_size, bytes.len() as u64 - 8);
+        assert_eq!(table_len, 0);
+    }
+
+    /// A `Force`-mode file round-trips through the demuxer: the ds64
+    /// sizes resolve the sentinel-tagged `data` chunk, and the metadata
+    /// surfaces `wav:rf64.magic == RF64` with the same 64-bit sizes.
+    #[test]
+    fn rf64_force_round_trips() {
+        let samples: Vec<i16> = (0..500).map(|i| ((i * 17) - 4000) as i16).collect();
+        let mut payload = Vec::with_capacity(samples.len() * 2);
+        for s in &samples {
+            payload.extend_from_slice(&s.to_le_bytes());
+        }
+        let stream = make_stream(SampleFormat::S16, 1, 44_100);
+        let opts = WavMuxOptions::default().with_rf64(Rf64Mode::Force);
+        let bytes = mux_to_bytes(&stream, &payload, opts, "rf64-force-rt");
+
+        let mut dmx = open_demux_from_bytes(bytes.clone());
+        assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:rf64.magic"), Some(&"RF64".to_string()));
+        assert_eq!(
+            md.get("wav:rf64.data_size"),
+            Some(&payload.len().to_string())
+        );
+        // The full payload comes back byte-identical despite the
+        // sentinel in the 32-bit `data` size field.
+        let mut out_bytes = Vec::new();
+        loop {
+            match dmx.next_packet() {
+                Ok(p) => out_bytes.extend_from_slice(&p.data),
+                Err(Error::Eof) => break,
+                Err(e) => panic!("demux error: {e}"),
+            }
+        }
+        assert_eq!(out_bytes, payload);
+    }
+
+    /// When an ADM `chna` chunk is present the forced 64-bit magic is
+    /// `BW64` (ITU-R BS.2088) rather than `RF64` (EBU Tech 3306).
+    #[test]
+    fn rf64_force_with_chna_is_bw64() {
+        let payload = vec![0u8; 2 * 50];
+        let stream = make_stream(SampleFormat::S16, 1, 48_000);
+        let chna = ChnaChunk {
+            num_tracks: 0,
+            num_uids: 0,
+            ids: Vec::new(),
+        };
+        let opts = WavMuxOptions::default()
+            .with_chna(chna)
+            .with_rf64(Rf64Mode::Force);
+        let bytes = mux_to_bytes(&stream, &payload, opts, "bw64-force-chna");
+        assert_eq!(&bytes[0..4], b"BW64");
+
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:rf64.magic"), Some(&"BW64".to_string()));
+    }
+
+    /// `Rf64Mode::Reserve` writes a `ds64`-sized `JUNK` placeholder up
+    /// front. For a small file that never overflows 32 bits the magic
+    /// stays `RIFF`, the placeholder is left as an inert `JUNK` chunk,
+    /// and the file is a perfectly ordinary WAVE that the demuxer reads
+    /// (the `JUNK` accounting keys appear). BS.2088-2 §3.6.
+    #[test]
+    fn rf64_reserve_small_file_stays_riff() {
+        let samples: Vec<i16> = (0..300).map(|i| (i * 11 - 1500) as i16).collect();
+        let mut payload = Vec::with_capacity(samples.len() * 2);
+        for s in &samples {
+            payload.extend_from_slice(&s.to_le_bytes());
+        }
+        let stream = make_stream(SampleFormat::S16, 1, 48_000);
+        let opts = WavMuxOptions::default().with_rf64(Rf64Mode::Reserve);
+        let bytes = mux_to_bytes(&stream, &payload, opts, "rf64-reserve");
+
+        // Magic stays RIFF; placeholder is an inert JUNK chunk after WAVE.
+        assert_eq!(&bytes[0..4], b"RIFF");
+        assert_eq!(&bytes[8..12], b"WAVE");
+        assert_eq!(&bytes[12..16], b"JUNK");
+        assert_eq!(
+            u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]),
+            DS64_FIXED_BODY_LEN
+        );
+
+        // Demuxer reads it as a normal file; the JUNK accounting keys
+        // show the placeholder, and the payload round-trips.
+        let mut dmx = open_demux_from_bytes(bytes.clone());
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:junk.count"), Some(&"1".to_string()));
+        assert_eq!(
+            md.get("wav:junk.total_bytes"),
+            Some(&DS64_FIXED_BODY_LEN.to_string())
+        );
+        // No RF64 keys — this is a plain RIFF file.
+        assert_eq!(md.get("wav:rf64.magic"), None);
+        let mut out_bytes = Vec::new();
+        loop {
+            match dmx.next_packet() {
+                Ok(p) => out_bytes.extend_from_slice(&p.data),
+                Err(Error::Eof) => break,
+                Err(e) => panic!("demux error: {e}"),
+            }
+        }
+        assert_eq!(out_bytes, payload);
+    }
+
+    /// The default muxer (no `with_rf64`) writes no placeholder and is
+    /// byte-identical to the historical output: plain `RIFF`, no `JUNK`
+    /// chunk, no `ds64`.
+    #[test]
+    fn rf64_default_writes_no_placeholder() {
+        let payload = vec![0u8; 2 * 64];
+        let stream = make_stream(SampleFormat::S16, 1, 48_000);
+        let plain = mux_to_bytes(&stream, &payload, WavMuxOptions::default(), "rf64-none-a");
+        let explicit = mux_to_bytes(
+            &stream,
+            &payload,
+            WavMuxOptions::default().with_rf64(Rf64Mode::Never),
+            "rf64-none-b",
+        );
+        assert_eq!(plain, explicit);
+        assert_eq!(&plain[0..4], b"RIFF");
+        // The chunk right after WAVE is `fmt `, not a placeholder.
+        assert_eq!(&plain[12..16], b"fmt ");
     }
 }
