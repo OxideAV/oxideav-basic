@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- integration test: full public mux → demux round-trip of a WAV carrying BOTH an Acidizer `acid` loop chunk and a BW64/ADM `chna` chunk — PCM byte-for-byte, typed WavDemuxer::{acid,chna}() accessors, and the ADM kind/definition-scope metadata keys (tests/wav_adm_metadata_roundtrip.rs)
 - BW64/ADM chna: classify each audioID reference (ATU_/AT_/AC_/AP_ → AdmRefKind) and resolve its definition scope per ITU-R BS.2088-2 §8.1/§3 (trailing four hex digits ≤ 0x0FFF = BS.2094 common, ≥ 0x1000 = file-local custom) — surfaced as wav:chna.<n>.{track_ref,pack_ref}_{kind,definition} keys, AdmRefKind/DefinitionScope public enums + AudioId accessors
 - BWF bext (Broadcast Audio Extension) chunk read+write with typed BextChunk surface (EBU Tech 3285 v2 §2.3) — WavMuxOptions::with_bext writer, WavDemuxer::bext() accessor, byte-exact parse/to_bytes round-trip
 - parse BW64/ADM bxml (compressed XML) chunk per ITU-R BS.2088-2 §6 — fmtType header + uncompressed-XML text surface
