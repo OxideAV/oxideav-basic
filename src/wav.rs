@@ -3880,6 +3880,9 @@ fn open_muxer(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Box<
         acid: None,
         chna: None,
         bext: None,
+        cue: None,
+        plst: None,
+        adtl: None,
         rf64: Rf64Mode::Never,
         riff_size_offset: 0,
         data_size_offset: 0,
@@ -3909,6 +3912,9 @@ pub struct WavMuxOptions {
     acid: Option<AcidChunk>,
     chna: Option<ChnaChunk>,
     bext: Option<BextChunk>,
+    cue: Option<CueChunk>,
+    plst: Option<PlaylistChunk>,
+    adtl: Option<AdtlChunk>,
     rf64: Rf64Mode,
 }
 
@@ -4010,6 +4016,36 @@ impl WavMuxOptions {
         self
     }
 
+    /// Emit a `cue ` (cue-points) chunk after the `data` waveform
+    /// (RIFF MCI §3 "Cue-Points Chunk"). Cue / playlist / associated-
+    /// data chunks reference sample positions in the `data` payload, so
+    /// they are written in the trailer once the payload is complete —
+    /// the conventional placement, and the one a sibling `plst`/`adtl`
+    /// expects. The body is `4 + N*24` bytes, always even.
+    pub fn with_cue(mut self, cue: CueChunk) -> Self {
+        self.cue = Some(cue);
+        self
+    }
+
+    /// Emit a `plst` (playlist) chunk after the `data` waveform (RIFF
+    /// MCI §3 "Playlist Chunk"). Each segment's `cue_id` should match a
+    /// [`CuePoint::name`] supplied via [`Self::with_cue`]. The body is
+    /// `4 + N*12` bytes, always even.
+    pub fn with_plst(mut self, plst: PlaylistChunk) -> Self {
+        self.plst = Some(plst);
+        self
+    }
+
+    /// Emit a `LIST adtl` (Associated Data List) chunk after the `data`
+    /// waveform (RIFF MCI §3 "Associated Data Chunk"). Each entry's
+    /// `name` should match a [`CuePoint::name`] supplied via
+    /// [`Self::with_cue`]. Odd-length `labl`/`note`/`ltxt` sub-chunks
+    /// get the RIFF word-alignment pad byte automatically.
+    pub fn with_adtl(mut self, adtl: AdtlChunk) -> Self {
+        self.adtl = Some(adtl);
+        self
+    }
+
     /// Select the 64-bit-extended (RF64 / BW64) large-file behaviour —
     /// see [`Rf64Mode`].
     ///
@@ -4063,6 +4099,9 @@ pub fn open_muxer_with(
         acid: opts.acid,
         chna: opts.chna,
         bext: opts.bext,
+        cue: opts.cue,
+        plst: opts.plst,
+        adtl: opts.adtl,
         rf64: opts.rf64,
         riff_size_offset: 0,
         data_size_offset: 0,
@@ -4160,6 +4199,15 @@ struct WavMuxer {
     /// a `bext` chunk ahead of `data` when present (EBU Tech 3285 v2
     /// §2.3).
     bext: Option<BextChunk>,
+    /// Caller-supplied cue-points, emitted as a `cue ` chunk *after*
+    /// `data` in the trailer when present (RIFF MCI §3).
+    cue: Option<CueChunk>,
+    /// Caller-supplied playlist, emitted as a `plst` chunk after `data`
+    /// in the trailer when present (RIFF MCI §3).
+    plst: Option<PlaylistChunk>,
+    /// Caller-supplied associated-data list, emitted as a `LIST adtl`
+    /// chunk after `data` in the trailer when present (RIFF MCI §3).
+    adtl: Option<AdtlChunk>,
     /// 64-bit-extended (RF64 / BW64) large-file behaviour — see
     /// [`Rf64Mode`]. Drives whether a `ds64` chunk (or its `JUNK`
     /// placeholder) is reserved after `WAVE` and whether the trailer
@@ -4348,6 +4396,40 @@ impl Muxer for WavMuxer {
         if self.data_bytes % 2 == 1 {
             self.output.write_all(&[0u8])?;
         }
+
+        // Trailing metadata chunks (RIFF MCI §3 optional `<other-ck>`
+        // that may follow the waveform). These reference sample
+        // positions in the `data` payload, so they are emitted here —
+        // after `data` is complete — rather than in `write_header`. They
+        // are counted in `riff_size` (the cursor advances before `end` is
+        // captured below) but never in `data_size`.
+        if let Some(cue) = &self.cue {
+            let body = cue.to_bytes(); // 4 + N*24, always even
+            self.output.write_all(b"cue ")?;
+            self.output.write_all(&(body.len() as u32).to_le_bytes())?;
+            self.output.write_all(&body)?;
+        }
+        if let Some(plst) = &self.plst {
+            let body = plst.to_bytes(); // 4 + N*12, always even
+            self.output.write_all(b"plst")?;
+            self.output.write_all(&(body.len() as u32).to_le_bytes())?;
+            self.output.write_all(&body)?;
+        }
+        if let Some(adtl) = &self.adtl {
+            // `to_list_body` already includes the `adtl` list type and
+            // each sub-chunk's word-alignment pad; the enclosing `LIST`
+            // size is the list-body length. The list body is even iff
+            // every sub-chunk was padded, which `to_list_body` ensures,
+            // so no inter-chunk pad is needed after the LIST.
+            let body = adtl.to_list_body();
+            self.output.write_all(b"LIST")?;
+            self.output.write_all(&(body.len() as u32).to_le_bytes())?;
+            self.output.write_all(&body)?;
+            if body.len() % 2 == 1 {
+                self.output.write_all(&[0u8])?;
+            }
+        }
+
         let end = self.output.stream_position()?;
 
         // True 64-bit RIFF and `data` sizes (the values a `ds64` chunk
@@ -9201,6 +9283,198 @@ mod tests {
         // WAVE(4) + ds64(8+28) + fmt (8+16) + data header(8) + payload.
         let overhead = 4 + (8 + DS64_FIXED_BODY_LEN as u64) + (8 + 16) + 8;
         assert_eq!(riff_size, total + overhead);
+    }
+
+    // ---- cue / plst / LIST adtl: typed parse/to_bytes + muxer round-trip ----
+
+    /// `CuePoint`/`CueChunk` parse and to_bytes are exact inverses, and
+    /// `at_sample` fills the single-`data`-chunk convention fields.
+    #[test]
+    fn cue_chunk_to_bytes_roundtrip() {
+        let cue = CueChunk::new(vec![
+            CuePoint::at_sample(1, 0),
+            CuePoint::at_sample(2, 44_100),
+            CuePoint {
+                name: 7,
+                position: 96_000,
+                fcc_chunk: *b"slnt",
+                chunk_start: 12,
+                block_start: 34,
+                sample_offset: 56,
+            },
+        ]);
+        let body = cue.to_bytes();
+        assert_eq!(body.len(), cue.body_len());
+        assert_eq!(body.len() % 2, 0); // always even
+        assert_eq!(u32::from_le_bytes(body[0..4].try_into().unwrap()), 3);
+        let reparsed = CueChunk::parse(&body).unwrap();
+        assert_eq!(reparsed, cue);
+        // Convention fields for a single-data file.
+        assert_eq!(cue.points[1].fcc_chunk, *b"data");
+        assert_eq!(cue.points[1].position, 44_100);
+        assert_eq!(cue.points[1].sample_offset, 44_100);
+        assert_eq!(cue.points[1].chunk_start, 0);
+    }
+
+    /// A `cue ` claiming more points than the body carries is clamped.
+    #[test]
+    fn cue_chunk_parse_clamps_overclaimed_count() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&9u32.to_le_bytes()); // claims 9
+        body.extend_from_slice(&CuePoint::at_sample(1, 100).to_bytes()); // only 1 fits
+        let cue = CueChunk::parse(&body).unwrap();
+        assert_eq!(cue.points.len(), 1);
+        assert_eq!(cue.points[0].name, 1);
+        // Body shorter than the 4-byte count header → None.
+        assert!(CueChunk::parse(&[0u8; 3]).is_none());
+    }
+
+    /// `PlaylistSegment`/`PlaylistChunk` parse/to_bytes inverses.
+    #[test]
+    fn plst_chunk_to_bytes_roundtrip() {
+        let plst = PlaylistChunk::new(vec![
+            PlaylistSegment {
+                cue_id: 1,
+                length: 22_050,
+                loops: 2,
+            },
+            PlaylistSegment {
+                cue_id: 1, // same cue replayed
+                length: 22_050,
+                loops: 1,
+            },
+        ]);
+        let body = plst.to_bytes();
+        assert_eq!(body.len(), plst.body_len());
+        assert_eq!(body.len() % 2, 0);
+        assert_eq!(PlaylistChunk::parse(&body).unwrap(), plst);
+    }
+
+    /// `AdtlChunk` parse/to_list_body inverses across all three entry
+    /// kinds, including odd-length `labl` text (word-alignment pad).
+    #[test]
+    fn adtl_chunk_to_list_body_roundtrip() {
+        let adtl = AdtlChunk::new(vec![
+            AdtlEntry::Label {
+                name: 1,
+                text: "intro".to_string(), // 5 chars + NUL = 6 bytes body → odd dwName? body=4+6=10 even
+            },
+            AdtlEntry::Note {
+                name: 1,
+                text: "comment text".to_string(),
+            },
+            AdtlEntry::LabeledText {
+                name: 2,
+                sample_length: 1024,
+                purpose: *b"capt",
+                country: 1,
+                language: 9,
+                dialect: 1,
+                code_page: 1252,
+                text: "caption".to_string(),
+            },
+        ]);
+        let body = adtl.to_list_body();
+        assert_eq!(body.len(), adtl.list_body_len());
+        assert_eq!(body.len() % 2, 0); // list body always even
+        assert_eq!(&body[0..4], b"adtl");
+        let reparsed = AdtlChunk::parse(&body[4..]);
+        assert_eq!(reparsed, adtl);
+    }
+
+    /// Full muxer → demuxer round-trip: a WAV written with cue / plst /
+    /// adtl trailing chunks reads back with the typed accessors intact,
+    /// the payload unchanged, and the chunks correctly placed *after*
+    /// `data` (verified by the demuxer surfacing them despite the
+    /// post-data position).
+    #[test]
+    fn mux_demux_cue_plst_adtl_roundtrip() {
+        let samples: Vec<i16> = (0..500).map(|i| (i as i16).wrapping_mul(53)).collect();
+        let mut payload = Vec::with_capacity(samples.len() * 2);
+        for s in &samples {
+            payload.extend_from_slice(&s.to_le_bytes());
+        }
+        let stream = make_stream(SampleFormat::S16, 1, 44_100);
+
+        let cue = CueChunk::new(vec![CuePoint::at_sample(1, 0), CuePoint::at_sample(2, 250)]);
+        let plst = PlaylistChunk::new(vec![PlaylistSegment {
+            cue_id: 1,
+            length: 250,
+            loops: 3,
+        }]);
+        let adtl = AdtlChunk::new(vec![
+            AdtlEntry::Label {
+                name: 1,
+                text: "start".to_string(),
+            },
+            AdtlEntry::Note {
+                name: 2,
+                text: "midpoint marker".to_string(),
+            },
+            AdtlEntry::LabeledText {
+                name: 1,
+                sample_length: 250,
+                purpose: *b"rgn ",
+                country: 0,
+                language: 0,
+                dialect: 0,
+                code_page: 0,
+                text: "first half".to_string(),
+            },
+        ]);
+
+        let opts = WavMuxOptions::default()
+            .with_cue(cue.clone())
+            .with_plst(plst.clone())
+            .with_adtl(adtl.clone());
+        let bytes = mux_to_bytes(&stream, &payload, opts, "cue-plst-adtl");
+
+        // The trailing chunks must sit after `data` — confirm `data`
+        // appears before `cue ` / `plst` / `LIST` in the byte stream.
+        let find = |needle: &[u8]| {
+            bytes
+                .windows(needle.len())
+                .position(|w| w == needle)
+                .unwrap()
+        };
+        let data_pos = find(b"data");
+        assert!(find(b"cue ") > data_pos);
+        assert!(find(b"plst") > data_pos);
+        assert!(find(b"adtl") > data_pos);
+
+        let typed = open_wav_demuxer(Box::new(std::io::Cursor::new(bytes.clone()))).unwrap();
+        assert_eq!(typed.cue(), Some(&cue));
+        assert_eq!(typed.plst(), Some(&plst));
+        assert_eq!(typed.adtl(), Some(&adtl));
+
+        // Payload still decodes intact through the dyn-Demuxer path.
+        let mut dmx = open_demux_from_bytes(bytes);
+        let mut out = Vec::new();
+        loop {
+            match dmx.next_packet() {
+                Ok(p) => out.extend_from_slice(&p.data),
+                Err(Error::Eof) => break,
+                Err(e) => panic!("demux error: {e}"),
+            }
+        }
+        assert_eq!(out, payload);
+    }
+
+    /// A WAV with no cue / plst / adtl reads back with all three typed
+    /// accessors `None`, and the byte stream is unchanged from the
+    /// pre-feature muxer (no stray trailing chunks).
+    #[test]
+    fn mux_without_cue_plst_adtl_is_unchanged() {
+        let payload = vec![0u8; 64];
+        let stream = make_stream(SampleFormat::U8, 1, 8_000);
+        let plain = mux_to_bytes(&stream, &payload, WavMuxOptions::default(), "no-cue");
+        let typed = open_wav_demuxer(Box::new(std::io::Cursor::new(plain.clone()))).unwrap();
+        assert!(typed.cue().is_none());
+        assert!(typed.plst().is_none());
+        assert!(typed.adtl().is_none());
+        // No trailing-chunk ids leaked into the output.
+        assert!(!plain.windows(4).any(|w| w == b"cue "));
+        assert!(!plain.windows(4).any(|w| w == b"plst"));
     }
 
     /// A seekable sink shared via `Rc<RefCell<…>>` so a test can read the
