@@ -9460,6 +9460,80 @@ mod tests {
         assert_eq!(out, payload);
     }
 
+    /// Full read → re-emit → read symmetry: demux a file's cue / plst /
+    /// adtl through the typed accessors, feed them straight back into the
+    /// muxer, and confirm the second read yields identical typed chunks.
+    /// This is the end-to-end proof that the accessor outputs round-trip
+    /// through the writer without information loss.
+    #[test]
+    fn demux_reemit_cue_plst_adtl_is_stable() {
+        let payload = vec![0u8; 200];
+        let stream = make_stream(SampleFormat::U8, 1, 22_050);
+
+        let cue = CueChunk::new(vec![
+            CuePoint::at_sample(10, 50),
+            CuePoint::at_sample(20, 150),
+        ]);
+        let plst = PlaylistChunk::new(vec![PlaylistSegment {
+            cue_id: 10,
+            length: 100,
+            loops: 1,
+        }]);
+        let adtl = AdtlChunk::new(vec![
+            AdtlEntry::Label {
+                name: 10,
+                text: "A".to_string(),
+            },
+            AdtlEntry::LabeledText {
+                name: 20,
+                sample_length: 50,
+                purpose: *b"scrp",
+                country: 0,
+                language: 0,
+                dialect: 0,
+                code_page: 0,
+                text: "line".to_string(),
+            },
+        ]);
+
+        let first = mux_to_bytes(
+            &stream,
+            &payload,
+            WavMuxOptions::default()
+                .with_cue(cue.clone())
+                .with_plst(plst.clone())
+                .with_adtl(adtl.clone()),
+            "reemit-1",
+        );
+
+        // Read the typed chunks back.
+        let d1 = open_wav_demuxer(Box::new(std::io::Cursor::new(first))).unwrap();
+        let cue1 = d1.cue().unwrap().clone();
+        let plst1 = d1.plst().unwrap().clone();
+        let adtl1 = d1.adtl().unwrap().clone();
+
+        // Re-emit them straight from the accessor outputs.
+        let second = mux_to_bytes(
+            &stream,
+            &payload,
+            WavMuxOptions::default()
+                .with_cue(cue1.clone())
+                .with_plst(plst1.clone())
+                .with_adtl(adtl1.clone()),
+            "reemit-2",
+        );
+
+        // Second read is identical to the first read's typed view…
+        let d2 = open_wav_demuxer(Box::new(std::io::Cursor::new(second.clone()))).unwrap();
+        assert_eq!(d2.cue(), Some(&cue1));
+        assert_eq!(d2.plst(), Some(&plst1));
+        assert_eq!(d2.adtl(), Some(&adtl1));
+        // …and equals the originals.
+        assert_eq!(cue1, cue);
+        assert_eq!(plst1, plst);
+        assert_eq!(adtl1, adtl);
+    }
+
     /// A WAV with no cue / plst / adtl reads back with all three typed
     /// accessors `None`, and the byte stream is unchanged from the
     /// pre-feature muxer (no stray trailing chunks).
