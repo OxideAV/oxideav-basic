@@ -409,6 +409,12 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
     // Typed BWF Broadcast Audio Extension view, populated when a `bext`
     // chunk parses (EBU Tech 3285 v2 §2.3).
     let mut bext: Option<BextChunk> = None;
+    // Typed cue-points / playlist / associated-data-list views, populated
+    // from the `cue `, `plst` and `LIST adtl` chunks (RIFF MCI §3). The
+    // first well-formed occurrence of each wins.
+    let mut cue: Option<CueChunk> = None;
+    let mut plst: Option<PlaylistChunk> = None;
+    let mut adtl: Option<AdtlChunk> = None;
     // RF64/BW64 ds64 (EBU Tech 3306 §3 / Annex A.2): mandatory first
     // chunk after the form header when the magic is RF64 or BW64;
     // otherwise must be absent.
@@ -529,6 +535,12 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
                         }
                     }
                 } else {
+                    if buf.len() >= 4 && &buf[0..4] == b"adtl" && adtl.is_none() {
+                        let parsed = AdtlChunk::parse(&buf[4..]);
+                        if !parsed.entries.is_empty() {
+                            adtl = Some(parsed);
+                        }
+                    }
                     parse_list_chunk(&buf, &mut metadata);
                 }
                 if size % 2 == 1 {
@@ -547,6 +559,9 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
                 let mut buf = vec![0u8; size as usize];
                 input.read_exact(&mut buf)?;
                 parse_cue_chunk(&buf, &mut metadata);
+                if cue.is_none() {
+                    cue = CueChunk::parse(&buf);
+                }
                 if size % 2 == 1 {
                     input.seek(SeekFrom::Current(1))?;
                 }
@@ -555,6 +570,9 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
                 let mut buf = vec![0u8; size as usize];
                 input.read_exact(&mut buf)?;
                 parse_plst_chunk(&buf, &mut metadata);
+                if plst.is_none() {
+                    plst = PlaylistChunk::parse(&buf);
+                }
                 if size % 2 == 1 {
                     input.seek(SeekFrom::Current(1))?;
                 }
@@ -669,9 +687,19 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
                 }
             }
             b"data" => {
-                data_offset = Some(input.stream_position()?);
-                data_size = Some(size);
-                break;
+                // The `data` chunk is no longer the scan terminator:
+                // cue / plst / LIST adtl chunks are commonly placed
+                // *after* the waveform (RIFF MCI §3 lists them among the
+                // optional `<other-ck>` which may follow `data`). Record
+                // the payload anchor on the first `data` chunk, then seek
+                // over its (word-aligned) body and keep walking so the
+                // trailing metadata chunks are parsed too.
+                if data_offset.is_none() {
+                    data_offset = Some(input.stream_position()?);
+                    data_size = Some(size);
+                }
+                let pad = size + (size % 2);
+                input.seek(SeekFrom::Current(pad as i64))?;
             }
             _ => {
                 let pad = size + (size % 2);
@@ -791,6 +819,9 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
         acid,
         chna,
         bext,
+        cue,
+        plst,
+        adtl,
     })
 }
 
@@ -1218,6 +1249,489 @@ fn parse_plst_chunk(buf: &[u8], out: &mut Vec<(String, String)>) {
         out.push((format!("wav:plst.{i}.cue_id"), dw_name.to_string()));
         out.push((format!("wav:plst.{i}.length"), dw_length.to_string()));
         out.push((format!("wav:plst.{i}.loops"), dw_loops.to_string()));
+    }
+}
+
+/// A single cue-point record from a `cue ` chunk.
+///
+/// Layout per `docs/container/riff/metadata/microsoft-riffmci.pdf` §3
+/// "Cue-Points Chunk" — a fixed 24-byte struct:
+///
+/// ```text
+/// <cue-point> -> struct {
+///     DWORD  dwName;        // unique id, referenced by plst/adtl
+///     DWORD  dwPosition;    // sample position in the play order
+///     FOURCC fccChunk;      // 'data' or 'slnt' (for wavl LIST forms)
+///     DWORD  dwChunkStart;  // byte offset of fccChunk within wavl LIST
+///     DWORD  dwBlockStart;  // byte offset of enclosing block
+///     DWORD  dwSampleOffset;// sample offset within block
+/// }
+/// ```
+///
+/// For the common single-`data`-chunk WAVE file, `fcc_chunk` is
+/// `*b"data"`, `chunk_start` and `block_start` are `0`, and
+/// `sample_offset` carries the sample position of the cue point
+/// relative to the start of the `data` chunk (RIFF MCI §3 "Examples of
+/// File Position Values", row "Within PCM data").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CuePoint {
+    /// `dwName` — unique identifier; `plst`/`adtl` records reference a
+    /// cue point by this value.
+    pub name: u32,
+    /// `dwPosition` — sequential sample number within the play order.
+    pub position: u32,
+    /// `fccChunk` — the chunk ID (`*b"data"` or `*b"slnt"`) that
+    /// contains the cue point.
+    pub fcc_chunk: [u8; 4],
+    /// `dwChunkStart` — byte offset of `fcc_chunk`'s start relative to
+    /// the data section of the enclosing `wavl` LIST (`0` for a
+    /// single-`data` file).
+    pub chunk_start: u32,
+    /// `dwBlockStart` — byte offset of the start of the block
+    /// containing the position (`0` for a single-`data` file).
+    pub block_start: u32,
+    /// `dwSampleOffset` — sample offset of the cue point relative to
+    /// the start of the block.
+    pub sample_offset: u32,
+}
+
+impl CuePoint {
+    /// On-wire size of a single cue-point record (RIFF MCI §3).
+    pub const REC_LEN: usize = 24;
+
+    /// Build a cue point for the common single-`data`-chunk WAVE file:
+    /// `fcc_chunk = b"data"`, `chunk_start = block_start = 0`, and the
+    /// supplied `sample_offset` (which equals `position` in that
+    /// layout).
+    pub fn at_sample(name: u32, sample: u32) -> Self {
+        CuePoint {
+            name,
+            position: sample,
+            fcc_chunk: *b"data",
+            chunk_start: 0,
+            block_start: 0,
+            sample_offset: sample,
+        }
+    }
+
+    /// Parse one 24-byte cue-point record. Returns `None` when fewer
+    /// than 24 bytes are available.
+    pub fn parse(buf: &[u8]) -> Option<CuePoint> {
+        if buf.len() < Self::REC_LEN {
+            return None;
+        }
+        let r = |o: usize| u32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
+        Some(CuePoint {
+            name: r(0),
+            position: r(4),
+            fcc_chunk: [buf[8], buf[9], buf[10], buf[11]],
+            chunk_start: r(12),
+            block_start: r(16),
+            sample_offset: r(20),
+        })
+    }
+
+    /// Serialise the 24-byte cue-point record (exact inverse of
+    /// [`Self::parse`]).
+    pub fn to_bytes(&self) -> [u8; 24] {
+        let mut out = [0u8; 24];
+        out[0..4].copy_from_slice(&self.name.to_le_bytes());
+        out[4..8].copy_from_slice(&self.position.to_le_bytes());
+        out[8..12].copy_from_slice(&self.fcc_chunk);
+        out[12..16].copy_from_slice(&self.chunk_start.to_le_bytes());
+        out[16..20].copy_from_slice(&self.block_start.to_le_bytes());
+        out[20..24].copy_from_slice(&self.sample_offset.to_le_bytes());
+        out
+    }
+}
+
+/// A typed view of a `cue ` (cue-points) chunk — the structured
+/// counterpart to the read-only `wav:cue.*` metadata keys.
+///
+/// `cue ` carries a count-prefixed table of [`CuePoint`] records
+/// (RIFF MCI §3 "Cue-Points Chunk"). The body is `4 + N*24` bytes,
+/// always even, so the muxer never needs a word-alignment pad byte.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CueChunk {
+    /// The cue-point table, in file order.
+    pub points: Vec<CuePoint>,
+}
+
+impl CueChunk {
+    /// Build a `cue ` chunk from a list of cue points.
+    pub fn new(points: Vec<CuePoint>) -> Self {
+        CueChunk { points }
+    }
+
+    /// Parse a `cue ` chunk body (`dwCuePoints` count prefix followed
+    /// by the cue-point table). A `dwCuePoints` count exceeding what
+    /// the body actually carries is clamped to the records that fit
+    /// (defensive against writers that lie about the count). A body
+    /// shorter than the 4-byte count header returns `None`.
+    pub fn parse(buf: &[u8]) -> Option<CueChunk> {
+        if buf.len() < 4 {
+            return None;
+        }
+        let claimed = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        let body = &buf[4..];
+        let fits = (body.len() / CuePoint::REC_LEN) as u32;
+        let count = claimed.min(fits);
+        let mut points = Vec::with_capacity(count as usize);
+        for i in 0..count as usize {
+            let off = i * CuePoint::REC_LEN;
+            if let Some(p) = CuePoint::parse(&body[off..]) {
+                points.push(p);
+            }
+        }
+        Some(CueChunk { points })
+    }
+
+    /// On-wire body length (`4 + N*24` bytes — always even).
+    pub fn body_len(&self) -> usize {
+        4 + self.points.len() * CuePoint::REC_LEN
+    }
+
+    /// Serialise the `cue ` chunk body (count prefix + cue-point
+    /// table). Exact inverse of [`Self::parse`].
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.body_len());
+        out.extend_from_slice(&(self.points.len() as u32).to_le_bytes());
+        for p in &self.points {
+            out.extend_from_slice(&p.to_bytes());
+        }
+        out
+    }
+}
+
+/// A single play-segment record from a `plst` (playlist) chunk.
+///
+/// Layout per `docs/container/riff/metadata/microsoft-riffmci.pdf` §3
+/// "Playlist Chunk" — a fixed 12-byte struct:
+///
+/// ```text
+/// <play-segment> -> struct {
+///     DWORD dwName;   // cue-point id (must match a <cue-ck> entry)
+///     DWORD dwLength; // section length in samples
+///     DWORD dwLoops;  // play count
+/// }
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlaylistSegment {
+    /// `dwName` — the cue-point id this segment plays from; must match
+    /// a [`CuePoint::name`] in the file's `cue ` table.
+    pub cue_id: u32,
+    /// `dwLength` — length of the section in samples.
+    pub length: u32,
+    /// `dwLoops` — number of times to play the section.
+    pub loops: u32,
+}
+
+impl PlaylistSegment {
+    /// On-wire size of a single play-segment record (RIFF MCI §3).
+    pub const REC_LEN: usize = 12;
+
+    /// Parse one 12-byte play-segment record. Returns `None` when
+    /// fewer than 12 bytes are available.
+    pub fn parse(buf: &[u8]) -> Option<PlaylistSegment> {
+        if buf.len() < Self::REC_LEN {
+            return None;
+        }
+        let r = |o: usize| u32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
+        Some(PlaylistSegment {
+            cue_id: r(0),
+            length: r(4),
+            loops: r(8),
+        })
+    }
+
+    /// Serialise the 12-byte play-segment record (exact inverse of
+    /// [`Self::parse`]).
+    pub fn to_bytes(&self) -> [u8; 12] {
+        let mut out = [0u8; 12];
+        out[0..4].copy_from_slice(&self.cue_id.to_le_bytes());
+        out[4..8].copy_from_slice(&self.length.to_le_bytes());
+        out[8..12].copy_from_slice(&self.loops.to_le_bytes());
+        out
+    }
+}
+
+/// A typed view of a `plst` (playlist) chunk — the structured
+/// counterpart to the read-only `wav:plst.*` metadata keys.
+///
+/// `plst` carries a count-prefixed table of [`PlaylistSegment`]
+/// records (RIFF MCI §3 "Playlist Chunk"). The body is `4 + N*12`
+/// bytes, always even.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PlaylistChunk {
+    /// The play-segment table, in file order.
+    pub segments: Vec<PlaylistSegment>,
+}
+
+impl PlaylistChunk {
+    /// Build a `plst` chunk from a list of play segments.
+    pub fn new(segments: Vec<PlaylistSegment>) -> Self {
+        PlaylistChunk { segments }
+    }
+
+    /// Parse a `plst` chunk body. A `dwSegments` count exceeding what
+    /// the body carries is clamped; a body shorter than the 4-byte
+    /// count header returns `None`.
+    pub fn parse(buf: &[u8]) -> Option<PlaylistChunk> {
+        if buf.len() < 4 {
+            return None;
+        }
+        let claimed = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        let body = &buf[4..];
+        let fits = (body.len() / PlaylistSegment::REC_LEN) as u32;
+        let count = claimed.min(fits);
+        let mut segments = Vec::with_capacity(count as usize);
+        for i in 0..count as usize {
+            let off = i * PlaylistSegment::REC_LEN;
+            if let Some(s) = PlaylistSegment::parse(&body[off..]) {
+                segments.push(s);
+            }
+        }
+        Some(PlaylistChunk { segments })
+    }
+
+    /// On-wire body length (`4 + N*12` bytes — always even).
+    pub fn body_len(&self) -> usize {
+        4 + self.segments.len() * PlaylistSegment::REC_LEN
+    }
+
+    /// Serialise the `plst` chunk body. Exact inverse of
+    /// [`Self::parse`].
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.body_len());
+        out.extend_from_slice(&(self.segments.len() as u32).to_le_bytes());
+        for s in &self.segments {
+            out.extend_from_slice(&s.to_bytes());
+        }
+        out
+    }
+}
+
+/// One entry of a `LIST adtl` (Associated Data List) chunk.
+///
+/// Layout per `docs/container/riff/metadata/microsoft-riffmci.pdf` §3
+/// "Associated Data Chunk". Each variant attaches text or metadata to
+/// a cue point identified by `dwName` (which must match a
+/// [`CuePoint::name`] in the file's `cue ` table):
+///
+/// - `labl( <dwName:DWORD> <data:ZSTR> )` — a label/title.
+/// - `note( <dwName:DWORD> <data:ZSTR> )` — comment text.
+/// - `ltxt( <dwName> <dwSampleLength> <dwPurpose> <wCountry> <wLanguage>
+///   <wDialect> <wCodePage> <data:BYTE>... )` — text spanning a
+///   `dwSampleLength`-sample segment, qualified by the CSET-style
+///   country / language / dialect / code-page fields.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AdtlEntry {
+    /// `labl` — a label/title for a cue point.
+    Label {
+        /// `dwName` — the cue-point id this label is attached to.
+        name: u32,
+        /// NUL-terminated label text (stored without the terminator).
+        text: String,
+    },
+    /// `note` — comment text for a cue point.
+    Note {
+        /// `dwName` — the cue-point id this note is attached to.
+        name: u32,
+        /// NUL-terminated comment text (stored without the terminator).
+        text: String,
+    },
+    /// `ltxt` — text associated with a `sample_length`-sample segment.
+    LabeledText {
+        /// `dwName` — the cue-point id this segment is anchored to.
+        name: u32,
+        /// `dwSampleLength` — number of samples the segment spans.
+        sample_length: u32,
+        /// `dwPurpose` — FOURCC purpose code (e.g. `*b"scrp"` for
+        /// script text, `*b"capt"` for closed-caption text).
+        purpose: [u8; 4],
+        /// `wCountry` — country code (RIFF MCI Chapter 2 table; `0` =
+        /// default).
+        country: u16,
+        /// `wLanguage` — language code (RIFF MCI Chapter 2 table).
+        language: u16,
+        /// `wDialect` — dialect code (RIFF MCI Chapter 2 table).
+        dialect: u16,
+        /// `wCodePage` — code page for the text payload.
+        code_page: u16,
+        /// The text payload (stored without any trailing NUL).
+        text: String,
+    },
+}
+
+impl AdtlEntry {
+    /// The sub-chunk FOURCC for this entry (`labl` / `note` / `ltxt`).
+    fn fourcc(&self) -> &'static [u8; 4] {
+        match self {
+            AdtlEntry::Label { .. } => b"labl",
+            AdtlEntry::Note { .. } => b"note",
+            AdtlEntry::LabeledText { .. } => b"ltxt",
+        }
+    }
+
+    /// On-wire body length (excluding the 8-byte sub-chunk header and
+    /// any word-alignment pad).
+    fn body_len(&self) -> usize {
+        match self {
+            AdtlEntry::Label { text, .. } | AdtlEntry::Note { text, .. } => 4 + text.len() + 1,
+            AdtlEntry::LabeledText { text, .. } => 20 + text.len(),
+        }
+    }
+
+    /// Serialise this entry's sub-chunk body (without the 8-byte
+    /// header). `labl`/`note` bodies are NUL-terminated; `ltxt` is the
+    /// 20-byte fixed header followed by the raw (un-terminated) text.
+    fn body_bytes(&self) -> Vec<u8> {
+        match self {
+            AdtlEntry::Label { name, text } | AdtlEntry::Note { name, text } => {
+                let mut out = Vec::with_capacity(4 + text.len() + 1);
+                out.extend_from_slice(&name.to_le_bytes());
+                out.extend_from_slice(text.as_bytes());
+                out.push(0); // ZSTR terminator
+                out
+            }
+            AdtlEntry::LabeledText {
+                name,
+                sample_length,
+                purpose,
+                country,
+                language,
+                dialect,
+                code_page,
+                text,
+            } => {
+                let mut out = Vec::with_capacity(20 + text.len());
+                out.extend_from_slice(&name.to_le_bytes());
+                out.extend_from_slice(&sample_length.to_le_bytes());
+                out.extend_from_slice(purpose);
+                out.extend_from_slice(&country.to_le_bytes());
+                out.extend_from_slice(&language.to_le_bytes());
+                out.extend_from_slice(&dialect.to_le_bytes());
+                out.extend_from_slice(&code_page.to_le_bytes());
+                out.extend_from_slice(text.as_bytes());
+                out
+            }
+        }
+    }
+
+    /// Parse one `labl` / `note` / `ltxt` sub-chunk body (the bytes
+    /// after the 8-byte sub-chunk header). Returns `None` for an
+    /// unrecognised id or a truncated body.
+    fn parse(id: &[u8; 4], body: &[u8]) -> Option<AdtlEntry> {
+        match id {
+            b"labl" | b"note" if body.len() >= 4 => {
+                let name = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+                let raw = &body[4..];
+                let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+                let text = String::from_utf8_lossy(&raw[..end]).into_owned();
+                if id == b"labl" {
+                    Some(AdtlEntry::Label { name, text })
+                } else {
+                    Some(AdtlEntry::Note { name, text })
+                }
+            }
+            b"ltxt" if body.len() >= 20 => {
+                let r32 =
+                    |o: usize| u32::from_le_bytes([body[o], body[o + 1], body[o + 2], body[o + 3]]);
+                let r16 = |o: usize| u16::from_le_bytes([body[o], body[o + 1]]);
+                let raw = &body[20..];
+                let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+                Some(AdtlEntry::LabeledText {
+                    name: r32(0),
+                    sample_length: r32(4),
+                    purpose: [body[8], body[9], body[10], body[11]],
+                    country: r16(12),
+                    language: r16(14),
+                    dialect: r16(16),
+                    code_page: r16(18),
+                    text: String::from_utf8_lossy(&raw[..end]).into_owned(),
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+/// A typed view of a `LIST adtl` (Associated Data List) chunk — the
+/// structured counterpart to the read-only `wav:adtl.*` metadata keys.
+///
+/// The list groups [`AdtlEntry`] records (`labl`/`note`/`ltxt`) that
+/// annotate the cue points declared by a sibling `cue ` chunk (RIFF
+/// MCI §3 "Associated Data Chunk"). The `file` sub-chunk (embedded
+/// media) is parsed for its `dwName`/`dwMedType` accounting through
+/// the metadata path but is not represented as a typed [`AdtlEntry`]
+/// variant (its payload is opaque to this layer).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AdtlChunk {
+    /// The associated-data entries, in file order.
+    pub entries: Vec<AdtlEntry>,
+}
+
+impl AdtlChunk {
+    /// Build an `adtl` list from a vector of entries.
+    pub fn new(entries: Vec<AdtlEntry>) -> Self {
+        AdtlChunk { entries }
+    }
+
+    /// Parse a `LIST adtl` body (the bytes *after* the 4-byte `adtl`
+    /// list type). Unrecognised / truncated sub-chunks are skipped.
+    pub fn parse(buf: &[u8]) -> AdtlChunk {
+        let mut entries = Vec::new();
+        let mut i = 0usize;
+        while i + 8 <= buf.len() {
+            let id: [u8; 4] = [buf[i], buf[i + 1], buf[i + 2], buf[i + 3]];
+            let size =
+                u32::from_le_bytes([buf[i + 4], buf[i + 5], buf[i + 6], buf[i + 7]]) as usize;
+            i += 8;
+            if i + size > buf.len() {
+                break;
+            }
+            if let Some(entry) = AdtlEntry::parse(&id, &buf[i..i + size]) {
+                entries.push(entry);
+            }
+            i += size;
+            if size % 2 == 1 {
+                i += 1; // word-alignment pad
+            }
+        }
+        AdtlChunk { entries }
+    }
+
+    /// On-wire body length of the whole `LIST adtl` chunk *body* — the
+    /// 4-byte `adtl` list type plus, for each sub-chunk, its 8-byte
+    /// header, body bytes and word-alignment pad. This is the value
+    /// written into the enclosing `LIST` chunk's size field.
+    pub fn list_body_len(&self) -> usize {
+        let mut len = 4; // "adtl" list type
+        for e in &self.entries {
+            let body = e.body_len();
+            len += 8 + body + (body % 2);
+        }
+        len
+    }
+
+    /// Serialise the whole `LIST adtl` chunk *body*: the `adtl` list
+    /// type followed by each entry's sub-chunk (`id` + size + body +
+    /// word-alignment pad). The caller prepends the `LIST` id and the
+    /// total size. Exact inverse of [`Self::parse`] modulo the list
+    /// type prefix.
+    pub fn to_list_body(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.list_body_len());
+        out.extend_from_slice(b"adtl");
+        for e in &self.entries {
+            let body = e.body_bytes();
+            out.extend_from_slice(e.fourcc());
+            out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            out.extend_from_slice(&body);
+            if body.len() % 2 == 1 {
+                out.push(0); // word-alignment pad
+            }
+        }
+        out
     }
 }
 
@@ -3143,6 +3657,9 @@ pub struct WavDemuxer {
     acid: Option<AcidChunk>,
     chna: Option<ChnaChunk>,
     bext: Option<BextChunk>,
+    cue: Option<CueChunk>,
+    plst: Option<PlaylistChunk>,
+    adtl: Option<AdtlChunk>,
 }
 
 impl WavDemuxer {
@@ -3226,6 +3743,35 @@ impl WavDemuxer {
     /// [`WavMuxOptions::with_bext`].
     pub fn bext(&self) -> Option<&BextChunk> {
         self.bext.as_ref()
+    }
+
+    /// Typed view of the `cue ` (cue-points) chunk when the file
+    /// carried one with a well-formed body (RIFF MCI §3 "Cue-Points
+    /// Chunk"). `None` when the chunk is absent or shorter than the
+    /// 4-byte count pre-amble. Chunks placed *after* the `data`
+    /// waveform are read too — the same data is mirrored under the
+    /// `wav:cue.*` metadata keys for `dyn Demuxer` consumers, and is
+    /// re-emittable via [`WavMuxOptions::with_cue`].
+    pub fn cue(&self) -> Option<&CueChunk> {
+        self.cue.as_ref()
+    }
+
+    /// Typed view of the `plst` (playlist) chunk when the file carried
+    /// one with a well-formed body (RIFF MCI §3 "Playlist Chunk").
+    /// `None` when absent or truncated. Mirrored under the
+    /// `wav:plst.*` metadata keys; re-emittable via
+    /// [`WavMuxOptions::with_plst`].
+    pub fn plst(&self) -> Option<&PlaylistChunk> {
+        self.plst.as_ref()
+    }
+
+    /// Typed view of the `LIST adtl` (Associated Data List) chunk when
+    /// the file carried one with at least one well-formed
+    /// `labl`/`note`/`ltxt` entry (RIFF MCI §3 "Associated Data
+    /// Chunk"). `None` when absent. Mirrored under the `wav:adtl.*`
+    /// metadata keys; re-emittable via [`WavMuxOptions::with_adtl`].
+    pub fn adtl(&self) -> Option<&AdtlChunk> {
+        self.adtl.as_ref()
     }
 }
 
