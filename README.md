@@ -95,8 +95,19 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework �
   non-PCM `wFormatTag` (G.711 A-law/μ-law and the EXTENSIBLE escape
   hatch) per spec, and skips it for plain PCM where it is optional.
   The `cue ` chunk, `plst` (Playlist)
-  chunk and `LIST adtl` (Associated Data List) sub-chunks are parsed
-  per Microsoft RIFF MCI §3 — cue points surface as `wav:cue.count`
+  chunk and `LIST adtl` (Associated Data List) sub-chunks are
+  **read+write symmetric** per Microsoft RIFF MCI §3 via the typed
+  `CuePoint`/`CueChunk`, `PlaylistSegment`/`PlaylistChunk` and
+  `AdtlEntry`/`AdtlChunk` (`labl`/`note`/`ltxt`) surfaces — byte-exact
+  `parse`/`to_bytes`, `WavMuxOptions::with_cue` / `with_plst` /
+  `with_adtl` writers (emitted in the trailer after `data`, the
+  conventional placement for sample-position-referencing chunks), and
+  `WavDemuxer::cue()` / `plst()` / `adtl()` accessors. Because these
+  chunks are commonly written *after* the waveform, the demuxer no
+  longer stops scanning at `data`: it seeks over the word-aligned
+  `data` body and walks the remaining chunks to EOF. The same data is
+  also mirrored through the read-only metadata keys — cue points
+  surface as `wav:cue.count`
   plus per-point `wav:cue.<dwName>.position` / `.fcc_chunk` /
   `.chunk_start` / `.block_start` / `.sample_offset`; playlist
   segments surface as `wav:plst.count` plus per-segment
