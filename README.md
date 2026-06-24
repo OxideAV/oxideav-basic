@@ -164,7 +164,39 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework �
   Compressed payloads are not inflated at the container layer (RFC 1952
   decode is left to a higher-level ADM-aware consumer); bodies shorter
   than the 2-byte `fmtType` header are skipped-as-opaque (only
-  `body_len`). The `_PMX`
+  `body_len`). The `<sxml>` chunk (ITU-R BS.2088-2 §7) is the
+  *serialized*-XML third ADM carrier alongside `<axml>` (uncompressed
+  whole document) and `<bxml>` (compressed whole document) — it is
+  supported on BOTH the read and write sides through the typed
+  `wav::SxmlChunk` / `wav::SubXmlChunk` / `wav::AlignmentPoint` structs.
+  The body is a 14-byte fixed prefix (`fmtType` WORD + 64-bit
+  `subXMLCkTbSize` + `nSubXMLChunks`) followed by an array of
+  `SubXMLChunk` records — each a `subXMLChunkSize`/`nSamplesSubDataChunk`
+  header plus an `xmlData[]` payload binding a *run* of audio samples to
+  an XML fragment, so time-variant / Serial-ADM (BS.2125) metadata can
+  be streamed contiguously with the audio — then an optional
+  `nAlignmentPoints` count and a table of 16-byte `AlignmentPoint`
+  records (64-bit byte-offset + 64-bit sample timestamp) for
+  timestamp-based random access. `parse`/`to_bytes` are byte-lossless
+  (the on-wire `subXMLCkTbSize` is carried verbatim;
+  `computed_sub_table_byte_size` returns the canonical value for
+  writers). The demuxer surfaces `wav:sxml.fmt_type` (`0x%04X`),
+  `wav:sxml.compression` (`none`/`gzip`, omitted for private/future
+  codes), `wav:sxml.sub_chunk_count`, `wav:sxml.alignment_point_count`,
+  `wav:sxml.total_samples` (summed `nSamplesSubDataChunk`),
+  `wav:sxml.body_len` (always, so a malformed/reserved body is
+  observable), and per-record `wav:sxml.<n>.samples` / `.xml_len` plus —
+  only for the uncompressed `fmtType == 0x0000` form — `.xml` (text
+  trimmed at the first NUL + surrounding whitespace, like `<axml>`);
+  gzip (`0x0001`) and private codes surface header fields only. The
+  typed view is reachable via `WavDemuxer::sxml()` and the muxer writes
+  the chunk via `WavMuxOptions::with_sxml` (emitted ahead of `chna` /
+  `data` per the §2.1 recommended order, RIFF §2 word-aligned). Because
+  `<sxml>` (like `chna`) marks an ADM-carrying file, a forced/promoted
+  64-bit muxer output uses the `BW64` top-level magic when either is
+  present. Bodies shorter than the 14-byte prefix, or whose declared
+  counts overrun the chunk, are skipped-as-opaque (only `body_len`);
+  the mux→demux round-trip is pinned in tests. The `_PMX`
   chunk (Adobe XMP packet, the WAV/AVI carrier for an XMP serialised
   packet — FOURCC is little-endian "XMP_" reversed; catalogued in
   exiftool-riff-tags.html § "RIFF Main tags" entry `'_PMX'`, scope
