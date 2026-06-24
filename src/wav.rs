@@ -4262,6 +4262,7 @@ fn open_muxer(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Box<
         extensible: None,
         acid: None,
         chna: None,
+        sxml: None,
         bext: None,
         cue: None,
         plst: None,
@@ -4294,6 +4295,7 @@ pub struct WavMuxOptions {
     extensible: Option<ExtensibleOpts>,
     acid: Option<AcidChunk>,
     chna: Option<ChnaChunk>,
+    sxml: Option<SxmlChunk>,
     bext: Option<BextChunk>,
     cue: Option<CueChunk>,
     plst: Option<PlaylistChunk>,
@@ -4389,6 +4391,18 @@ impl WavMuxOptions {
         self
     }
 
+    /// Emit a BW64/ADM `<sxml>` (serialized-XML) chunk ahead of the
+    /// `data` chunk (layout per [`SxmlChunk`] / ITU-R BS.2088-2 §7).
+    /// The body length is even for the fixed fields; an odd-length
+    /// `xml_data` payload triggers the RIFF §2 word-alignment pad byte.
+    /// Like `chna`, the presence of an `sxml` chunk marks the file as
+    /// ADM-carrying, so a forced/promoted 64-bit file uses the `BW64`
+    /// top-level magic.
+    pub fn with_sxml(mut self, sxml: SxmlChunk) -> Self {
+        self.sxml = Some(sxml);
+        self
+    }
+
     /// Emit a BWF `bext` (Broadcast Audio Extension) chunk ahead of the
     /// `data` chunk (602-byte fixed struct + optional `CodingHistory`
     /// tail — see [`BextChunk`] / EBU Tech 3285 v2 §2.3). When the body
@@ -4481,6 +4495,7 @@ pub fn open_muxer_with(
         extensible: opts.extensible,
         acid: opts.acid,
         chna: opts.chna,
+        sxml: opts.sxml,
         bext: opts.bext,
         cue: opts.cue,
         plst: opts.plst,
@@ -4578,6 +4593,9 @@ struct WavMuxer {
     /// a `chna` chunk ahead of `data` when present (ITU-R BS.2088-2
     /// §8.1).
     chna: Option<ChnaChunk>,
+    /// Caller-supplied BW64/ADM serialized-XML metadata, emitted as an
+    /// `sxml` chunk ahead of `data` when present (ITU-R BS.2088-2 §7).
+    sxml: Option<SxmlChunk>,
     /// Caller-supplied BWF Broadcast Audio Extension metadata, emitted as
     /// a `bext` chunk ahead of `data` when present (EBU Tech 3285 v2
     /// §2.3).
@@ -4744,6 +4762,22 @@ impl Muxer for WavMuxer {
             self.output.write_all(&acid.to_bytes())?;
         }
 
+        // `sxml` chunk: caller-supplied BW64/ADM serialized-XML records
+        // (ITU-R BS.2088-2 §7). Emitted ahead of `chna`/`data`, matching
+        // the §2.1 recommended order (`<axml>/<bxml>/<sxml>` then
+        // `<chna>` then `<data>`). The fixed fields are even-sized; an
+        // odd-length `xml_data` payload makes the body odd, so a RIFF §2
+        // word-alignment pad byte is written when needed.
+        if let Some(sxml) = &self.sxml {
+            let body = sxml.to_bytes();
+            self.output.write_all(b"sxml")?;
+            self.output.write_all(&(body.len() as u32).to_le_bytes())?;
+            self.output.write_all(&body)?;
+            if body.len() % 2 == 1 {
+                self.output.write_all(&[0u8])?;
+            }
+        }
+
         // `chna` chunk: caller-supplied BW64/ADM channel-allocation
         // records (ITU-R BS.2088-2 §8.1). The body is `4 + N*40` bytes,
         // always even, so no inter-chunk pad byte is needed.
@@ -4885,8 +4919,9 @@ impl Muxer for WavMuxer {
                 self.output.write_all(&SIZE64_SENTINEL.to_le_bytes())?;
             }
 
-            // Top-level magic: BW64 for ADM (chna present) else RF64.
-            let magic: &[u8; 4] = if self.chna.is_some() {
+            // Top-level magic: BW64 for ADM (a `chna` or `sxml` chunk
+            // present marks an ADM-carrying file, §2.1) else RF64.
+            let magic: &[u8; 4] = if self.chna.is_some() || self.sxml.is_some() {
                 b"BW64"
             } else {
                 b"RF64"
@@ -6825,6 +6860,123 @@ mod tests {
         let plain = wav_with_smpl_and_inst(None, None);
         let dmx = open_wav_demuxer(Box::new(Cursor::new(plain))).unwrap();
         assert_eq!(dmx.chna(), None);
+    }
+
+    /// Write→read round-trip through the public muxer/demuxer paths:
+    /// `WavMuxOptions::with_sxml` emits the `sxml` chunk ahead of `data`,
+    /// the demuxer's typed accessor + metadata keys return identical
+    /// values, and the PCM payload is untouched (ITU-R BS.2088-2 §7).
+    #[test]
+    fn sxml_round_trip() {
+        let s0 = SubXmlChunk {
+            n_samples: 480,
+            xml_data: b"<sadm:frame><o id=\"AO_1001\"/></sadm:frame>".to_vec(),
+        };
+        let s1 = SubXmlChunk {
+            n_samples: 480,
+            xml_data: b"<sadm:frame><o id=\"AO_1002\"/></sadm:frame>".to_vec(),
+        };
+        let sxml = SxmlChunk {
+            fmt_type: 0x0000,
+            sub_table_byte_size: 4 + s0.encoded_len() as u64 + s1.encoded_len() as u64,
+            sub_chunks: vec![s0, s1],
+            alignment_points: vec![AlignmentPoint {
+                byte_offset: 14,
+                n_samples: 0,
+            }],
+        };
+        let payload: Vec<u8> = (0..400u32).flat_map(|i| (i as i16).to_le_bytes()).collect();
+        let stream = make_stream(SampleFormat::S16, 1, 48_000);
+        let opts = WavMuxOptions::default().with_sxml(sxml.clone());
+        let bytes = mux_to_bytes(&stream, &payload, opts, "sxml-rt");
+        // The serialized chunk (header + body) appears verbatim ahead of
+        // `data` (every xml_data here is even-length, so no pad byte).
+        let body = sxml.to_bytes();
+        let mut chunk = b"sxml".to_vec();
+        chunk.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        chunk.extend_from_slice(&body);
+        assert!(bytes.windows(chunk.len()).any(|w| w == &chunk[..]));
+
+        use std::io::Cursor;
+        let mut dmx = open_wav_demuxer(Box::new(Cursor::new(bytes))).unwrap();
+        assert_eq!(dmx.sxml(), Some(&sxml));
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:sxml.sub_chunk_count"), Some(&"2".to_string()));
+        assert_eq!(md.get("wav:sxml.total_samples"), Some(&"960".to_string()));
+        assert_eq!(
+            md.get("wav:sxml.0.xml"),
+            Some(&"<sadm:frame><o id=\"AO_1001\"/></sadm:frame>".to_string())
+        );
+        let mut out = Vec::new();
+        loop {
+            match dmx.next_packet() {
+                Ok(p) => out.extend_from_slice(&p.data),
+                Err(Error::Eof) => break,
+                Err(e) => panic!("demux error: {e}"),
+            }
+        }
+        assert_eq!(out, payload);
+
+        // No `sxml` chunk → typed accessor is None.
+        let plain = wav_with_smpl_and_inst(None, None);
+        let dmx = open_wav_demuxer(Box::new(Cursor::new(plain))).unwrap();
+        assert_eq!(dmx.sxml(), None);
+    }
+
+    /// An odd-length `xml_data` payload makes the `sxml` body odd; the
+    /// muxer writes the RIFF §2 word-alignment pad byte after it, and the
+    /// demuxer reads the chunk back identically (pad not absorbed into
+    /// the payload). The trailing `data` chunk still resolves.
+    #[test]
+    fn sxml_odd_payload_word_aligned() {
+        let s0 = SubXmlChunk {
+            n_samples: 100,
+            // 5-byte payload → SubXMLChunk encoded_len = 13 (odd) →
+            // overall body odd → pad byte required.
+            xml_data: b"<x/>!".to_vec(),
+        };
+        let sxml = SxmlChunk {
+            fmt_type: 0x0000,
+            sub_table_byte_size: 4 + s0.encoded_len() as u64,
+            sub_chunks: vec![s0],
+            alignment_points: vec![],
+        };
+        assert_eq!(sxml.body_len() % 2, 1);
+        let payload: Vec<u8> = vec![0u8; 80];
+        let stream = make_stream(SampleFormat::S16, 1, 48_000);
+        let opts = WavMuxOptions::default().with_sxml(sxml.clone());
+        let bytes = mux_to_bytes(&stream, &payload, opts, "sxml-odd");
+        let dmx = open_demux_from_bytes(bytes);
+        // Round-trips through the metadata view despite the odd body.
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:sxml.0.xml"), Some(&"<x/>!".to_string()));
+        assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
+    }
+
+    /// A forced 64-bit file carrying only an `sxml` chunk (no `chna`)
+    /// uses the `BW64` top-level magic — `sxml` is an ADM marker per
+    /// §2.1, exactly like `chna`.
+    #[test]
+    fn rf64_force_with_sxml_is_bw64() {
+        let payload = vec![0u8; 2 * 50];
+        let stream = make_stream(SampleFormat::S16, 1, 48_000);
+        let sxml = SxmlChunk {
+            fmt_type: 0x0000,
+            sub_table_byte_size: 4,
+            sub_chunks: vec![],
+            alignment_points: vec![],
+        };
+        let opts = WavMuxOptions::default()
+            .with_sxml(sxml)
+            .with_rf64(Rf64Mode::Force);
+        let bytes = mux_to_bytes(&stream, &payload, opts, "bw64-force-sxml");
+        assert_eq!(&bytes[0..4], b"BW64");
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:rf64.magic"), Some(&"BW64".to_string()));
     }
 
     /// `AudioId` ADM reference classification (§1.2 prefix → kind) and the
