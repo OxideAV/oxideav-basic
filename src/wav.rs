@@ -406,6 +406,9 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
     // Typed BW64/ADM channel-allocation view, populated when a `chna`
     // chunk parses (ITU-R BS.2088-2 §8.1).
     let mut chna: Option<ChnaChunk> = None;
+    // Typed BW64/ADM serialized-XML view, populated when an `sxml` chunk
+    // parses (ITU-R BS.2088-2 §7). First well-formed occurrence wins.
+    let mut sxml: Option<SxmlChunk> = None;
     // Typed BWF Broadcast Audio Extension view, populated when a `bext`
     // chunk parses (EBU Tech 3285 v2 §2.3).
     let mut bext: Option<BextChunk> = None;
@@ -639,6 +642,21 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
                     input.seek(SeekFrom::Current(1))?;
                 }
             }
+            b"sxml" => {
+                // ITU-R BS.2088-2 §7: the serialized-XML ADM carrier.
+                // Segments the (optionally gzip) XML into per-sample-run
+                // SubXMLChunk records with an optional AlignmentPoint
+                // table for timestamp-based access.
+                let mut buf = vec![0u8; size as usize];
+                input.read_exact(&mut buf)?;
+                let parsed = parse_sxml_chunk(&buf, &mut metadata);
+                if sxml.is_none() {
+                    sxml = parsed;
+                }
+                if size % 2 == 1 {
+                    input.seek(SeekFrom::Current(1))?;
+                }
+            }
             b"_PMX" => {
                 let mut buf = vec![0u8; size as usize];
                 input.read_exact(&mut buf)?;
@@ -818,6 +836,7 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
         subformat: fmt.subformat,
         acid,
         chna,
+        sxml,
         bext,
         cue,
         plst,
@@ -2499,6 +2518,358 @@ fn parse_chna_chunk(buf: &[u8], out: &mut Vec<(String, String)>) -> Option<ChnaC
     Some(chna)
 }
 
+/// One `SubXMLChunk` record inside an `<sxml>` chunk per ITU-R
+/// BS.2088-2 §7.1 (`docs/container/riff/metadata/R-REC-BS.2088.pdf`):
+///
+/// ```text
+/// struct SubXMLChunk {
+///     DWORD subXMLChunkSize;     // bytes of xmlData (excludes the two
+///                                // leading DWORDs)
+///     DWORD nSamplesSubDataChunk;// audio samples/channel for this run
+///     CHAR  xmlData[];           // (compressed or plain) XML payload
+/// };
+/// ```
+///
+/// Per §7.2 `subXMLChunkSize` is "the size of the data section of the
+/// SubXMLChunk in bytes excluding the 8 bytes used by `subXMLChunkSize`
+/// and `nSamplesSubDataChunk`" — i.e. the `xml_data` length — and
+/// `nSamplesSubDataChunk` is "the number of audio samples per channel
+/// associated with the SubXMLChunk". The `xml_data` bytes are carried
+/// verbatim; whether they are gzip-compressed is governed by the parent
+/// chunk's `fmt_type` (§7.2), not interpreted here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubXmlChunk {
+    /// `nSamplesSubDataChunk` — audio samples per channel this record
+    /// applies to (a run contiguous with the adjacent SubXMLChunks).
+    pub n_samples: u32,
+    /// `xmlData[]` — the (optionally gzip-compressed) XML payload,
+    /// carried verbatim. Its length equals the on-wire
+    /// `subXMLChunkSize`.
+    pub xml_data: Vec<u8>,
+}
+
+impl SubXmlChunk {
+    /// Fixed `subXMLChunkSize` + `nSamplesSubDataChunk` header in bytes
+    /// (the two leading DWORDs, excluded from `subXMLChunkSize`).
+    pub const HEADER_LEN: usize = 8;
+
+    /// On-disk size of this record in bytes (header + payload).
+    pub fn encoded_len(&self) -> usize {
+        Self::HEADER_LEN + self.xml_data.len()
+    }
+
+    /// Serialize one `SubXMLChunk` record. `subXMLChunkSize` is the
+    /// `xml_data` length (excludes the two leading DWORDs, §7.2).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.encoded_len());
+        out.extend_from_slice(&(self.xml_data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&self.n_samples.to_le_bytes());
+        out.extend_from_slice(&self.xml_data);
+        out
+    }
+}
+
+/// One `AlignmentPoint` record inside an `<sxml>` chunk per ITU-R
+/// BS.2088-2 §7.1:
+///
+/// ```text
+/// struct AlignmentPoint {
+///     DWORD subXMLChunkByteOffsetLow;   // 64-bit byte offset of the
+///     DWORD subXMLChunkByteOffsetHigh;  // SubXMLChunk from the start of
+///                                       // the sxml data section
+///     DWORD nSamplesAlignPointLow;      // 64-bit sample timestamp from
+///     DWORD nSamplesAlignPointHigh;     // the start of the <data> chunk
+/// };
+/// ```
+///
+/// Per §7.2 the byte offset is measured "from the beginning of the
+/// `<sxml>` chunk excluding the 8 bytes used by `ckID` and `ckSize`"
+/// (i.e. from the start of the chunk data section), and the sample
+/// timestamp is "expressed in audio samples per channel from the
+/// beginning of the `<data>` chunk". Both are 64-bit, stored as a pair
+/// of little-endian DWORDs (`0xHHHHLLLL`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AlignmentPoint {
+    /// `subXMLChunkByteOffset` — 64-bit byte offset of a SubXMLChunk
+    /// from the start of the `<sxml>` data section.
+    pub byte_offset: u64,
+    /// `nSamplesAlignPoint` — 64-bit timestamp in audio samples per
+    /// channel from the start of the `<data>` chunk.
+    pub n_samples: u64,
+}
+
+impl AlignmentPoint {
+    /// Fixed size of one `AlignmentPoint` record (four DWORDs).
+    pub const SIZE: usize = 16;
+
+    /// Decode a 16-byte `AlignmentPoint` record. Returns `None` when the
+    /// slice is shorter than [`Self::SIZE`].
+    pub fn parse(buf: &[u8]) -> Option<AlignmentPoint> {
+        if buf.len() < Self::SIZE {
+            return None;
+        }
+        let lo_off = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as u64;
+        let hi_off = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as u64;
+        let lo_s = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]) as u64;
+        let hi_s = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]) as u64;
+        Some(AlignmentPoint {
+            byte_offset: (hi_off << 32) | lo_off,
+            n_samples: (hi_s << 32) | lo_s,
+        })
+    }
+
+    /// Serialize the 16-byte `AlignmentPoint` record (low DWORD then high
+    /// DWORD for each 64-bit field, §7.2).
+    pub fn to_bytes(&self) -> [u8; 16] {
+        let mut out = [0u8; 16];
+        out[0..4].copy_from_slice(&((self.byte_offset & 0xFFFF_FFFF) as u32).to_le_bytes());
+        out[4..8].copy_from_slice(&((self.byte_offset >> 32) as u32).to_le_bytes());
+        out[8..12].copy_from_slice(&((self.n_samples & 0xFFFF_FFFF) as u32).to_le_bytes());
+        out[12..16].copy_from_slice(&((self.n_samples >> 32) as u32).to_le_bytes());
+        out
+    }
+}
+
+/// Typed view of the BW64/ADM `<sxml>` chunk per ITU-R BS.2088-2 §7
+/// (`docs/container/riff/metadata/R-REC-BS.2088.pdf`):
+///
+/// ```text
+/// struct sxml_chunk {
+///     CHAR  ckID[4];               // {'s','x','m','l'}
+///     DWORD ckSize;                // size of the data section
+///     WORD  fmtType;               // 0x0000 = uncompressed,
+///                                  // 0x0001 = gzip (RFC 1952)
+///     DWORD subXMLCkTbSizeLow;     // 64-bit size of (nSubXMLChunks +
+///     DWORD subXMLCkTbSizeHigh;    //   SubXMLChunk table[])
+///     DWORD nSubXMLChunks;         // number of SubXMLChunk records
+///     SubXMLChunk table[];
+///     DWORD nAlignmentPoints;      // number of AlignmentPoint records
+///     AlignmentPoint table[];
+/// };
+/// ```
+///
+/// The `<sxml>` chunk is the *serialized* ADM XML carrier (alongside
+/// the uncompressed `<axml>` and compressed-whole `<bxml>` chunks, §2):
+/// it segments the XML into per-sample-run `SubXMLChunk` records so
+/// time-variant metadata (e.g. the serial ADM of ITU-R BS.2125) can be
+/// streamed contiguously with the audio, plus an optional
+/// `AlignmentPoint` table for timestamp-based random access (§7.1).
+///
+/// `sub_table_byte_size` is the on-wire `subXMLCkTbSize` field —
+/// "the size of the SubXMLChunk table[] including the 4 bytes of the
+/// `nSubXMLChunks` field" (§7.2). It is preserved verbatim so a
+/// read→write pass is byte-lossless even when a writer recorded a
+/// padded/over-provisioned value; [`Self::computed_sub_table_byte_size`]
+/// returns the size implied by the parsed records for writers that want
+/// the canonical value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SxmlChunk {
+    /// `fmtType` — compression of the `SubXMLChunk` payloads
+    /// (`0x0000` = uncompressed, `0x0001` = gzip per RFC 1952, §7.2).
+    pub fmt_type: u16,
+    /// `subXMLCkTbSize` — the on-wire 64-bit size of the SubXMLChunk
+    /// table *including* the leading `nSubXMLChunks` DWORD (§7.2),
+    /// carried verbatim for byte-lossless round-trip.
+    pub sub_table_byte_size: u64,
+    /// The `SubXMLChunk table[]` records (`nSubXMLChunks` entries).
+    pub sub_chunks: Vec<SubXmlChunk>,
+    /// The optional `AlignmentPoint table[]` records
+    /// (`nAlignmentPoints` entries; may be empty, §7.1).
+    pub alignment_points: Vec<AlignmentPoint>,
+}
+
+impl SxmlChunk {
+    /// Fixed prefix bytes before the SubXMLChunk table: `fmtType` (WORD)
+    /// plus `subXMLCkTbSizeLow`/`High` (two DWORDs) plus `nSubXMLChunks`
+    /// (DWORD) — 14 bytes total (§7.1).
+    pub const PREFIX_LEN: usize = 14;
+
+    /// Decode an `<sxml>` chunk data section (the bytes after the 8-byte
+    /// `ckID`+`ckSize` header). Returns `None` when the body is shorter
+    /// than the 14-byte fixed prefix, or when a declared count or record
+    /// length runs past the buffer (a truncated/malformed body is then
+    /// skipped-as-opaque by the caller, §7.1).
+    pub fn parse(buf: &[u8]) -> Option<SxmlChunk> {
+        if buf.len() < Self::PREFIX_LEN {
+            return None;
+        }
+        let fmt_type = u16::from_le_bytes([buf[0], buf[1]]);
+        let lo = u32::from_le_bytes([buf[2], buf[3], buf[4], buf[5]]) as u64;
+        let hi = u32::from_le_bytes([buf[6], buf[7], buf[8], buf[9]]) as u64;
+        let sub_table_byte_size = (hi << 32) | lo;
+        let n_sub = u32::from_le_bytes([buf[10], buf[11], buf[12], buf[13]]) as usize;
+
+        let mut off = Self::PREFIX_LEN;
+        let mut sub_chunks = Vec::with_capacity(n_sub);
+        for _ in 0..n_sub {
+            if off + SubXmlChunk::HEADER_LEN > buf.len() {
+                return None;
+            }
+            let sub_size =
+                u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]) as usize;
+            let n_samples =
+                u32::from_le_bytes([buf[off + 4], buf[off + 5], buf[off + 6], buf[off + 7]]);
+            let data_start = off + SubXmlChunk::HEADER_LEN;
+            let data_end = data_start.checked_add(sub_size)?;
+            if data_end > buf.len() {
+                return None;
+            }
+            sub_chunks.push(SubXmlChunk {
+                n_samples,
+                xml_data: buf[data_start..data_end].to_vec(),
+            });
+            off = data_end;
+        }
+
+        // `nAlignmentPoints` DWORD then the AlignmentPoint table[]. A
+        // body without the alignment-count DWORD is malformed (the
+        // field is mandatory in the §7.1 struct even when zero).
+        if off + 4 > buf.len() {
+            return None;
+        }
+        let n_align =
+            u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]) as usize;
+        off += 4;
+        let mut alignment_points = Vec::with_capacity(n_align);
+        for _ in 0..n_align {
+            if off + AlignmentPoint::SIZE > buf.len() {
+                return None;
+            }
+            // `parse` cannot fail here — the slice is exactly SIZE bytes.
+            if let Some(ap) = AlignmentPoint::parse(&buf[off..off + AlignmentPoint::SIZE]) {
+                alignment_points.push(ap);
+            }
+            off += AlignmentPoint::SIZE;
+        }
+
+        Some(SxmlChunk {
+            fmt_type,
+            sub_table_byte_size,
+            sub_chunks,
+            alignment_points,
+        })
+    }
+
+    /// The `subXMLCkTbSize` value implied by the parsed records: the
+    /// `nSubXMLChunks` DWORD (4 bytes) plus every `SubXMLChunk`'s
+    /// encoded length (§7.2 "including the 4 bytes of the nSubXMLChunks
+    /// field"). Writers that don't preserve an exotic on-wire value can
+    /// use this as the canonical `subXMLCkTbSize`.
+    pub fn computed_sub_table_byte_size(&self) -> u64 {
+        let records: usize = self.sub_chunks.iter().map(|s| s.encoded_len()).sum();
+        (4 + records) as u64
+    }
+
+    /// On-disk size of the chunk **data section** in bytes (the `ckSize`
+    /// value, excluding the 8-byte `ckID`+`ckSize` header). Always even
+    /// for the fixed-size fields; an odd total only arises from an
+    /// odd-length `xml_data` payload, which the muxer pads per RIFF §2.
+    pub fn body_len(&self) -> usize {
+        let subs: usize = self.sub_chunks.iter().map(|s| s.encoded_len()).sum();
+        Self::PREFIX_LEN + subs + 4 + self.alignment_points.len() * AlignmentPoint::SIZE
+    }
+
+    /// Serialize the `<sxml>` chunk data section. `subXMLCkTbSize` is
+    /// emitted from [`Self::sub_table_byte_size`] (the preserved on-wire
+    /// value) so a read→write pass is byte-lossless.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.body_len());
+        out.extend_from_slice(&self.fmt_type.to_le_bytes());
+        out.extend_from_slice(&((self.sub_table_byte_size & 0xFFFF_FFFF) as u32).to_le_bytes());
+        out.extend_from_slice(&((self.sub_table_byte_size >> 32) as u32).to_le_bytes());
+        out.extend_from_slice(&(self.sub_chunks.len() as u32).to_le_bytes());
+        for s in &self.sub_chunks {
+            out.extend_from_slice(&s.to_bytes());
+        }
+        out.extend_from_slice(&(self.alignment_points.len() as u32).to_le_bytes());
+        for ap in &self.alignment_points {
+            out.extend_from_slice(&ap.to_bytes());
+        }
+        out
+    }
+
+    /// Human-readable label for the documented `fmt_type` codes
+    /// (`none` for `0x0000`, `gzip` for `0x0001`); `None` for any
+    /// other (private / future) code so the raw `fmt_type` stays
+    /// authoritative.
+    pub fn compression_label(&self) -> Option<&'static str> {
+        match self.fmt_type {
+            0x0000 => Some("none"),
+            0x0001 => Some("gzip"),
+            _ => None,
+        }
+    }
+}
+
+/// Parse an `<sxml>` chunk body, surface `wav:sxml.*` metadata keys and
+/// return the typed view for [`WavDemuxer::sxml`]. Keys:
+///
+/// - `wav:sxml.body_len` — raw on-wire chunk-body length (always
+///   emitted when the chunk is present, so a malformed/reserved body is
+///   observable, mirroring `<axml>` / `<bxml>`).
+/// - `wav:sxml.fmt_type` — the raw 16-bit `fmtType` as `0x%04X`.
+/// - `wav:sxml.compression` — `none` / `gzip` label for the documented
+///   codes; omitted for private/future codes.
+/// - `wav:sxml.sub_chunk_count` — `nSubXMLChunks`.
+/// - `wav:sxml.alignment_point_count` — `nAlignmentPoints`.
+/// - `wav:sxml.total_samples` — the summed `nSamplesSubDataChunk`
+///   across all SubXMLChunks (the total audio span the serialized XML
+///   covers).
+/// - per-SubXMLChunk `wav:sxml.<n>.samples` / `.xml_len`, and — only
+///   for the uncompressed `fmt_type == 0x0000` form — `.xml` (the
+///   payload trimmed at the first NUL + surrounding whitespace, like
+///   `<axml>`); zero-based `<n>` by table order.
+///
+/// A body shorter than the 14-byte fixed prefix, or one whose declared
+/// counts overrun the buffer, is skipped-as-opaque: only
+/// `wav:sxml.body_len` is emitted and `None` is returned.
+fn parse_sxml_chunk(buf: &[u8], out: &mut Vec<(String, String)>) -> Option<SxmlChunk> {
+    out.push(("wav:sxml.body_len".to_string(), buf.len().to_string()));
+    let sxml = SxmlChunk::parse(buf)?;
+    out.push((
+        "wav:sxml.fmt_type".to_string(),
+        format!("0x{:04X}", sxml.fmt_type),
+    ));
+    if let Some(label) = sxml.compression_label() {
+        out.push(("wav:sxml.compression".to_string(), label.to_string()));
+    }
+    out.push((
+        "wav:sxml.sub_chunk_count".to_string(),
+        sxml.sub_chunks.len().to_string(),
+    ));
+    out.push((
+        "wav:sxml.alignment_point_count".to_string(),
+        sxml.alignment_points.len().to_string(),
+    ));
+    let total_samples: u64 = sxml.sub_chunks.iter().map(|s| s.n_samples as u64).sum();
+    out.push((
+        "wav:sxml.total_samples".to_string(),
+        total_samples.to_string(),
+    ));
+    let uncompressed = sxml.fmt_type == 0x0000;
+    for (n, s) in sxml.sub_chunks.iter().enumerate() {
+        out.push((format!("wav:sxml.{n}.samples"), s.n_samples.to_string()));
+        out.push((
+            format!("wav:sxml.{n}.xml_len"),
+            s.xml_data.len().to_string(),
+        ));
+        if uncompressed {
+            let end = s
+                .xml_data
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(s.xml_data.len());
+            let text = String::from_utf8_lossy(&s.xml_data[..end])
+                .trim()
+                .to_string();
+            if !text.is_empty() {
+                out.push((format!("wav:sxml.{n}.xml"), text));
+            }
+        }
+    }
+    Some(sxml)
+}
+
 /// Parse a `fact` chunk body per
 /// `docs/container/riff/metadata/microsoft-riffmci.pdf` §3 "FACT Chunk":
 ///
@@ -3656,6 +4027,7 @@ pub struct WavDemuxer {
     subformat: Option<[u8; 16]>,
     acid: Option<AcidChunk>,
     chna: Option<ChnaChunk>,
+    sxml: Option<SxmlChunk>,
     bext: Option<BextChunk>,
     cue: Option<CueChunk>,
     plst: Option<PlaylistChunk>,
@@ -3731,6 +4103,17 @@ impl WavDemuxer {
     /// `wav:chna.*` metadata keys for `dyn Demuxer` consumers.
     pub fn chna(&self) -> Option<&ChnaChunk> {
         self.chna.as_ref()
+    }
+
+    /// Typed view of the BW64/ADM `<sxml>` (serialized-XML) chunk when
+    /// the file carried one with a well-formed body (ITU-R BS.2088-2
+    /// §7). `None` when the chunk is absent, shorter than the 14-byte
+    /// fixed prefix, or malformed (declared counts overrunning the
+    /// body). The same data is mirrored under the `wav:sxml.*` metadata
+    /// keys for `dyn Demuxer` consumers, and is re-emittable via
+    /// [`WavMuxOptions::with_sxml`].
+    pub fn sxml(&self) -> Option<&SxmlChunk> {
+        self.sxml.as_ref()
     }
 
     /// Typed view of the BWF `bext` (Broadcast Audio Extension) chunk
@@ -7359,6 +7742,240 @@ mod tests {
         assert_eq!(md.get("wav:bxml.fmt_type"), Some(&"0x0000".to_string()));
         assert_eq!(md.get("wav:bxml.compression"), Some(&"none".to_string()));
         assert!(!md.contains_key("wav:bxml"));
+    }
+
+    /// Build a minimal valid PCM WAV with a caller-supplied raw `<sxml>`
+    /// chunk inserted between `fmt ` and `data`. The body is the on-wire
+    /// `sxml` data section (the bytes after the 8-byte chunk header),
+    /// per ITU-R BS.2088-2 §7 (`docs/container/riff/metadata/
+    /// R-REC-BS.2088.pdf`).
+    fn wav_with_sxml(sxml_body: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"RIFF");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(b"WAVE");
+        // fmt : 16-byte PCM s16 mono 8000 Hz.
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&16u32.to_le_bytes());
+        buf.extend_from_slice(&FMT_PCM.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&8_000u32.to_le_bytes());
+        buf.extend_from_slice(&16_000u32.to_le_bytes());
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(&16u16.to_le_bytes());
+        // sxml chunk.
+        buf.extend_from_slice(b"sxml");
+        buf.extend_from_slice(&(sxml_body.len() as u32).to_le_bytes());
+        buf.extend_from_slice(sxml_body);
+        if sxml_body.len() % 2 == 1 {
+            buf.push(0);
+        }
+        // empty data chunk
+        buf.extend_from_slice(b"data");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf
+    }
+
+    /// An uncompressed (`fmtType == 0x0000`) `<sxml>` chunk with two
+    /// SubXMLChunk records and one AlignmentPoint surfaces every
+    /// per-record key, the `none` compression label, the summed sample
+    /// span, and round-trips byte-for-byte through the typed surface
+    /// (ITU-R BS.2088-2 §7).
+    #[test]
+    fn sxml_uncompressed_two_subchunks_and_alignment_point() {
+        let s0 = SubXmlChunk {
+            n_samples: 48_000,
+            xml_data: b"<frame n=\"0\"/>".to_vec(),
+        };
+        let s1 = SubXmlChunk {
+            n_samples: 24_000,
+            xml_data: b"<frame n=\"1\"/>".to_vec(),
+        };
+        let ap = AlignmentPoint {
+            byte_offset: 14,
+            n_samples: 48_000,
+        };
+        let sxml = SxmlChunk {
+            fmt_type: 0x0000,
+            sub_table_byte_size: 4 + s0.encoded_len() as u64 + s1.encoded_len() as u64,
+            sub_chunks: vec![s0.clone(), s1.clone()],
+            alignment_points: vec![ap],
+        };
+        // Typed round-trip: parse(to_bytes(x)) == x.
+        let body = sxml.to_bytes();
+        assert_eq!(SxmlChunk::parse(&body).unwrap(), sxml);
+
+        let bytes = wav_with_sxml(&body);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:sxml.body_len"), Some(&body.len().to_string()));
+        assert_eq!(md.get("wav:sxml.fmt_type"), Some(&"0x0000".to_string()));
+        assert_eq!(md.get("wav:sxml.compression"), Some(&"none".to_string()));
+        assert_eq!(md.get("wav:sxml.sub_chunk_count"), Some(&"2".to_string()));
+        assert_eq!(
+            md.get("wav:sxml.alignment_point_count"),
+            Some(&"1".to_string())
+        );
+        assert_eq!(md.get("wav:sxml.total_samples"), Some(&"72000".to_string()));
+        assert_eq!(md.get("wav:sxml.0.samples"), Some(&"48000".to_string()));
+        assert_eq!(md.get("wav:sxml.0.xml_len"), Some(&"14".to_string()));
+        assert_eq!(
+            md.get("wav:sxml.0.xml"),
+            Some(&"<frame n=\"0\"/>".to_string())
+        );
+        assert_eq!(md.get("wav:sxml.1.samples"), Some(&"24000".to_string()));
+        assert_eq!(
+            md.get("wav:sxml.1.xml"),
+            Some(&"<frame n=\"1\"/>".to_string())
+        );
+        // chunk-walk still resolves fmt + data after the sxml hop.
+        assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
+    }
+
+    /// A gzip-flagged (`fmtType == 0x0001`) `<sxml>` chunk surfaces the
+    /// `gzip` label and per-record lengths but does NOT attempt to expose
+    /// `.xml` text — container-layer leaves RFC 1952 inflation to a
+    /// higher-level ADM-aware consumer (§7.2). Opaque payload bytes must
+    /// not break the parse.
+    #[test]
+    fn sxml_gzip_omits_xml_text() {
+        let s0 = SubXmlChunk {
+            n_samples: 1_024,
+            xml_data: vec![0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00],
+        };
+        let sxml = SxmlChunk {
+            fmt_type: 0x0001,
+            sub_table_byte_size: 4 + s0.encoded_len() as u64,
+            sub_chunks: vec![s0],
+            alignment_points: vec![],
+        };
+        let body = sxml.to_bytes();
+        assert_eq!(SxmlChunk::parse(&body).unwrap(), sxml);
+        let bytes = wav_with_sxml(&body);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:sxml.fmt_type"), Some(&"0x0001".to_string()));
+        assert_eq!(md.get("wav:sxml.compression"), Some(&"gzip".to_string()));
+        assert_eq!(md.get("wav:sxml.0.xml_len"), Some(&"8".to_string()));
+        assert!(!md.contains_key("wav:sxml.0.xml"));
+    }
+
+    /// An `<sxml>` chunk with an unknown `fmtType` omits the
+    /// `compression` label (raw `fmt_type` stays authoritative) and
+    /// suppresses `.xml` (only the uncompressed `0x0000` form exposes
+    /// text), per the §7.2 fmtType semantics.
+    #[test]
+    fn sxml_unknown_fmt_type_omits_label_and_text() {
+        let s0 = SubXmlChunk {
+            n_samples: 0,
+            xml_data: b"<x/>".to_vec(),
+        };
+        let sxml = SxmlChunk {
+            fmt_type: 0x00FF,
+            sub_table_byte_size: 4 + s0.encoded_len() as u64,
+            sub_chunks: vec![s0],
+            alignment_points: vec![],
+        };
+        let body = sxml.to_bytes();
+        let bytes = wav_with_sxml(&body);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:sxml.fmt_type"), Some(&"0x00FF".to_string()));
+        assert!(!md.contains_key("wav:sxml.compression"));
+        assert!(!md.contains_key("wav:sxml.0.xml"));
+    }
+
+    /// An empty `<sxml>` chunk (zero SubXMLChunks, zero AlignmentPoints)
+    /// is still well-formed: the 14-byte prefix + the `nAlignmentPoints`
+    /// DWORD = 18 bytes. It surfaces the counts but no per-record keys
+    /// and round-trips byte-for-byte.
+    #[test]
+    fn sxml_empty_tables_round_trip() {
+        let sxml = SxmlChunk {
+            fmt_type: 0x0000,
+            sub_table_byte_size: 4,
+            sub_chunks: vec![],
+            alignment_points: vec![],
+        };
+        let body = sxml.to_bytes();
+        assert_eq!(body.len(), 18);
+        assert_eq!(SxmlChunk::parse(&body).unwrap(), sxml);
+        let bytes = wav_with_sxml(&body);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:sxml.sub_chunk_count"), Some(&"0".to_string()));
+        assert_eq!(
+            md.get("wav:sxml.alignment_point_count"),
+            Some(&"0".to_string())
+        );
+        assert_eq!(md.get("wav:sxml.total_samples"), Some(&"0".to_string()));
+        assert!(!md.contains_key("wav:sxml.0.samples"));
+    }
+
+    /// A body shorter than the 14-byte fixed prefix is skipped-as-opaque:
+    /// only `wav:sxml.body_len` is emitted and the typed view is `None`.
+    #[test]
+    fn sxml_truncated_prefix_skipped_as_opaque() {
+        let body = vec![0u8; 10];
+        assert!(SxmlChunk::parse(&body).is_none());
+        let bytes = wav_with_sxml(&body);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:sxml.body_len"), Some(&"10".to_string()));
+        assert!(!md.contains_key("wav:sxml.fmt_type"));
+        // chunk-walk still resolves fmt + data despite the opaque sxml.
+        assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
+    }
+
+    /// A declared `nSubXMLChunks` whose record length overruns the body
+    /// is rejected (returns `None`) rather than reading out of bounds,
+    /// per the §7.1 fixed-layout discipline.
+    #[test]
+    fn sxml_overrunning_subchunk_size_rejected() {
+        // prefix: fmtType=0, subTblSize=4+12=16, nSubXMLChunks=1
+        let mut body = Vec::new();
+        body.extend_from_slice(&0x0000u16.to_le_bytes());
+        body.extend_from_slice(&16u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&1u32.to_le_bytes());
+        // one SubXMLChunk claiming 100 bytes of xmlData but only 2 present
+        body.extend_from_slice(&100u32.to_le_bytes()); // subXMLChunkSize
+        body.extend_from_slice(&0u32.to_le_bytes()); // nSamplesSubDataChunk
+        body.extend_from_slice(&[0xAA, 0xBB]);
+        assert!(SxmlChunk::parse(&body).is_none());
+    }
+
+    /// `computed_sub_table_byte_size` returns the canonical
+    /// `subXMLCkTbSize` (4-byte count DWORD + every record's encoded
+    /// length) regardless of the preserved on-wire value (§7.2).
+    #[test]
+    fn sxml_computed_sub_table_byte_size_is_canonical() {
+        let s0 = SubXmlChunk {
+            n_samples: 10,
+            xml_data: b"abcd".to_vec(),
+        };
+        let s1 = SubXmlChunk {
+            n_samples: 20,
+            xml_data: b"ef".to_vec(),
+        };
+        let sxml = SxmlChunk {
+            fmt_type: 0x0000,
+            // deliberately bogus preserved value
+            sub_table_byte_size: 9_999,
+            sub_chunks: vec![s0.clone(), s1.clone()],
+            alignment_points: vec![],
+        };
+        // 4 (count) + (8+4) + (8+2) = 26
+        assert_eq!(sxml.computed_sub_table_byte_size(), 26);
+        // The preserved value is what to_bytes emits (byte-lossless).
+        let body = sxml.to_bytes();
+        let lo = u32::from_le_bytes([body[2], body[3], body[4], body[5]]) as u64;
+        assert_eq!(lo, 9_999);
     }
 
     /// Build a minimal valid PCM WAV with a caller-supplied raw `_PMX`
