@@ -3162,7 +3162,89 @@ fn parse_pmx_chunk(buf: &[u8], out: &mut Vec<(String, String)>) {
 /// metafile, ...) carry binary GDI structures whose enumeration lives
 /// in the Windows API headers (not a media spec) and which this
 /// container layer surfaces only as a raw `type` value plus length.
-const CF_TEXT: u32 = 1;
+pub const CF_TEXT: u32 = 1;
+
+/// Typed view of a RIFF `DISP` (Display) chunk body — a clipboard-
+/// format `type` DWORD followed by a payload in that clipboard format.
+///
+/// The WAV convention catalogued under
+/// `docs/container/riff/metadata/exiftool-riff-tags.html` § "RIFF Main
+/// tags" (entry `'DISP'`) maps the chunk to the "SoundSchemeTitle": a
+/// `CF_TEXT` (type == 1) display title a player shows for a sound. The
+/// chunk body layout is:
+///
+/// ```text
+/// <disp-ck> -> DISP( <Type:u32-le> <Data:[u8]> )
+/// ```
+///
+/// This crate carries the `type` and `data` verbatim so a read→write
+/// pass is byte-lossless regardless of clipboard format; the
+/// convenience [`Self::text`] constructor builds the common `CF_TEXT`
+/// form (a NUL-terminated title) and [`Self::title`] decodes it back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DispChunk {
+    /// Windows clipboard-format type (`CF_TEXT == 1`, `CF_DIB == 8`, …).
+    pub cf_type: u32,
+    /// Payload bytes in the clipboard format named by [`Self::cf_type`].
+    pub data: Vec<u8>,
+}
+
+impl DispChunk {
+    /// Build a `CF_TEXT` display title (`SoundSchemeTitle`). The title
+    /// is stored as the supplied UTF-8 bytes followed by a single NUL
+    /// terminator, matching the common WAV writer convention.
+    pub fn text(title: &str) -> Self {
+        let mut data = title.as_bytes().to_vec();
+        data.push(0);
+        Self {
+            cf_type: CF_TEXT,
+            data,
+        }
+    }
+
+    /// Decode the display title when this is a `CF_TEXT` chunk: the
+    /// payload up to the first NUL, trimmed of surrounding whitespace.
+    /// Returns `None` for non-`CF_TEXT` clipboard formats or an empty
+    /// title.
+    pub fn title(&self) -> Option<String> {
+        if self.cf_type != CF_TEXT {
+            return None;
+        }
+        let end = self
+            .data
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(self.data.len());
+        let text = String::from_utf8_lossy(&self.data[..end])
+            .trim()
+            .to_string();
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
+        }
+    }
+
+    /// Parse a `DISP` chunk body. Returns `None` when the body is
+    /// shorter than the 4-byte `type` header.
+    pub fn parse(buf: &[u8]) -> Option<Self> {
+        if buf.len() < 4 {
+            return None;
+        }
+        Some(Self {
+            cf_type: u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
+            data: buf[4..].to_vec(),
+        })
+    }
+
+    /// Serialize to the on-wire body (4-byte LE `type` + payload).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + self.data.len());
+        out.extend_from_slice(&self.cf_type.to_le_bytes());
+        out.extend_from_slice(&self.data);
+        out
+    }
+}
 
 /// Parse a `DISP` (Display) chunk body and surface its clipboard
 /// payload through the metadata table.
@@ -3203,21 +3285,12 @@ const CF_TEXT: u32 = 1;
 /// (only `body_len`).
 fn parse_disp_chunk(buf: &[u8], out: &mut Vec<(String, String)>) {
     out.push(("wav:disp.body_len".to_string(), buf.len().to_string()));
-    if buf.len() < 4 {
+    let Some(disp) = DispChunk::parse(buf) else {
         return;
-    }
-    let cf_type = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-    out.push(("wav:disp.type".to_string(), cf_type.to_string()));
-    if cf_type == CF_TEXT {
-        let payload = &buf[4..];
-        let end = payload
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(payload.len());
-        let text = String::from_utf8_lossy(&payload[..end]).trim().to_string();
-        if !text.is_empty() {
-            out.push(("wav:disp.title".to_string(), text));
-        }
+    };
+    out.push(("wav:disp.type".to_string(), disp.cf_type.to_string()));
+    if let Some(title) = disp.title() {
+        out.push(("wav:disp.title".to_string(), title));
     }
 }
 
@@ -4450,6 +4523,7 @@ fn open_muxer(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Box<
         chna: None,
         sxml: None,
         bext: None,
+        disp: None,
         cue: None,
         plst: None,
         adtl: None,
@@ -4483,6 +4557,7 @@ pub struct WavMuxOptions {
     chna: Option<ChnaChunk>,
     sxml: Option<SxmlChunk>,
     bext: Option<BextChunk>,
+    disp: Option<DispChunk>,
     cue: Option<CueChunk>,
     plst: Option<PlaylistChunk>,
     adtl: Option<AdtlChunk>,
@@ -4599,6 +4674,17 @@ impl WavMuxOptions {
         self
     }
 
+    /// Emit a `DISP` (Display) chunk ahead of the `data` chunk — the
+    /// RIFF "SoundSchemeTitle" convention. The body is a clipboard-format
+    /// `type` DWORD then a payload (see [`DispChunk`]); use
+    /// [`DispChunk::text`] for the common `CF_TEXT` display-title form.
+    /// When the body length is odd the muxer writes the RIFF §2
+    /// word-alignment pad byte after it.
+    pub fn with_disp(mut self, disp: DispChunk) -> Self {
+        self.disp = Some(disp);
+        self
+    }
+
     /// Emit a `cue ` (cue-points) chunk after the `data` waveform
     /// (RIFF MCI §3 "Cue-Points Chunk"). Cue / playlist / associated-
     /// data chunks reference sample positions in the `data` payload, so
@@ -4683,6 +4769,7 @@ pub fn open_muxer_with(
         chna: opts.chna,
         sxml: opts.sxml,
         bext: opts.bext,
+        disp: opts.disp,
         cue: opts.cue,
         plst: opts.plst,
         adtl: opts.adtl,
@@ -4786,6 +4873,10 @@ struct WavMuxer {
     /// a `bext` chunk ahead of `data` when present (EBU Tech 3285 v2
     /// §2.3).
     bext: Option<BextChunk>,
+    /// Caller-supplied RIFF Display (`DISP`) metadata, emitted as a
+    /// `DISP` chunk ahead of `data` when present (the WAV
+    /// "SoundSchemeTitle" convention).
+    disp: Option<DispChunk>,
     /// Caller-supplied cue-points, emitted as a `cue ` chunk *after*
     /// `data` in the trailer when present (RIFF MCI §3).
     cue: Option<CueChunk>,
@@ -4931,6 +5022,22 @@ impl Muxer for WavMuxer {
         if let Some(bext) = &self.bext {
             let body = bext.to_bytes();
             self.output.write_all(b"bext")?;
+            self.output.write_all(&(body.len() as u32).to_le_bytes())?;
+            self.output.write_all(&body)?;
+            if body.len() % 2 == 1 {
+                self.output.write_all(&[0u8])?;
+            }
+        }
+
+        // `DISP` chunk: caller-supplied RIFF Display metadata (the WAV
+        // "SoundSchemeTitle" convention — a clipboard-format `type`
+        // DWORD + payload, see [`DispChunk`]). The body may be odd
+        // (a CF_TEXT title of even byte length plus the 4-byte type and
+        // a NUL terminator is odd), so a RIFF §2 word-alignment pad byte
+        // is written when needed.
+        if let Some(disp) = &self.disp {
+            let body = disp.to_bytes();
+            self.output.write_all(b"DISP")?;
             self.output.write_all(&(body.len() as u32).to_le_bytes())?;
             self.output.write_all(&body)?;
             if body.len() % 2 == 1 {
@@ -7672,6 +7779,53 @@ mod tests {
         assert_eq!(md.get("wav:disp.type"), Some(&"8".to_string()));
         assert_eq!(md.get("wav:disp.body_len"), Some(&body.len().to_string()));
         assert!(!md.contains_key("wav:disp.title"));
+    }
+
+    /// `DispChunk::parse` / `to_bytes` are byte-lossless, and
+    /// `DispChunk::text` / `title` round-trip a CF_TEXT title.
+    #[test]
+    fn disp_chunk_parse_to_bytes_symmetric() {
+        let disp = DispChunk::text("My Sound");
+        assert_eq!(disp.cf_type, CF_TEXT);
+        assert_eq!(disp.title().as_deref(), Some("My Sound"));
+        let body = disp.to_bytes();
+        // 4-byte type + "My Sound" (8) + NUL (1) = 13 bytes.
+        assert_eq!(body.len(), 13);
+        let round = DispChunk::parse(&body).unwrap();
+        assert_eq!(round, disp);
+        // A non-CF_TEXT chunk preserves its raw payload verbatim.
+        let bin = DispChunk {
+            cf_type: 8,
+            data: vec![0x01, 0x02, 0x03],
+        };
+        assert_eq!(bin.title(), None);
+        assert_eq!(DispChunk::parse(&bin.to_bytes()).unwrap(), bin);
+        // Truncated body → None.
+        assert!(DispChunk::parse(&[0x01, 0x00]).is_none());
+    }
+
+    /// `WavMuxOptions::with_disp` writes a `DISP` chunk that the demuxer
+    /// reads back: the title round-trips through the public mux→demux
+    /// path and the chunk is placed ahead of `data`.
+    #[test]
+    fn disp_write_read_round_trip() {
+        let samples: Vec<i16> = (0..50).map(|i| (i * 200) as i16).collect();
+        let mut payload = Vec::with_capacity(samples.len() * 2);
+        for s in &samples {
+            payload.extend_from_slice(&s.to_le_bytes());
+        }
+        let stream = make_stream(SampleFormat::S16, 1, 8_000);
+        let opts = WavMuxOptions::default().with_disp(DispChunk::text("Notify Title"));
+        let bytes = mux_to_bytes(&stream, &payload, opts, "disp-rt");
+        // DISP is emitted ahead of `data`.
+        let disp_at = find_chunk(&bytes, b"DISP").expect("DISP chunk present");
+        let data_at = find_chunk(&bytes, b"data").expect("data chunk present");
+        assert!(disp_at < data_at, "DISP must precede data");
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:disp.type"), Some(&"1".to_string()));
+        assert_eq!(md.get("wav:disp.title"), Some(&"Notify Title".to_string()));
     }
 
     /// A `DISP` body shorter than the 4-byte type DWORD is skipped as
