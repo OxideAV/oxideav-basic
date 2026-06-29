@@ -4562,6 +4562,7 @@ fn open_muxer(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Box<
         sxml: None,
         bext: None,
         disp: None,
+        id3: None,
         cue: None,
         plst: None,
         adtl: None,
@@ -4596,6 +4597,7 @@ pub struct WavMuxOptions {
     sxml: Option<SxmlChunk>,
     bext: Option<BextChunk>,
     disp: Option<DispChunk>,
+    id3: Option<Vec<u8>>,
     cue: Option<CueChunk>,
     plst: Option<PlaylistChunk>,
     adtl: Option<AdtlChunk>,
@@ -4723,6 +4725,22 @@ impl WavMuxOptions {
         self
     }
 
+    /// Emit an `id3 ` (embedded ID3v2 tag) chunk ahead of the `data`
+    /// chunk, carrying the supplied complete ID3v2 tag bytes verbatim.
+    ///
+    /// The WAV container's job is to *carry* the embedded tag, not to
+    /// construct its frames — frame encoding (TIT2, TPE1, APIC, …) is
+    /// `oxideav-id3`'s responsibility per the codec/container split. The
+    /// caller therefore supplies a fully-formed ID3v2 tag (10-byte
+    /// header + frames + padding) and this muxer writes it as an `id3 `
+    /// chunk with the RIFF §2 word-alignment pad byte when the tag length
+    /// is odd. The demuxer's `wav:id3.*` keys read the header fields back
+    /// for observability.
+    pub fn with_id3(mut self, id3_tag: Vec<u8>) -> Self {
+        self.id3 = Some(id3_tag);
+        self
+    }
+
     /// Emit a `cue ` (cue-points) chunk after the `data` waveform
     /// (RIFF MCI §3 "Cue-Points Chunk"). Cue / playlist / associated-
     /// data chunks reference sample positions in the `data` payload, so
@@ -4808,6 +4826,7 @@ pub fn open_muxer_with(
         sxml: opts.sxml,
         bext: opts.bext,
         disp: opts.disp,
+        id3: opts.id3,
         cue: opts.cue,
         plst: opts.plst,
         adtl: opts.adtl,
@@ -4915,6 +4934,9 @@ struct WavMuxer {
     /// `DISP` chunk ahead of `data` when present (the WAV
     /// "SoundSchemeTitle" convention).
     disp: Option<DispChunk>,
+    /// Caller-supplied complete ID3v2 tag bytes, emitted verbatim as an
+    /// `id3 ` chunk ahead of `data` when present.
+    id3: Option<Vec<u8>>,
     /// Caller-supplied cue-points, emitted as a `cue ` chunk *after*
     /// `data` in the trailer when present (RIFF MCI §3).
     cue: Option<CueChunk>,
@@ -5079,6 +5101,19 @@ impl Muxer for WavMuxer {
             self.output.write_all(&(body.len() as u32).to_le_bytes())?;
             self.output.write_all(&body)?;
             if body.len() % 2 == 1 {
+                self.output.write_all(&[0u8])?;
+            }
+        }
+
+        // `id3 ` chunk: caller-supplied complete ID3v2 tag carried
+        // verbatim. The container writes the bytes as-is (frame
+        // construction is oxideav-id3's job); an odd tag length triggers
+        // the RIFF §2 word-alignment pad byte.
+        if let Some(id3) = &self.id3 {
+            self.output.write_all(b"id3 ")?;
+            self.output.write_all(&(id3.len() as u32).to_le_bytes())?;
+            self.output.write_all(id3)?;
+            if id3.len() % 2 == 1 {
                 self.output.write_all(&[0u8])?;
             }
         }
@@ -7960,6 +7995,40 @@ mod tests {
         assert_eq!(md.get("wav:id3.body_len"), Some(&"8".to_string()));
         assert!(!md.contains_key("wav:id3.version"));
         assert!(!md.contains_key("wav:id3.tag_size"));
+    }
+
+    /// `WavMuxOptions::with_id3` writes a complete ID3v2 tag verbatim as
+    /// an `id3 ` chunk that the demuxer reads back: the header fields
+    /// round-trip through the public mux→demux path and the chunk is
+    /// placed ahead of `data`.
+    #[test]
+    fn id3_write_read_round_trip() {
+        let mut frames = Vec::new();
+        frames.extend_from_slice(b"TIT2");
+        let text = b"\x00Round 380";
+        frames.extend_from_slice(&(text.len() as u32).to_be_bytes());
+        frames.extend_from_slice(&0u16.to_be_bytes());
+        frames.extend_from_slice(text);
+        let tag = id3v2_tag(3, 0, 0x00, &frames);
+        let tag_len = tag.len();
+
+        let samples: Vec<i16> = (0..40).map(|i| (i * 100) as i16).collect();
+        let mut payload = Vec::with_capacity(samples.len() * 2);
+        for s in &samples {
+            payload.extend_from_slice(&s.to_le_bytes());
+        }
+        let stream = make_stream(SampleFormat::S16, 1, 8_000);
+        let opts = WavMuxOptions::default().with_id3(tag.clone());
+        let bytes = mux_to_bytes(&stream, &payload, opts, "id3-rt");
+        let id3_at = find_chunk(&bytes, b"id3 ").expect("id3 chunk present");
+        let data_at = find_chunk(&bytes, b"data").expect("data chunk present");
+        assert!(id3_at < data_at, "id3 must precede data");
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:id3.version"), Some(&"3.0".to_string()));
+        assert_eq!(md.get("wav:id3.tag_size"), Some(&frames.len().to_string()));
+        assert_eq!(md.get("wav:id3.body_len"), Some(&tag_len.to_string()));
     }
 
     /// The uppercase `ID3 ` FOURCC variant is also recognised (some
