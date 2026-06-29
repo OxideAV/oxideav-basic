@@ -989,26 +989,16 @@ fn parse_wavl_list(
 }
 
 fn parse_info_list(buf: &[u8], out: &mut Vec<(String, String)>) {
-    let mut i = 0usize;
-    while i + 8 <= buf.len() {
-        let id: [u8; 4] = [buf[i], buf[i + 1], buf[i + 2], buf[i + 3]];
-        let size = u32::from_le_bytes([buf[i + 4], buf[i + 5], buf[i + 6], buf[i + 7]]) as usize;
-        i += 8;
-        if i + size > buf.len() {
-            break;
+    // Reuse the typed parser (the read/write-symmetric `InfoChunk`) then
+    // map each recognised sub-ID to its snake_case metadata key. Unknown
+    // sub-IDs and empty values are dropped from the `dyn Demuxer`
+    // metadata surface (they still round-trip through `InfoChunk`).
+    for e in InfoChunk::parse(buf).entries {
+        if e.value.is_empty() {
+            continue;
         }
-        let raw = &buf[i..i + size];
-        let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
-        let value = String::from_utf8_lossy(&raw[..end]).trim().to_string();
-        let key = info_id_to_key(&id);
-        if !value.is_empty() {
-            if let Some(k) = key {
-                out.push((k.to_string(), value));
-            }
-        }
-        i += size;
-        if size % 2 == 1 {
-            i += 1;
+        if let Some(k) = info_id_to_key(&e.id) {
+            out.push((k.to_string(), e.value));
         }
     }
 }
@@ -3845,6 +3835,95 @@ fn info_id_to_key(id: &[u8; 4]) -> Option<&'static str> {
     }
 }
 
+/// A single `LIST INFO` text entry: a 4-byte sub-ID FOURCC plus a
+/// NUL-terminated text value (RIFF MCI §3 "INFO List Chunk"). Keeping
+/// the raw FOURCC (rather than the snake_case key) makes the writer
+/// fully general — any documented or vendor sub-ID round-trips, not just
+/// the ones [`info_id_to_key`] maps to a friendly key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InfoEntry {
+    /// The 4-byte INFO sub-ID FOURCC (`*b"INAM"`, `*b"IART"`, …).
+    pub id: [u8; 4],
+    /// The text value (stored NUL-terminated + word-aligned on the wire).
+    pub value: String,
+}
+
+/// Typed view of a `LIST INFO` chunk (RIFF MCI §3 "INFO List Chunk") —
+/// an ordered list of text [`InfoEntry`] records. Each record's on-wire
+/// form is `<id:FOURCC> <size:u32-le> <ZSTR text> [pad]` (the §3
+/// "Storage of Text Information" grammar), where the text is
+/// NUL-terminated and the chunk word-aligned per RIFF §2.
+///
+/// The demuxer already surfaces every recognised INFO sub-ID through its
+/// snake_case metadata key; this typed view adds **write** support so a
+/// producer can emit a `LIST INFO` chunk symmetrically. `parse` reads
+/// every sub-chunk verbatim (preserving order and unknown sub-IDs);
+/// `to_bytes` returns the `INFO` list body (the 4-byte `INFO` list type
+/// followed by the sub-chunks), ready to wrap in a `LIST` chunk header.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InfoChunk {
+    /// The INFO text entries, in file order.
+    pub entries: Vec<InfoEntry>,
+}
+
+impl InfoChunk {
+    /// Append a text entry by raw FOURCC sub-ID.
+    pub fn with_entry(mut self, id: [u8; 4], value: &str) -> Self {
+        self.entries.push(InfoEntry {
+            id,
+            value: value.to_string(),
+        });
+        self
+    }
+
+    /// Parse a `LIST INFO` body (the bytes *after* the 4-byte `INFO`
+    /// list type — i.e. the sub-chunk sequence). Sub-chunks that overrun
+    /// the buffer terminate the scan (matching [`parse_info_list`]).
+    pub fn parse(buf: &[u8]) -> Self {
+        let mut entries = Vec::new();
+        let mut i = 0usize;
+        while i + 8 <= buf.len() {
+            let id: [u8; 4] = [buf[i], buf[i + 1], buf[i + 2], buf[i + 3]];
+            let size =
+                u32::from_le_bytes([buf[i + 4], buf[i + 5], buf[i + 6], buf[i + 7]]) as usize;
+            i += 8;
+            if i + size > buf.len() {
+                break;
+            }
+            let raw = &buf[i..i + size];
+            let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+            let value = String::from_utf8_lossy(&raw[..end]).trim().to_string();
+            entries.push(InfoEntry { id, value });
+            i += size;
+            if size % 2 == 1 {
+                i += 1;
+            }
+        }
+        Self { entries }
+    }
+
+    /// Serialize the full `LIST INFO` body: the 4-byte `INFO` list type
+    /// followed by each entry as `<id> <size:u32-le> <ZSTR> [pad]`. The
+    /// returned bytes are the `LIST` chunk *body* (write a `LIST` header
+    /// with this length ahead of it).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"INFO");
+        for e in &self.entries {
+            // ZSTR: text + a single NUL terminator (RIFF MCI §3).
+            let mut payload = e.value.as_bytes().to_vec();
+            payload.push(0);
+            out.extend_from_slice(&e.id);
+            out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            out.extend_from_slice(&payload);
+            if payload.len() % 2 == 1 {
+                out.push(0);
+            }
+        }
+        out
+    }
+}
+
 /// Fixed (pre-`CodingHistory`) size of the BWF `bext` struct, in bytes.
 ///
 /// Sum of the field widths from EBU Tech 3285 v2 §2.3 `BROADCAST_EXT`:
@@ -4563,6 +4642,7 @@ fn open_muxer(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Box<
         bext: None,
         disp: None,
         id3: None,
+        info: None,
         cue: None,
         plst: None,
         adtl: None,
@@ -4598,6 +4678,7 @@ pub struct WavMuxOptions {
     bext: Option<BextChunk>,
     disp: Option<DispChunk>,
     id3: Option<Vec<u8>>,
+    info: Option<InfoChunk>,
     cue: Option<CueChunk>,
     plst: Option<PlaylistChunk>,
     adtl: Option<AdtlChunk>,
@@ -4741,6 +4822,18 @@ impl WavMuxOptions {
         self
     }
 
+    /// Emit a `LIST INFO` (text metadata) chunk ahead of the `data`
+    /// chunk (RIFF MCI §3 "INFO List Chunk"). The supplied [`InfoChunk`]
+    /// carries an ordered list of `(sub-ID FOURCC, text)` entries; the
+    /// muxer writes a `LIST` header wrapping the `INFO` list type and
+    /// each NUL-terminated, word-aligned sub-chunk. The demuxer reads
+    /// the recognised sub-IDs back through their snake_case metadata
+    /// keys, giving read/write symmetry for WAV text tags.
+    pub fn with_info(mut self, info: InfoChunk) -> Self {
+        self.info = Some(info);
+        self
+    }
+
     /// Emit a `cue ` (cue-points) chunk after the `data` waveform
     /// (RIFF MCI §3 "Cue-Points Chunk"). Cue / playlist / associated-
     /// data chunks reference sample positions in the `data` payload, so
@@ -4827,6 +4920,7 @@ pub fn open_muxer_with(
         bext: opts.bext,
         disp: opts.disp,
         id3: opts.id3,
+        info: opts.info,
         cue: opts.cue,
         plst: opts.plst,
         adtl: opts.adtl,
@@ -4937,6 +5031,9 @@ struct WavMuxer {
     /// Caller-supplied complete ID3v2 tag bytes, emitted verbatim as an
     /// `id3 ` chunk ahead of `data` when present.
     id3: Option<Vec<u8>>,
+    /// Caller-supplied `LIST INFO` text metadata, emitted as a `LIST`
+    /// (`INFO`) chunk ahead of `data` when present (RIFF MCI §3).
+    info: Option<InfoChunk>,
     /// Caller-supplied cue-points, emitted as a `cue ` chunk *after*
     /// `data` in the trailer when present (RIFF MCI §3).
     cue: Option<CueChunk>,
@@ -5114,6 +5211,21 @@ impl Muxer for WavMuxer {
             self.output.write_all(&(id3.len() as u32).to_le_bytes())?;
             self.output.write_all(id3)?;
             if id3.len() % 2 == 1 {
+                self.output.write_all(&[0u8])?;
+            }
+        }
+
+        // `LIST INFO` chunk: caller-supplied text metadata (RIFF MCI §3
+        // "INFO List Chunk"). `InfoChunk::to_bytes` returns the LIST
+        // body (the `INFO` list type + each NUL-terminated, word-aligned
+        // sub-chunk), so the body length is always even and no
+        // inter-chunk pad byte is needed.
+        if let Some(info) = &self.info {
+            let body = info.to_bytes();
+            self.output.write_all(b"LIST")?;
+            self.output.write_all(&(body.len() as u32).to_le_bytes())?;
+            self.output.write_all(&body)?;
+            if body.len() % 2 == 1 {
                 self.output.write_all(&[0u8])?;
             }
         }
@@ -9880,6 +9992,50 @@ mod tests {
             out.push(0);
         }
         out
+    }
+
+    /// `InfoChunk::parse` / `to_bytes` round-trip an INFO list body
+    /// byte-losslessly (modulo the canonical NUL terminator + word-align
+    /// pad), preserving entry order and unknown sub-IDs.
+    #[test]
+    fn info_chunk_parse_to_bytes_symmetric() {
+        let info = InfoChunk::default()
+            .with_entry(*b"INAM", "My Title")
+            .with_entry(*b"IART", "The Artist")
+            .with_entry(*b"IZZZ", "vendor"); // unknown sub-ID preserved
+        let body = info.to_bytes();
+        assert_eq!(&body[0..4], b"INFO");
+        // parse() consumes the sub-chunks after the INFO list type.
+        let round = InfoChunk::parse(&body[4..]);
+        assert_eq!(round, info);
+    }
+
+    /// `WavMuxOptions::with_info` writes a `LIST INFO` chunk the demuxer
+    /// reads back through the snake_case metadata keys (read/write
+    /// symmetry for WAV text tags), placed ahead of `data`.
+    #[test]
+    fn info_write_read_round_trip() {
+        let samples: Vec<i16> = (0..30).map(|i| (i * 100) as i16).collect();
+        let mut payload = Vec::with_capacity(samples.len() * 2);
+        for s in &samples {
+            payload.extend_from_slice(&s.to_le_bytes());
+        }
+        let info = InfoChunk::default()
+            .with_entry(*b"INAM", "Round 380 Title")
+            .with_entry(*b"IART", "OxideAV")
+            .with_entry(*b"ISFT", "oxideav-basic");
+        let stream = make_stream(SampleFormat::S16, 1, 8_000);
+        let opts = WavMuxOptions::default().with_info(info);
+        let bytes = mux_to_bytes(&stream, &payload, opts, "info-rt");
+        let list_at = find_chunk(&bytes, b"LIST").expect("LIST chunk present");
+        let data_at = find_chunk(&bytes, b"data").expect("data chunk present");
+        assert!(list_at < data_at, "LIST INFO must precede data");
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("title"), Some(&"Round 380 Title".to_string()));
+        assert_eq!(md.get("artist"), Some(&"OxideAV".to_string()));
+        assert_eq!(md.get("encoder"), Some(&"oxideav-basic".to_string()));
     }
 
     /// Build a minimal valid WAV file whose `LIST INFO` chunk carries
