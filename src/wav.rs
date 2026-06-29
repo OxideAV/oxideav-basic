@@ -673,6 +673,30 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
                     input.seek(SeekFrom::Current(1))?;
                 }
             }
+            b"DISP" => {
+                // RIFF "Display" chunk: a clipboard-format type DWORD
+                // plus payload. The WAV convention is a CF_TEXT title
+                // ("SoundSchemeTitle" in the ExifTool RIFF tag table).
+                let mut buf = vec![0u8; size as usize];
+                input.read_exact(&mut buf)?;
+                parse_disp_chunk(&buf, &mut metadata);
+                if size % 2 == 1 {
+                    input.seek(SeekFrom::Current(1))?;
+                }
+            }
+            b"id3 " | b"ID3 " => {
+                // Embedded ID3v2 tag (the Microsoft-namespaced
+                // "ID3v2-in-RIFF" carriage catalogued in the ExifTool
+                // RIFF tag table). The container layer surfaces only the
+                // 10-byte ID3v2 header fields for observability; frame
+                // decoding is `oxideav-id3`'s job, not this crate's.
+                let mut buf = vec![0u8; size as usize];
+                input.read_exact(&mut buf)?;
+                parse_id3_chunk(&buf, &mut metadata);
+                if size % 2 == 1 {
+                    input.seek(SeekFrom::Current(1))?;
+                }
+            }
             b"JUNK" => {
                 // Microsoft RIFF MCI §2 "JUNK (Filler) Chunk": padding,
                 // filler or outdated information; the body contains
@@ -3130,6 +3154,168 @@ fn parse_pmx_chunk(buf: &[u8], out: &mut Vec<(String, String)>) {
     if !text.is_empty() {
         out.push(("wav:xmp".to_string(), text));
     }
+}
+
+/// Windows clipboard-format value for plain text (`CF_TEXT`). This is
+/// the only `DISP` payload type with a stable, schema-free textual
+/// interpretation; other documented clipboard formats (bitmap, DIB,
+/// metafile, ...) carry binary GDI structures whose enumeration lives
+/// in the Windows API headers (not a media spec) and which this
+/// container layer surfaces only as a raw `type` value plus length.
+const CF_TEXT: u32 = 1;
+
+/// Parse a `DISP` (Display) chunk body and surface its clipboard
+/// payload through the metadata table.
+///
+/// The `DISP` chunk is the RIFF "display" convention catalogued under
+/// `docs/container/riff/metadata/exiftool-riff-tags.html` § "RIFF Main
+/// tags" (entry `'DISP'`, mapped to the WAV `SoundSchemeTitle` — the
+/// human-readable title a player shows for a sound, e.g. a Windows
+/// "sound scheme" event name). The body is a 4-byte little-endian
+/// clipboard-format type DWORD followed by data in that clipboard
+/// format:
+///
+/// ```text
+/// DWORD  type;     // Windows clipboard format (CF_TEXT == 1, ...)
+/// BYTE   data[];   // payload in that clipboard format
+/// ```
+///
+/// For WAV files the overwhelmingly common form is `CF_TEXT` (`type ==
+/// 1`) carrying the display title as a (usually NUL-terminated) text
+/// string. We surface:
+///
+/// * `wav:disp.body_len` — raw on-wire chunk-body length (includes the
+///   4-byte `type` DWORD). Always emitted when the chunk is present so
+///   a NUL-reserved placeholder is observable. Excludes the 8-byte
+///   chunk header and the RIFF §2 word-align pad byte.
+/// * `wav:disp.type` — the raw 32-bit clipboard-format `type` value as
+///   a decimal. Always emitted when the 4-byte header is present.
+/// * `wav:disp.title` — the UTF-8 text payload, surfaced **only** when
+///   `type == CF_TEXT` (1). Trimmed at the first NUL byte (writers
+///   commonly NUL-terminate / NUL-pad the title) and stripped of
+///   surrounding whitespace. Omitted when the trimmed text is empty.
+///
+/// Non-`CF_TEXT` clipboard formats (bitmap / DIB / metafile / ...)
+/// carry binary GDI structures; this container layer does not interpret
+/// them — only `body_len` + `type` are surfaced so a downstream tool
+/// can observe the chunk's presence and dispatch on the format itself.
+/// Bodies shorter than the 4-byte `type` header are skipped as opaque
+/// (only `body_len`).
+fn parse_disp_chunk(buf: &[u8], out: &mut Vec<(String, String)>) {
+    out.push(("wav:disp.body_len".to_string(), buf.len().to_string()));
+    if buf.len() < 4 {
+        return;
+    }
+    let cf_type = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    out.push(("wav:disp.type".to_string(), cf_type.to_string()));
+    if cf_type == CF_TEXT {
+        let payload = &buf[4..];
+        let end = payload
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(payload.len());
+        let text = String::from_utf8_lossy(&payload[..end]).trim().to_string();
+        if !text.is_empty() {
+            out.push(("wav:disp.title".to_string(), text));
+        }
+    }
+}
+
+/// Parse an `id3 ` (embedded ID3v2 tag) chunk and surface the ID3v2
+/// header fields for observability.
+///
+/// The `id3 ` FOURCC carries a complete ID3v2 tag verbatim inside the
+/// RIFF tree (the Microsoft-namespaced "ID3v2-in-RIFF" convention,
+/// catalogued under
+/// `docs/container/riff/metadata/exiftool-riff-tags.html` § "RIFF Main
+/// tags", entry `'ID3 '`). The tag itself begins with the 10-byte
+/// ID3v2 header defined in `docs/container/id3/id3v2.3.0.html` §3.1
+/// (common to every v2 generation per the directory README's
+/// "Tag layout" diagram):
+///
+/// ```text
+/// ID3v2/file identifier   "ID3"
+/// ID3v2 version           $03 00    (major, revision)
+/// ID3v2 flags             %abc00000
+/// ID3v2 size              4 * %0xxxxxxx   (synchsafe, 28 bits)
+/// ```
+///
+/// Per §3.1 the major version and revision are each one byte and never
+/// `$FF`; the flags byte uses bit 7 (unsynchronisation), bit 6
+/// (extended header) and bit 5 (experimental indicator) for the v2.3
+/// generation (v2.4 §3.1 adds bit 4 = footer present); and the 4-byte
+/// size is *synchsafe* — bit 7 of every byte is zero, so the true tag
+/// length (excluding the 10-byte header) is the 28-bit value formed by
+/// concatenating the low 7 bits of each byte, most-significant first.
+///
+/// Frame decoding (TIT2, TPE1, APIC, ...) is **not** done here — that
+/// is `oxideav-id3`'s responsibility (per the workspace's
+/// codec/container split: the WAV container recognises and bounds the
+/// embedded tag, a dedicated crate decodes its frames). This parser
+/// therefore surfaces only the header-level observability keys:
+///
+/// * `wav:id3.body_len` — raw on-wire chunk-body length (the whole
+///   embedded tag including its 10-byte ID3v2 header). Always emitted
+///   when the chunk is present.
+/// * `wav:id3.version` — the ID3v2 `major.revision` (e.g. `2.3.0`
+///   rendered as `3.0`), emitted only when the `ID3` magic + the two
+///   version bytes are present and neither version byte is `$FF`.
+/// * `wav:id3.flags` — the raw flags byte as `0x%02X`.
+/// * `wav:id3.unsynchronisation` / `.extended_header` /
+///   `.experimental` — the three v2.3 header flag bits as `true` when
+///   set (omitted when clear), decoded per §3.1.
+/// * `wav:id3.tag_size` — the synchsafe-decoded tag length in bytes
+///   (excludes the 10-byte header), emitted when the 10-byte header is
+///   present.
+///
+/// Bodies that don't start with the `ID3` magic, or are shorter than
+/// the 10-byte header, surface only `wav:id3.body_len` (the malformed /
+/// empty placeholder stays observable).
+fn parse_id3_chunk(buf: &[u8], out: &mut Vec<(String, String)>) {
+    out.push(("wav:id3.body_len".to_string(), buf.len().to_string()));
+    // Need the 3-byte magic + 2 version bytes + 1 flags + 4 size = 10.
+    if buf.len() < 10 || &buf[0..3] != b"ID3" {
+        return;
+    }
+    let major = buf[3];
+    let revision = buf[4];
+    // §3.1: version bytes are never $FF.
+    if major == 0xFF || revision == 0xFF {
+        return;
+    }
+    // The directory README renders ID3v2.3.0 as major=3, revision=0;
+    // the on-wire "ID3v2 version" stores (major, revision) so the human
+    // form is "2.<major>.<revision>". We surface the compact
+    // "<major>.<revision>" because the leading "2." is implied by the
+    // `ID3` magic + the §3.1 tag identification pattern.
+    out.push(("wav:id3.version".to_string(), format!("{major}.{revision}")));
+    let flags = buf[5];
+    out.push(("wav:id3.flags".to_string(), format!("0x{flags:02X}")));
+    if flags & 0x80 != 0 {
+        out.push(("wav:id3.unsynchronisation".to_string(), "true".to_string()));
+    }
+    if flags & 0x40 != 0 {
+        out.push(("wav:id3.extended_header".to_string(), "true".to_string()));
+    }
+    if flags & 0x20 != 0 {
+        out.push(("wav:id3.experimental".to_string(), "true".to_string()));
+    }
+    // §3.1 synchsafe size: bit 7 of each byte is zero, 28 bits total,
+    // most-significant byte first. The size excludes the 10-byte header.
+    let tag_size = decode_synchsafe_u32(&buf[6..10]);
+    out.push(("wav:id3.tag_size".to_string(), tag_size.to_string()));
+}
+
+/// Decode a 4-byte ID3v2 *synchsafe* integer per
+/// `docs/container/id3/id3v2.3.0.html` §3.1: bit 7 of each byte is
+/// zero, and the 28-bit value is the concatenation of the low 7 bits of
+/// each byte, most-significant byte first (`$00 00 02 01` → 257).
+fn decode_synchsafe_u32(b: &[u8]) -> u32 {
+    debug_assert_eq!(b.len(), 4);
+    ((b[0] as u32 & 0x7F) << 21)
+        | ((b[1] as u32 & 0x7F) << 14)
+        | ((b[2] as u32 & 0x7F) << 7)
+        | (b[3] as u32 & 0x7F)
 }
 
 /// Surface metadata for a `JUNK` (Filler) chunk per
@@ -7420,6 +7606,181 @@ mod tests {
             dmx.metadata().iter().cloned().collect();
         assert_eq!(md.get("wav:fact.sample_count"), Some(&"200".to_string()));
         assert!(!md.contains_key("wav:fact.mismatch"));
+    }
+
+    /// Build a minimal valid PCM WAV with a caller-supplied raw chunk
+    /// (`fourcc` + `body`) inserted between `fmt ` and an empty `data`
+    /// chunk. The body is word-aligned per RIFF §2.
+    fn wav_with_chunk(fourcc: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"RIFF");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(b"WAVE");
+        // fmt : 16-byte PCM s16 mono 8000 Hz.
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&16u32.to_le_bytes());
+        buf.extend_from_slice(&FMT_PCM.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&8_000u32.to_le_bytes());
+        buf.extend_from_slice(&16_000u32.to_le_bytes());
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(&16u16.to_le_bytes());
+        buf.extend_from_slice(fourcc);
+        buf.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        buf.extend_from_slice(body);
+        if body.len() % 2 == 1 {
+            buf.push(0);
+        }
+        buf.extend_from_slice(b"data");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf
+    }
+
+    /// A `DISP` chunk with a `CF_TEXT` (type == 1) title surfaces the
+    /// raw type, the body length and the decoded title (trimmed at the
+    /// first NUL). The WAV convention per the ExifTool RIFF tag table
+    /// maps `DISP` to the "SoundSchemeTitle".
+    #[test]
+    fn disp_cf_text_title_round_trips() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&1u32.to_le_bytes()); // CF_TEXT
+        body.extend_from_slice(b"Windows Notify\0\0\0"); // NUL-padded title
+        let bytes = wav_with_chunk(b"DISP", &body);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:disp.type"), Some(&"1".to_string()));
+        assert_eq!(md.get("wav:disp.body_len"), Some(&body.len().to_string()));
+        assert_eq!(
+            md.get("wav:disp.title"),
+            Some(&"Windows Notify".to_string())
+        );
+    }
+
+    /// A `DISP` chunk whose clipboard type is not `CF_TEXT` (e.g.
+    /// `CF_DIB == 8`) surfaces only the raw type + body length; the
+    /// binary GDI payload is not interpreted at the container layer.
+    #[test]
+    fn disp_non_text_type_surfaces_header_only() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&8u32.to_le_bytes()); // CF_DIB
+        body.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0x00]);
+        let bytes = wav_with_chunk(b"DISP", &body);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:disp.type"), Some(&"8".to_string()));
+        assert_eq!(md.get("wav:disp.body_len"), Some(&body.len().to_string()));
+        assert!(!md.contains_key("wav:disp.title"));
+    }
+
+    /// A `DISP` body shorter than the 4-byte type DWORD is skipped as
+    /// opaque — only `wav:disp.body_len` surfaces.
+    #[test]
+    fn disp_truncated_body_is_opaque() {
+        let bytes = wav_with_chunk(b"DISP", &[0x01, 0x00]);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:disp.body_len"), Some(&"2".to_string()));
+        assert!(!md.contains_key("wav:disp.type"));
+        assert!(!md.contains_key("wav:disp.title"));
+    }
+
+    /// Build a 10-byte ID3v2 header + caller-supplied frame bytes.
+    /// `major`/`revision`/`flags` are raw; `tag_size` is encoded
+    /// synchsafe per §3.1.
+    fn id3v2_tag(major: u8, revision: u8, flags: u8, frames: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(b"ID3");
+        v.push(major);
+        v.push(revision);
+        v.push(flags);
+        // synchsafe-encode the frame length (28 bits, 7 bits/byte).
+        let n = frames.len() as u32;
+        v.push(((n >> 21) & 0x7F) as u8);
+        v.push(((n >> 14) & 0x7F) as u8);
+        v.push(((n >> 7) & 0x7F) as u8);
+        v.push((n & 0x7F) as u8);
+        v.extend_from_slice(frames);
+        v
+    }
+
+    /// An `id3 ` chunk carrying a canonical ID3v2.3 tag surfaces the
+    /// version, flags and synchsafe-decoded tag size — but not decoded
+    /// frame content (that is `oxideav-id3`'s job).
+    #[test]
+    fn id3_chunk_v23_header_surfaces() {
+        // A single TIT2 frame: id(4) + size(4) + flags(2) + enc(1) + text.
+        let mut frames = Vec::new();
+        frames.extend_from_slice(b"TIT2");
+        let text = b"\x00OxideAV"; // ISO-8859-1 encoding byte + text
+        frames.extend_from_slice(&(text.len() as u32).to_be_bytes());
+        frames.extend_from_slice(&0u16.to_be_bytes());
+        frames.extend_from_slice(text);
+        let tag = id3v2_tag(3, 0, 0x00, &frames);
+        let tag_len = tag.len();
+        let bytes = wav_with_chunk(b"id3 ", &tag);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:id3.version"), Some(&"3.0".to_string()));
+        assert_eq!(md.get("wav:id3.flags"), Some(&"0x00".to_string()));
+        assert_eq!(md.get("wav:id3.tag_size"), Some(&frames.len().to_string()));
+        assert_eq!(md.get("wav:id3.body_len"), Some(&tag_len.to_string()));
+        // No frame-level keys leak from the container layer.
+        assert!(md.keys().all(|k| !k.contains("TIT2")));
+    }
+
+    /// The synchsafe size decode handles the §3.1 worked example
+    /// (`$00 00 02 01` → 257) and the header flag bits decode per §3.1.
+    #[test]
+    fn id3_chunk_synchsafe_and_flags() {
+        // 257 frame bytes (zero-filled) with unsync + extended-header
+        // + experimental flags all set.
+        let frames = vec![0u8; 257];
+        let tag = id3v2_tag(4, 0, 0xE0, &frames);
+        let bytes = wav_with_chunk(b"id3 ", &tag);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:id3.version"), Some(&"4.0".to_string()));
+        assert_eq!(md.get("wav:id3.tag_size"), Some(&"257".to_string()));
+        assert_eq!(md.get("wav:id3.flags"), Some(&"0xE0".to_string()));
+        assert_eq!(
+            md.get("wav:id3.unsynchronisation"),
+            Some(&"true".to_string())
+        );
+        assert_eq!(md.get("wav:id3.extended_header"), Some(&"true".to_string()));
+        assert_eq!(md.get("wav:id3.experimental"), Some(&"true".to_string()));
+        // Verify the synchsafe encoding produced the §3.1 example bytes.
+        assert_eq!(&tag[6..10], &[0x00, 0x00, 0x02, 0x01]);
+    }
+
+    /// An `id3 ` body that doesn't start with the `ID3` magic, or is
+    /// shorter than the 10-byte header, surfaces only `body_len`.
+    #[test]
+    fn id3_chunk_malformed_is_opaque() {
+        let bytes = wav_with_chunk(b"id3 ", b"NOTID3xx");
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:id3.body_len"), Some(&"8".to_string()));
+        assert!(!md.contains_key("wav:id3.version"));
+        assert!(!md.contains_key("wav:id3.tag_size"));
+    }
+
+    /// The uppercase `ID3 ` FOURCC variant is also recognised (some
+    /// writers use the all-caps form even though the ExifTool table
+    /// catalogues the lowercase `id3 `).
+    #[test]
+    fn id3_chunk_uppercase_fourcc() {
+        let tag = id3v2_tag(3, 0, 0x00, &[0u8; 4]);
+        let bytes = wav_with_chunk(b"ID3 ", &tag);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:id3.version"), Some(&"3.0".to_string()));
     }
 
     /// Build a minimal valid PCM WAV with a caller-supplied raw `iXML`
