@@ -332,7 +332,43 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework �
   `wav:chna.<n>.{track_ref,pack_ref}_{kind,definition}`. Bodies shorter
   than the 4-byte pre-amble are skipped-as-opaque; the mux→demux
   round-trip and the BS.2088-2 §8.3.1 stereo worked example are pinned
-  byte-for-byte in tests.
+  byte-for-byte in tests. The `DISP` (Display) chunk — the RIFF
+  "SoundSchemeTitle" convention catalogued in
+  `docs/container/riff/metadata/exiftool-riff-tags.html` (a clipboard-
+  format `type` DWORD followed by a payload in that format) — is
+  supported on BOTH read and write sides through the typed
+  `wav::DispChunk` struct (`parse` / `to_bytes`, plus `DispChunk::text`
+  / `title` for the common `CF_TEXT` display-title form). The demuxer
+  surfaces `wav:disp.{body_len,type}` always plus `wav:disp.title` for
+  the `CF_TEXT` (type == 1) form (text trimmed at the first NUL);
+  non-text clipboard formats surface header-only and the binary GDI
+  payload is not interpreted at the container layer; truncated bodies
+  are skipped-as-opaque. The typed view is reachable via
+  `WavDemuxer::disp()` and the muxer writes the chunk via
+  `WavMuxOptions::with_disp`. The `id3 ` / `ID3 ` (embedded ID3v2 tag)
+  chunk is supported on BOTH sides: the demuxer surfaces the 10-byte
+  ID3v2 header fields for observability per
+  `docs/container/id3/id3v2.3.0.html` §3.1 (`wav:id3.{body_len,version,
+  flags,tag_size}` plus the `.unsynchronisation` / `.extended_header` /
+  `.experimental` flag bits and the §3.1 synchsafe 28-bit `tag_size`
+  decode), and the muxer carries a complete caller-supplied ID3v2 tag
+  verbatim via `WavMuxOptions::with_id3`. Frame
+  encoding/decoding (TIT2, APIC, …) is left to `oxideav-id3` per the
+  codec/container split; malformed / non-`ID3`-magic bodies surface
+  only `body_len`. The `PAD ` (Pad / alignment-padding) chunk — the
+  alignment sibling of `JUNK` in the RIFF MCI §2 "skip/ignore" dispatch
+  group — is accounted under the parallel `wav:pad.*` key namespace
+  (`count` / `total_bytes` / per-chunk `<n>.body_len`), mirroring the
+  `JUNK` contract; the two stay in separate namespaces and absence is
+  observable. The `LIST INFO` text-tag namespace (read since the
+  baseline) is now **write-symmetric** through the typed
+  `wav::InfoChunk` / `wav::InfoEntry` structs (`parse` / `to_bytes`
+  carrying an ordered list of `(sub-ID FOURCC, text)` entries,
+  NUL-terminated + RIFF §2 word-aligned): `WavMuxOptions::with_info`
+  emits a `LIST`(`INFO`) chunk ahead of `data` and the demuxer reads
+  recognised sub-IDs back through their snake_case keys, with the typed
+  view (including unknown/vendor sub-IDs carried verbatim) reachable via
+  `WavDemuxer::info()`.
 - **slin** container: Asterisk-style headerless `.sln*` / `.slin*` raw
   S16LE PCM (extension drives the sample rate).
 - **Y4M (YUV4MPEG2)** container: rawvideo demuxer + muxer for `.y4m` files,
