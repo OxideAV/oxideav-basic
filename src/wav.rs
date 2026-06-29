@@ -712,6 +712,16 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
                     input.seek(SeekFrom::Current(1))?;
                 }
             }
+            b"PAD " => {
+                // RIFF "Pad" chunk: alignment padding for the following
+                // chunk. Like JUNK, the body carries no semantic data;
+                // we account for it under the parallel wav:pad.* keys.
+                input.seek(SeekFrom::Current(size as i64))?;
+                surface_pad_metadata(&mut metadata, size);
+                if size % 2 == 1 {
+                    input.seek(SeekFrom::Current(1))?;
+                }
+            }
             b"slnt" => {
                 // Microsoft RIFF MCI §3 "Wave Data": the `slnt`
                 // (silence) chunk `slnt( <dwSamples:DWORD> )` carries a
@@ -3425,18 +3435,46 @@ fn decode_synchsafe_u32(b: &[u8]) -> u32 {
 /// counter; their `body_len` surfaces as `0`. The spec calls the
 /// filler "of arbitrary size" so a zero-length body is in-range.
 fn surface_junk_metadata(out: &mut Vec<(String, String)>, size: u64) {
+    surface_filler_metadata(out, "junk", size);
+}
+
+/// Surface accounting metadata for a `PAD ` (Pad) chunk per
+/// `docs/container/riff/metadata/microsoft-riffmci.pdf` §2 (the RIFF
+/// padding chunk, listed alongside `JUNK` in the "skip / ignore"
+/// dispatch group of `docs/container/riff/metadata/README.md` step 3).
+///
+/// `PAD ` is the alignment-padding sibling of `JUNK`: where `JUNK`
+/// represents arbitrary filler / outdated data, `PAD ` is written
+/// specifically to align the following chunk to a hardware-friendly
+/// boundary (e.g. a sector or CD-DA frame). Like `JUNK`, its body
+/// carries no semantic payload, so we surface only accounting under the
+/// parallel `wav:pad.*` key namespace (`count`, `total_bytes`, per-chunk
+/// `<n>.body_len`) — mirroring the `JUNK` contract exactly so a
+/// downstream tool can observe how much alignment padding a writer
+/// reserved without re-walking the file or conflating it with `JUNK`.
+fn surface_pad_metadata(out: &mut Vec<(String, String)>, size: u64) {
+    surface_filler_metadata(out, "pad", size);
+}
+
+/// Shared accounting for the semantic-free filler chunks (`JUNK` /
+/// `PAD `). Emits `wav:<prefix>.count`, `wav:<prefix>.total_bytes` and
+/// per-chunk `wav:<prefix>.<n>.body_len` (zero-based by encounter
+/// order), accumulating across multiple chunks of the same kind.
+fn surface_filler_metadata(out: &mut Vec<(String, String)>, prefix: &str, size: u64) {
     // Count existing entries to derive the next zero-based index and
     // the running total. We linear-scan the metadata vector because
     // it's already keyed by string and we want a single source of
     // truth (no parallel counter to forget to update). Metadata
     // vectors stay small (low hundreds of entries) so this is O(n)
-    // per JUNK chunk over a tiny n.
+    // per filler chunk over a tiny n.
+    let count_key = format!("wav:{prefix}.count");
+    let total_key = format!("wav:{prefix}.total_bytes");
     let mut count: u64 = 0;
     let mut total: u64 = 0;
     for (k, v) in out.iter() {
-        if k == "wav:junk.count" {
+        if *k == count_key {
             count = v.parse().unwrap_or(count);
-        } else if k == "wav:junk.total_bytes" {
+        } else if *k == total_key {
             total = v.parse().unwrap_or(total);
         }
     }
@@ -3444,13 +3482,13 @@ fn surface_junk_metadata(out: &mut Vec<(String, String)>, size: u64) {
     count = count.saturating_add(1);
     total = total.saturating_add(size);
     // Per-chunk entry.
-    out.push((format!("wav:junk.{idx}.body_len"), size.to_string()));
+    out.push((format!("wav:{prefix}.{idx}.body_len"), size.to_string()));
     // Update the rolling aggregates. We push fresh entries rather than
     // mutate in place so the vector stays append-only (matching how
     // every other chunk parser in this module emits).
-    out.retain(|(k, _)| k != "wav:junk.count" && k != "wav:junk.total_bytes");
-    out.push(("wav:junk.count".to_string(), count.to_string()));
-    out.push(("wav:junk.total_bytes".to_string(), total.to_string()));
+    out.retain(|(k, _)| *k != count_key && *k != total_key);
+    out.push((count_key, count.to_string()));
+    out.push((total_key, total.to_string()));
 }
 
 /// Surface metadata for a `slnt` (silence) chunk per
@@ -7935,6 +7973,57 @@ mod tests {
         let md: std::collections::HashMap<String, String> =
             dmx.metadata().iter().cloned().collect();
         assert_eq!(md.get("wav:id3.version"), Some(&"3.0".to_string()));
+    }
+
+    /// A `PAD ` (Pad) chunk is accounted under the `wav:pad.*` key
+    /// namespace, mirroring the `JUNK` contract — the body is
+    /// semantic-free so only count / total / per-chunk body_len surface.
+    #[test]
+    fn pad_chunk_accounting() {
+        let bytes = wav_with_chunk(b"PAD ", &[0u8; 16]);
+        let dmx = open_demux_from_bytes(bytes);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:pad.count"), Some(&"1".to_string()));
+        assert_eq!(md.get("wav:pad.total_bytes"), Some(&"16".to_string()));
+        assert_eq!(md.get("wav:pad.0.body_len"), Some(&"16".to_string()));
+        // PAD accounting must not leak into the JUNK namespace.
+        assert!(!md.contains_key("wav:junk.count"));
+    }
+
+    /// Files with no `PAD ` chunk emit no `wav:pad.*` keys (absence is
+    /// observable), and `JUNK` / `PAD ` accounting stay in separate
+    /// namespaces when both are present.
+    #[test]
+    fn pad_and_junk_separate_namespaces() {
+        // Build a WAV carrying one JUNK and one PAD chunk before data.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"RIFF");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(b"WAVE");
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&16u32.to_le_bytes());
+        buf.extend_from_slice(&FMT_PCM.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&8_000u32.to_le_bytes());
+        buf.extend_from_slice(&16_000u32.to_le_bytes());
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(&16u16.to_le_bytes());
+        buf.extend_from_slice(b"JUNK");
+        buf.extend_from_slice(&8u32.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 8]);
+        buf.extend_from_slice(b"PAD ");
+        buf.extend_from_slice(&4u32.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 4]);
+        buf.extend_from_slice(b"data");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        let dmx = open_demux_from_bytes(buf);
+        let md: std::collections::HashMap<String, String> =
+            dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:junk.count"), Some(&"1".to_string()));
+        assert_eq!(md.get("wav:junk.total_bytes"), Some(&"8".to_string()));
+        assert_eq!(md.get("wav:pad.count"), Some(&"1".to_string()));
+        assert_eq!(md.get("wav:pad.total_bytes"), Some(&"4".to_string()));
     }
 
     /// Build a minimal valid PCM WAV with a caller-supplied raw `iXML`
