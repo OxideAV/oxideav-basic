@@ -418,6 +418,14 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
     let mut cue: Option<CueChunk> = None;
     let mut plst: Option<PlaylistChunk> = None;
     let mut adtl: Option<AdtlChunk> = None;
+    // Typed RIFF Display view, populated when a `DISP` chunk parses with
+    // at least the 4-byte clipboard-format `type` header. First
+    // well-formed occurrence wins.
+    let mut disp: Option<DispChunk> = None;
+    // Typed `LIST INFO` view, populated from the first `LIST INFO` chunk
+    // (RIFF MCI §3). Carries every sub-ID verbatim (including unknown /
+    // vendor sub-IDs) for re-emission via `WavMuxOptions::with_info`.
+    let mut info: Option<InfoChunk> = None;
     // RF64/BW64 ds64 (EBU Tech 3306 §3 / Annex A.2): mandatory first
     // chunk after the form header when the magic is RF64 or BW64;
     // otherwise must be absent.
@@ -542,6 +550,12 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
                         let parsed = AdtlChunk::parse(&buf[4..]);
                         if !parsed.entries.is_empty() {
                             adtl = Some(parsed);
+                        }
+                    }
+                    if buf.len() >= 4 && &buf[0..4] == b"INFO" && info.is_none() {
+                        let parsed = InfoChunk::parse(&buf[4..]);
+                        if !parsed.entries.is_empty() {
+                            info = Some(parsed);
                         }
                     }
                     parse_list_chunk(&buf, &mut metadata);
@@ -680,6 +694,9 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
                 let mut buf = vec![0u8; size as usize];
                 input.read_exact(&mut buf)?;
                 parse_disp_chunk(&buf, &mut metadata);
+                if disp.is_none() {
+                    disp = DispChunk::parse(&buf);
+                }
                 if size % 2 == 1 {
                     input.seek(SeekFrom::Current(1))?;
                 }
@@ -875,6 +892,8 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
         cue,
         plst,
         adtl,
+        disp,
+        info,
     })
 }
 
@@ -4408,6 +4427,8 @@ pub struct WavDemuxer {
     cue: Option<CueChunk>,
     plst: Option<PlaylistChunk>,
     adtl: Option<AdtlChunk>,
+    disp: Option<DispChunk>,
+    info: Option<InfoChunk>,
 }
 
 impl WavDemuxer {
@@ -4531,6 +4552,25 @@ impl WavDemuxer {
     /// metadata keys; re-emittable via [`WavMuxOptions::with_adtl`].
     pub fn adtl(&self) -> Option<&AdtlChunk> {
         self.adtl.as_ref()
+    }
+
+    /// Typed view of the `DISP` (Display) chunk when the file carried one
+    /// with at least the 4-byte clipboard-format `type` header (the WAV
+    /// "SoundSchemeTitle" convention). `None` when absent or truncated.
+    /// Mirrored under the `wav:disp.*` metadata keys; re-emittable via
+    /// [`WavMuxOptions::with_disp`].
+    pub fn disp(&self) -> Option<&DispChunk> {
+        self.disp.as_ref()
+    }
+
+    /// Typed view of the `LIST INFO` (text metadata) chunk when the file
+    /// carried one with at least one entry (RIFF MCI §3 "INFO List
+    /// Chunk"). `None` when absent. Carries every sub-ID verbatim
+    /// (including unknown / vendor sub-IDs); the recognised ones are also
+    /// mirrored under their snake_case metadata keys, and the whole list
+    /// is re-emittable via [`WavMuxOptions::with_info`].
+    pub fn info(&self) -> Option<&InfoChunk> {
+        self.info.as_ref()
     }
 }
 
@@ -10036,6 +10076,51 @@ mod tests {
         assert_eq!(md.get("title"), Some(&"Round 380 Title".to_string()));
         assert_eq!(md.get("artist"), Some(&"OxideAV".to_string()));
         assert_eq!(md.get("encoder"), Some(&"oxideav-basic".to_string()));
+    }
+
+    /// A WAV muxed with DISP + id3 + LIST INFO chunks round-trips
+    /// through the concrete `open_wav_demuxer` typed accessors
+    /// (`disp()` / `info()`), and the PCM payload is byte-identical.
+    #[test]
+    fn disp_id3_info_typed_accessors_round_trip() {
+        use std::io::Cursor;
+        let samples: Vec<i16> = (0..64).map(|i| ((i * 73) - 2000) as i16).collect();
+        let mut payload = Vec::with_capacity(samples.len() * 2);
+        for s in &samples {
+            payload.extend_from_slice(&s.to_le_bytes());
+        }
+        let id3_tag = id3v2_tag(3, 0, 0x00, &[0u8; 8]);
+        let info = InfoChunk::default()
+            .with_entry(*b"INAM", "Combined")
+            .with_entry(*b"IART", "OxideAV");
+        let stream = make_stream(SampleFormat::S16, 1, 8_000);
+        let opts = WavMuxOptions::default()
+            .with_disp(DispChunk::text("Display Title"))
+            .with_id3(id3_tag)
+            .with_info(info.clone());
+        let bytes = mux_to_bytes(&stream, &payload, opts, "combined-rt");
+
+        let dmx = open_wav_demuxer(Box::new(Cursor::new(bytes.clone()))).unwrap();
+        let disp = dmx.disp().expect("typed disp present");
+        assert_eq!(disp.cf_type, CF_TEXT);
+        assert_eq!(disp.title().as_deref(), Some("Display Title"));
+        let got_info = dmx.info().expect("typed info present");
+        assert_eq!(got_info, &info);
+
+        // PCM payload survives byte-for-byte.
+        let mut demux = open_demux_from_bytes(bytes);
+        let pkt = demux.next_packet().unwrap();
+        assert_eq!(&pkt.data[..payload.len()], &payload[..]);
+    }
+
+    /// An absent DISP / INFO chunk leaves the typed accessors at `None`.
+    #[test]
+    fn disp_info_typed_accessors_absent() {
+        use std::io::Cursor;
+        let plain = wav_with_chunk(b"JUNK", &[0u8; 4]);
+        let dmx = open_wav_demuxer(Box::new(Cursor::new(plain))).unwrap();
+        assert_eq!(dmx.disp(), None);
+        assert_eq!(dmx.info(), None);
     }
 
     /// Build a minimal valid WAV file whose `LIST INFO` chunk carries
