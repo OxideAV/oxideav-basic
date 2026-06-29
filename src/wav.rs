@@ -426,6 +426,10 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
     // (RIFF MCI §3). Carries every sub-ID verbatim (including unknown /
     // vendor sub-IDs) for re-emission via `WavMuxOptions::with_info`.
     let mut info: Option<InfoChunk> = None;
+    // Typed sampler / instrument views, populated from the `smpl` / `inst`
+    // chunks (RIFF MCI §3). First well-formed occurrence of each wins.
+    let mut smpl: Option<SmplChunk> = None;
+    let mut inst: Option<InstChunk> = None;
     // RF64/BW64 ds64 (EBU Tech 3306 §3 / Annex A.2): mandatory first
     // chunk after the form header when the magic is RF64 or BW64;
     // otherwise must be absent.
@@ -597,7 +601,10 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
             b"smpl" => {
                 let mut buf = vec![0u8; size as usize];
                 input.read_exact(&mut buf)?;
-                parse_smpl_chunk(&buf, &mut metadata);
+                let parsed = parse_smpl_chunk(&buf, &mut metadata);
+                if smpl.is_none() {
+                    smpl = parsed;
+                }
                 if size % 2 == 1 {
                     input.seek(SeekFrom::Current(1))?;
                 }
@@ -605,7 +612,10 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
             b"inst" => {
                 let mut buf = vec![0u8; size as usize];
                 input.read_exact(&mut buf)?;
-                parse_inst_chunk(&buf, &mut metadata);
+                let parsed = parse_inst_chunk(&buf, &mut metadata);
+                if inst.is_none() {
+                    inst = parsed;
+                }
                 if size % 2 == 1 {
                     input.seek(SeekFrom::Current(1))?;
                 }
@@ -894,6 +904,8 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
         adtl,
         disp,
         info,
+        smpl,
+        inst,
     })
 }
 
@@ -1832,94 +1844,66 @@ impl AdtlChunk {
 /// carries is clamped to the records that fit (defensive against
 /// writers that lie about the count); a body shorter than the 36-byte
 /// fixed header is treated as opaque and skipped.
-fn parse_smpl_chunk(buf: &[u8], out: &mut Vec<(String, String)>) {
-    const FIXED_LEN: usize = 36;
-    const LOOP_LEN: usize = 24;
-    if buf.len() < FIXED_LEN {
-        return;
-    }
-    let r = |off: usize| -> u32 {
-        u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
-    };
-    let manufacturer = r(0);
-    let product = r(4);
-    let sample_period = r(8);
-    let midi_unity_note = r(12);
-    let midi_pitch_fraction = r(16);
-    let smpte_format = r(20);
-    let smpte_offset = r(24);
-    let num_loops_claimed = r(28);
-    let sampler_data_len = r(32);
-
+fn parse_smpl_chunk(buf: &[u8], out: &mut Vec<(String, String)>) -> Option<SmplChunk> {
+    let smpl = SmplChunk::parse(buf)?;
     out.push((
         "wav:smpl.manufacturer".to_string(),
-        manufacturer.to_string(),
+        smpl.manufacturer.to_string(),
     ));
-    out.push(("wav:smpl.product".to_string(), product.to_string()));
+    out.push(("wav:smpl.product".to_string(), smpl.product.to_string()));
     out.push((
         "wav:smpl.sample_period".to_string(),
-        sample_period.to_string(),
+        smpl.sample_period.to_string(),
     ));
     out.push((
         "wav:smpl.midi_unity_note".to_string(),
-        midi_unity_note.to_string(),
+        smpl.midi_unity_note.to_string(),
     ));
     out.push((
         "wav:smpl.midi_pitch_fraction".to_string(),
-        midi_pitch_fraction.to_string(),
+        smpl.midi_pitch_fraction.to_string(),
     ));
     out.push((
         "wav:smpl.smpte_format".to_string(),
-        smpte_format.to_string(),
+        smpl.smpte_format.to_string(),
     ));
     // SMPTE offset packs HH MM SS FF in the high-to-low bytes of the
     // DWORD. Render the canonical HH:MM:SS:FF form alongside the raw
     // value for callers that prefer the on-wire integer.
-    let smpte_hh = (smpte_offset >> 24) & 0xFF;
-    let smpte_mm = (smpte_offset >> 16) & 0xFF;
-    let smpte_ss = (smpte_offset >> 8) & 0xFF;
-    let smpte_ff = smpte_offset & 0xFF;
+    let smpte_hh = (smpl.smpte_offset >> 24) & 0xFF;
+    let smpte_mm = (smpl.smpte_offset >> 16) & 0xFF;
+    let smpte_ss = (smpl.smpte_offset >> 8) & 0xFF;
+    let smpte_ff = smpl.smpte_offset & 0xFF;
     out.push((
         "wav:smpl.smpte_offset".to_string(),
         format!("{smpte_hh:02}:{smpte_mm:02}:{smpte_ss:02}:{smpte_ff:02}"),
     ));
     out.push((
         "wav:smpl.sampler_data_len".to_string(),
-        sampler_data_len.to_string(),
+        smpl.sampler_data_len.to_string(),
     ));
-
-    let body = &buf[FIXED_LEN..];
-    let num_loops_fits = (body.len() / LOOP_LEN) as u32;
-    let num_loops = num_loops_claimed.min(num_loops_fits);
     out.push((
         "wav:smpl.num_sample_loops".to_string(),
-        num_loops.to_string(),
+        smpl.loops.len().to_string(),
     ));
-    for i in 0..num_loops as usize {
-        let off = i * LOOP_LEN;
-        let loop_field = |word: usize| -> u32 {
-            let p = off + word * 4;
-            u32::from_le_bytes([body[p], body[p + 1], body[p + 2], body[p + 3]])
-        };
-        let cue_point_id = loop_field(0);
-        let loop_type = loop_field(1);
-        let start = loop_field(2);
-        let end = loop_field(3);
-        let fraction = loop_field(4);
-        let play_count = loop_field(5);
+    for (i, lp) in smpl.loops.iter().enumerate() {
         out.push((
             format!("wav:smpl.loop.{i}.cue_point_id"),
-            cue_point_id.to_string(),
+            lp.cue_point_id.to_string(),
         ));
-        out.push((format!("wav:smpl.loop.{i}.type"), loop_type.to_string()));
-        out.push((format!("wav:smpl.loop.{i}.start"), start.to_string()));
-        out.push((format!("wav:smpl.loop.{i}.end"), end.to_string()));
-        out.push((format!("wav:smpl.loop.{i}.fraction"), fraction.to_string()));
+        out.push((format!("wav:smpl.loop.{i}.type"), lp.loop_type.to_string()));
+        out.push((format!("wav:smpl.loop.{i}.start"), lp.start.to_string()));
+        out.push((format!("wav:smpl.loop.{i}.end"), lp.end.to_string()));
+        out.push((
+            format!("wav:smpl.loop.{i}.fraction"),
+            lp.fraction.to_string(),
+        ));
         out.push((
             format!("wav:smpl.loop.{i}.play_count"),
-            play_count.to_string(),
+            lp.play_count.to_string(),
         ));
     }
+    Some(smpl)
 }
 
 /// Parse an `inst` (Instrument) chunk body and emit `wav:inst.*`
@@ -1939,34 +1923,224 @@ fn parse_smpl_chunk(buf: &[u8], out: &mut Vec<(String, String)>) {
 ///
 /// A body shorter than the 7-byte fixed struct is treated as opaque
 /// and skipped.
-fn parse_inst_chunk(buf: &[u8], out: &mut Vec<(String, String)>) {
-    const FIXED_LEN: usize = 7;
-    if buf.len() < FIXED_LEN {
-        return;
-    }
-    let unshifted_note = buf[0];
-    let fine_tune = buf[1] as i8;
-    let gain = buf[2] as i8;
-    let low_note = buf[3];
-    let high_note = buf[4];
-    let low_velocity = buf[5];
-    let high_velocity = buf[6];
+fn parse_inst_chunk(buf: &[u8], out: &mut Vec<(String, String)>) -> Option<InstChunk> {
+    let inst = InstChunk::parse(buf)?;
     out.push((
         "wav:inst.unshifted_note".to_string(),
-        unshifted_note.to_string(),
+        inst.unshifted_note.to_string(),
     ));
-    out.push(("wav:inst.fine_tune".to_string(), fine_tune.to_string()));
-    out.push(("wav:inst.gain".to_string(), gain.to_string()));
-    out.push(("wav:inst.low_note".to_string(), low_note.to_string()));
-    out.push(("wav:inst.high_note".to_string(), high_note.to_string()));
+    out.push(("wav:inst.fine_tune".to_string(), inst.fine_tune.to_string()));
+    out.push(("wav:inst.gain".to_string(), inst.gain.to_string()));
+    out.push(("wav:inst.low_note".to_string(), inst.low_note.to_string()));
+    out.push(("wav:inst.high_note".to_string(), inst.high_note.to_string()));
     out.push((
         "wav:inst.low_velocity".to_string(),
-        low_velocity.to_string(),
+        inst.low_velocity.to_string(),
     ));
     out.push((
         "wav:inst.high_velocity".to_string(),
-        high_velocity.to_string(),
+        inst.high_velocity.to_string(),
     ));
+    Some(inst)
+}
+
+/// Typed view of an `inst` (Instrument) chunk body (RIFF MCI §3
+/// "Instrument Chunk"; field layout per the ExifTool RIFF Instrument
+/// Tags table). The 7-byte fixed struct carries MIDI sampler-mapping
+/// metadata; `fine_tune` (cents) and `gain` (dB) are signed 8-bit, the
+/// note / velocity fields are unsigned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct InstChunk {
+    /// MIDI note the unmodified sample plays at (0..=127).
+    pub unshifted_note: u8,
+    /// Pitch correction in cents (signed; −50..=50 in practice).
+    pub fine_tune: i8,
+    /// Playback gain in dB (signed).
+    pub gain: i8,
+    /// Lowest MIDI note this sample maps to (0..=127).
+    pub low_note: u8,
+    /// Highest MIDI note this sample maps to (0..=127).
+    pub high_note: u8,
+    /// Lowest MIDI velocity this sample maps to (1..=127).
+    pub low_velocity: u8,
+    /// Highest MIDI velocity this sample maps to (1..=127).
+    pub high_velocity: u8,
+}
+
+impl InstChunk {
+    /// On-wire body length (the 7-byte fixed struct).
+    pub const BODY_LEN: usize = 7;
+
+    /// Parse an `inst` chunk body. Returns `None` when the body is
+    /// shorter than the 7-byte fixed struct.
+    pub fn parse(buf: &[u8]) -> Option<Self> {
+        if buf.len() < Self::BODY_LEN {
+            return None;
+        }
+        Some(Self {
+            unshifted_note: buf[0],
+            fine_tune: buf[1] as i8,
+            gain: buf[2] as i8,
+            low_note: buf[3],
+            high_note: buf[4],
+            low_velocity: buf[5],
+            high_velocity: buf[6],
+        })
+    }
+
+    /// Serialize to the 7-byte on-wire body.
+    pub fn to_bytes(&self) -> [u8; 7] {
+        [
+            self.unshifted_note,
+            self.fine_tune as u8,
+            self.gain as u8,
+            self.low_note,
+            self.high_note,
+            self.low_velocity,
+            self.high_velocity,
+        ]
+    }
+}
+
+/// A single `smpl` (Sampler) chunk loop record (24-byte fixed layout
+/// per RIFF MCI §3 "Sample Loops"). All fields are little-endian u32.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct SampleLoop {
+    /// The cue-point id this loop is anchored to.
+    pub cue_point_id: u32,
+    /// Loop type (0 = forward, 1 = ping-pong, 2 = backward, ≥ 3 = vendor).
+    pub loop_type: u32,
+    /// Start byte/sample offset of the loop.
+    pub start: u32,
+    /// End byte/sample offset of the loop.
+    pub end: u32,
+    /// Fractional sample adjustment for the loop end.
+    pub fraction: u32,
+    /// Loop play count (0 = infinite).
+    pub play_count: u32,
+}
+
+impl SampleLoop {
+    /// On-wire length of a single loop record.
+    pub const LEN: usize = 24;
+
+    fn to_bytes(self) -> [u8; 24] {
+        let mut out = [0u8; 24];
+        out[0..4].copy_from_slice(&self.cue_point_id.to_le_bytes());
+        out[4..8].copy_from_slice(&self.loop_type.to_le_bytes());
+        out[8..12].copy_from_slice(&self.start.to_le_bytes());
+        out[12..16].copy_from_slice(&self.end.to_le_bytes());
+        out[16..20].copy_from_slice(&self.fraction.to_le_bytes());
+        out[20..24].copy_from_slice(&self.play_count.to_le_bytes());
+        out
+    }
+}
+
+/// Typed view of a `smpl` (Sampler) chunk body (RIFF MCI §3 "Sampler
+/// Chunk"). The 36-byte fixed struct carries the sampler mapping plus a
+/// `num_sample_loops`-long array of [`SampleLoop`] records and an
+/// optional vendor `sampler_data` tail. All multi-byte integers are
+/// little-endian.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct SmplChunk {
+    /// MIDI Manufacturer's Association id (0 = unspecified).
+    pub manufacturer: u32,
+    /// Manufacturer-assigned product id.
+    pub product: u32,
+    /// Sample period in nanoseconds (`1e9 / sample_rate`).
+    pub sample_period: u32,
+    /// MIDI note the sample plays at unmodified (0..=127).
+    pub midi_unity_note: u32,
+    /// Fractional tuning of `midi_unity_note` (0x80000000 = ½ semitone).
+    pub midi_pitch_fraction: u32,
+    /// SMPTE format (0 = none, else 24 / 25 / 29 / 30 fps).
+    pub smpte_format: u32,
+    /// SMPTE offset, packed `HH MM SS FF` high-to-low byte.
+    pub smpte_offset: u32,
+    /// Vendor-specific tail length (`sampler_data` byte count).
+    pub sampler_data_len: u32,
+    /// The loop records.
+    pub loops: Vec<SampleLoop>,
+    /// Vendor-specific tail bytes carried verbatim (length should match
+    /// `sampler_data_len` but the on-wire bytes win for lossless
+    /// round-trip).
+    pub sampler_data: Vec<u8>,
+}
+
+impl SmplChunk {
+    /// On-wire length of the fixed (pre-loop) struct.
+    pub const FIXED_LEN: usize = 36;
+
+    /// Parse a `smpl` chunk body. Returns `None` when the body is
+    /// shorter than the 36-byte fixed struct. Claimed loop counts that
+    /// overrun the body are clamped to what fits (matching the demuxer's
+    /// metadata-key behaviour).
+    pub fn parse(buf: &[u8]) -> Option<Self> {
+        if buf.len() < Self::FIXED_LEN {
+            return None;
+        }
+        let r = |off: usize| -> u32 {
+            u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+        };
+        let num_loops_claimed = r(28);
+        let body = &buf[Self::FIXED_LEN..];
+        let num_loops_fits = (body.len() / SampleLoop::LEN) as u32;
+        let num_loops = num_loops_claimed.min(num_loops_fits);
+        let mut loops = Vec::with_capacity(num_loops as usize);
+        for i in 0..num_loops as usize {
+            let off = i * SampleLoop::LEN;
+            let f = |word: usize| -> u32 {
+                let p = off + word * 4;
+                u32::from_le_bytes([body[p], body[p + 1], body[p + 2], body[p + 3]])
+            };
+            loops.push(SampleLoop {
+                cue_point_id: f(0),
+                loop_type: f(1),
+                start: f(2),
+                end: f(3),
+                fraction: f(4),
+                play_count: f(5),
+            });
+        }
+        // Any bytes past the consumed loop array are the vendor tail.
+        let consumed = num_loops as usize * SampleLoop::LEN;
+        let sampler_data = body.get(consumed..).unwrap_or(&[]).to_vec();
+        Some(Self {
+            manufacturer: r(0),
+            product: r(4),
+            sample_period: r(8),
+            midi_unity_note: r(12),
+            midi_pitch_fraction: r(16),
+            smpte_format: r(20),
+            smpte_offset: r(24),
+            sampler_data_len: r(32),
+            loops,
+            sampler_data,
+        })
+    }
+
+    /// Serialize to the on-wire body: the 36-byte fixed struct, then the
+    /// loop array, then the vendor tail. `num_sample_loops` is written as
+    /// the actual `loops` length (not any stale claimed count).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(
+            Self::FIXED_LEN + self.loops.len() * SampleLoop::LEN + self.sampler_data.len(),
+        );
+        out.extend_from_slice(&self.manufacturer.to_le_bytes());
+        out.extend_from_slice(&self.product.to_le_bytes());
+        out.extend_from_slice(&self.sample_period.to_le_bytes());
+        out.extend_from_slice(&self.midi_unity_note.to_le_bytes());
+        out.extend_from_slice(&self.midi_pitch_fraction.to_le_bytes());
+        out.extend_from_slice(&self.smpte_format.to_le_bytes());
+        out.extend_from_slice(&self.smpte_offset.to_le_bytes());
+        out.extend_from_slice(&(self.loops.len() as u32).to_le_bytes());
+        out.extend_from_slice(&self.sampler_data_len.to_le_bytes());
+        for lp in &self.loops {
+            out.extend_from_slice(&lp.to_bytes());
+        }
+        out.extend_from_slice(&self.sampler_data);
+        out
+    }
 }
 
 /// `AcidChunk::flags` bit 0 — the clip is a one-shot (played once,
@@ -4429,6 +4603,8 @@ pub struct WavDemuxer {
     adtl: Option<AdtlChunk>,
     disp: Option<DispChunk>,
     info: Option<InfoChunk>,
+    smpl: Option<SmplChunk>,
+    inst: Option<InstChunk>,
 }
 
 impl WavDemuxer {
@@ -4572,6 +4748,24 @@ impl WavDemuxer {
     pub fn info(&self) -> Option<&InfoChunk> {
         self.info.as_ref()
     }
+
+    /// Typed view of the `smpl` (Sampler) chunk when the file carried one
+    /// with a well-formed body (RIFF MCI §3 "Sampler Chunk", ≥ 36-byte
+    /// fixed struct). `None` when absent or truncated. Mirrored under the
+    /// `wav:smpl.*` metadata keys; re-emittable via
+    /// [`WavMuxOptions::with_smpl`].
+    pub fn smpl(&self) -> Option<&SmplChunk> {
+        self.smpl.as_ref()
+    }
+
+    /// Typed view of the `inst` (Instrument) chunk when the file carried
+    /// one with a well-formed body (RIFF MCI §3 "Instrument Chunk",
+    /// ≥ 7-byte fixed struct). `None` when absent or truncated. Mirrored
+    /// under the `wav:inst.*` metadata keys; re-emittable via
+    /// [`WavMuxOptions::with_inst`].
+    pub fn inst(&self) -> Option<&InstChunk> {
+        self.inst.as_ref()
+    }
 }
 
 impl Demuxer for WavDemuxer {
@@ -4683,6 +4877,8 @@ fn open_muxer(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Box<
         disp: None,
         id3: None,
         info: None,
+        smpl: None,
+        inst: None,
         cue: None,
         plst: None,
         adtl: None,
@@ -4719,6 +4915,8 @@ pub struct WavMuxOptions {
     disp: Option<DispChunk>,
     id3: Option<Vec<u8>>,
     info: Option<InfoChunk>,
+    smpl: Option<SmplChunk>,
+    inst: Option<InstChunk>,
     cue: Option<CueChunk>,
     plst: Option<PlaylistChunk>,
     adtl: Option<AdtlChunk>,
@@ -4874,6 +5072,24 @@ impl WavMuxOptions {
         self
     }
 
+    /// Emit a `smpl` (Sampler) chunk ahead of the `data` chunk (RIFF MCI
+    /// §3 "Sampler Chunk"; see [`SmplChunk`]). The body is `36 + 24*N +
+    /// sampler_data` bytes; when that total is odd the muxer writes the
+    /// RIFF §2 word-alignment pad byte after it.
+    pub fn with_smpl(mut self, smpl: SmplChunk) -> Self {
+        self.smpl = Some(smpl);
+        self
+    }
+
+    /// Emit an `inst` (Instrument) chunk ahead of the `data` chunk (RIFF
+    /// MCI §3 "Instrument Chunk"; see [`InstChunk`]). The fixed 7-byte
+    /// body is odd, so the muxer always writes the RIFF §2 word-alignment
+    /// pad byte after it.
+    pub fn with_inst(mut self, inst: InstChunk) -> Self {
+        self.inst = Some(inst);
+        self
+    }
+
     /// Emit a `cue ` (cue-points) chunk after the `data` waveform
     /// (RIFF MCI §3 "Cue-Points Chunk"). Cue / playlist / associated-
     /// data chunks reference sample positions in the `data` payload, so
@@ -4961,6 +5177,8 @@ pub fn open_muxer_with(
         disp: opts.disp,
         id3: opts.id3,
         info: opts.info,
+        smpl: opts.smpl,
+        inst: opts.inst,
         cue: opts.cue,
         plst: opts.plst,
         adtl: opts.adtl,
@@ -5074,6 +5292,12 @@ struct WavMuxer {
     /// Caller-supplied `LIST INFO` text metadata, emitted as a `LIST`
     /// (`INFO`) chunk ahead of `data` when present (RIFF MCI §3).
     info: Option<InfoChunk>,
+    /// Caller-supplied sampler metadata, emitted as a `smpl` chunk ahead
+    /// of `data` when present (RIFF MCI §3).
+    smpl: Option<SmplChunk>,
+    /// Caller-supplied instrument metadata, emitted as an `inst` chunk
+    /// ahead of `data` when present (RIFF MCI §3).
+    inst: Option<InstChunk>,
     /// Caller-supplied cue-points, emitted as a `cue ` chunk *after*
     /// `data` in the trailer when present (RIFF MCI §3).
     cue: Option<CueChunk>,
@@ -5268,6 +5492,32 @@ impl Muxer for WavMuxer {
             if body.len() % 2 == 1 {
                 self.output.write_all(&[0u8])?;
             }
+        }
+
+        // `smpl` chunk: caller-supplied sampler metadata (RIFF MCI §3).
+        // Body is 36 + 24*N + sampler_data bytes; an odd vendor tail
+        // makes it odd, so a RIFF §2 word-alignment pad byte is written
+        // when needed.
+        if let Some(smpl) = &self.smpl {
+            let body = smpl.to_bytes();
+            self.output.write_all(b"smpl")?;
+            self.output.write_all(&(body.len() as u32).to_le_bytes())?;
+            self.output.write_all(&body)?;
+            if body.len() % 2 == 1 {
+                self.output.write_all(&[0u8])?;
+            }
+        }
+
+        // `inst` chunk: caller-supplied instrument metadata (RIFF MCI
+        // §3). The fixed body is 7 bytes (odd), so the RIFF §2
+        // word-alignment pad byte is always written after it.
+        if let Some(inst) = &self.inst {
+            let body = inst.to_bytes();
+            self.output.write_all(b"inst")?;
+            self.output.write_all(&(body.len() as u32).to_le_bytes())?;
+            self.output.write_all(&body)?;
+            // body.len() == 7 is always odd.
+            self.output.write_all(&[0u8])?;
         }
 
         // `acid` chunk: caller-supplied Acidizer loop/tempo metadata
@@ -6749,6 +6999,103 @@ mod tests {
         buf.extend_from_slice(b"data");
         buf.extend_from_slice(&0u32.to_le_bytes());
         buf
+    }
+
+    /// `SmplChunk` / `InstChunk` `parse` ↔ `to_bytes` are byte-lossless
+    /// (including the loop array and a vendor `sampler_data` tail).
+    #[test]
+    fn smpl_inst_typed_parse_to_bytes_symmetric() {
+        let smpl = SmplChunk {
+            manufacturer: 0x1234,
+            product: 0xDEAD_BEEF,
+            sample_period: 22_675,
+            midi_unity_note: 60,
+            midi_pitch_fraction: 0x8000_0000,
+            smpte_format: 30,
+            smpte_offset: 0x01_02_03_04,
+            sampler_data_len: 3,
+            loops: vec![
+                SampleLoop {
+                    cue_point_id: 7,
+                    loop_type: 0,
+                    start: 0,
+                    end: 1000,
+                    fraction: 0,
+                    play_count: 0,
+                },
+                SampleLoop {
+                    cue_point_id: 9,
+                    loop_type: 1,
+                    start: 500,
+                    end: 1500,
+                    fraction: 0,
+                    play_count: 4,
+                },
+            ],
+            sampler_data: vec![0xAA, 0xBB, 0xCC],
+        };
+        let round = SmplChunk::parse(&smpl.to_bytes()).unwrap();
+        assert_eq!(round, smpl);
+        assert_eq!(round.loops.len(), 2);
+
+        let inst = InstChunk {
+            unshifted_note: 60,
+            fine_tune: -12,
+            gain: -3,
+            low_note: 48,
+            high_note: 72,
+            low_velocity: 1,
+            high_velocity: 127,
+        };
+        assert_eq!(InstChunk::parse(&inst.to_bytes()).unwrap(), inst);
+        assert!(InstChunk::parse(&[0u8; 6]).is_none());
+        assert!(SmplChunk::parse(&[0u8; 35]).is_none());
+    }
+
+    /// `with_smpl` / `with_inst` write chunks the demuxer reads back
+    /// through the typed `smpl()` / `inst()` accessors, placed ahead of
+    /// `data`.
+    #[test]
+    fn smpl_inst_write_read_round_trip() {
+        use std::io::Cursor;
+        let samples: Vec<i16> = (0..20).map(|i| (i * 300) as i16).collect();
+        let mut payload = Vec::with_capacity(samples.len() * 2);
+        for s in &samples {
+            payload.extend_from_slice(&s.to_le_bytes());
+        }
+        let smpl = SmplChunk {
+            midi_unity_note: 60,
+            loops: vec![SampleLoop {
+                cue_point_id: 1,
+                loop_type: 0,
+                start: 0,
+                end: 19,
+                fraction: 0,
+                play_count: 0,
+            }],
+            ..Default::default()
+        };
+        let inst = InstChunk {
+            unshifted_note: 60,
+            fine_tune: 5,
+            gain: -2,
+            low_note: 0,
+            high_note: 127,
+            low_velocity: 1,
+            high_velocity: 127,
+        };
+        let stream = make_stream(SampleFormat::S16, 1, 44_100);
+        let opts = WavMuxOptions::default()
+            .with_smpl(smpl.clone())
+            .with_inst(inst);
+        let bytes = mux_to_bytes(&stream, &payload, opts, "smpl-inst-rt");
+        let smpl_at = find_chunk(&bytes, b"smpl").expect("smpl present");
+        let inst_at = find_chunk(&bytes, b"inst").expect("inst present");
+        let data_at = find_chunk(&bytes, b"data").expect("data present");
+        assert!(smpl_at < data_at && inst_at < data_at);
+        let dmx = open_wav_demuxer(Box::new(Cursor::new(bytes))).unwrap();
+        assert_eq!(dmx.smpl().unwrap(), &smpl);
+        assert_eq!(dmx.inst().unwrap(), &inst);
     }
 
     /// Build a `smpl` fixed header (36 bytes) followed by N sample-loop

@@ -136,7 +136,14 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework â€
   low_velocity,high_velocity}` (signed `fine_tune` / `gain` decoded as
   `i8`). Loop counts that exceed the chunk body are clamped; bodies
   shorter than the 36-byte `smpl` / 7-byte `inst` fixed header are
-  treated as opaque. The `iXML` third-party metadata block (the
+  treated as opaque. Both chunks are now also supported on the **write**
+  side (read/write symmetry) through the typed `wav::SmplChunk` /
+  `wav::SampleLoop` / `wav::InstChunk` structs (`parse` / `to_bytes`
+  byte-lossless â€” the `smpl` loop array + vendor `sampler_data` tail
+  round-trip verbatim, `num_sample_loops` re-derived on write):
+  `WavMuxOptions::with_smpl` / `with_inst` emit the chunks ahead of
+  `data`, with the typed views reachable via `WavDemuxer::smpl()` /
+  `inst()`. The `iXML` third-party metadata block (the
   production-recorder schema catalogued in ExifTool's RIFF tag
   table) is surfaced through `wav:ixml` (UTF-8 text payload, trimmed
   at the first NUL + surrounding whitespace) and `wav:ixml.body_len`
