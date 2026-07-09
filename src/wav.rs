@@ -148,12 +148,16 @@ fn parse_ds64_chunk(buf: &[u8], out: &mut Vec<(String, String)>) -> Result<Ds64>
     out.push(("wav:rf64.table.count".to_string(), table_len.to_string()));
 
     const REC_LEN: usize = 12;
-    let mut table = Vec::with_capacity(table_len);
     let table_bytes_available = buf.len().saturating_sub(28);
     let table_recs_available = table_bytes_available / REC_LEN;
     // Defensive vs. writers that lie about the count: only consume as
     // many records as the body actually carries.
     let n = table_len.min(table_recs_available);
+    // Reserve against the *available* record count, never the declared
+    // `table_len` — that field is an untrusted u32 and a 28-byte body
+    // can name up to 0xFFFF_FFFF records (~68 GiB reservation), a
+    // denial-of-service. `n` is the true upper bound on records read.
+    let mut table = Vec::with_capacity(n);
     for i in 0..n {
         let off = 28 + i * REC_LEN;
         let id: [u8; 4] = [buf[off], buf[off + 1], buf[off + 2], buf[off + 3]];
@@ -11731,5 +11735,87 @@ mod tests {
         bytes.extend_from_slice(b"jun");
         let dmx = try_open(bytes).expect("partial trailing header must not abort the parse");
         assert_eq!(dmx.streams()[0].params.channels, Some(1));
+    }
+
+    /// Build a minimal RF64 WAVE whose mandatory `ds64` chunk carries the
+    /// given 28-byte prefix fields plus `table_bytes` of raw record data,
+    /// then a 16-byte PCM `fmt ` and an empty `data`. The declared
+    /// `table_len` is written verbatim so a lie can be exercised.
+    fn rf64_with_ds64(
+        data_size: u64,
+        sample_count: u64,
+        table_len: u32,
+        table_bytes: &[u8],
+    ) -> Vec<u8> {
+        let mut ds64 = Vec::new();
+        ds64.extend_from_slice(&0u64.to_le_bytes()); // riffSize
+        ds64.extend_from_slice(&data_size.to_le_bytes()); // dataSize
+        ds64.extend_from_slice(&sample_count.to_le_bytes()); // sampleCount
+        ds64.extend_from_slice(&table_len.to_le_bytes()); // tableLength (may lie)
+        ds64.extend_from_slice(table_bytes);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"RF64");
+        buf.extend_from_slice(&SIZE64_SENTINEL.to_le_bytes()); // legacy riff size = sentinel
+        buf.extend_from_slice(b"WAVE");
+        buf.extend_from_slice(b"ds64");
+        buf.extend_from_slice(&(ds64.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&ds64);
+        if ds64.len() % 2 == 1 {
+            buf.push(0);
+        }
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&16u32.to_le_bytes());
+        buf.extend_from_slice(&WAVE_FORMAT_PCM.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&8_000u32.to_le_bytes());
+        buf.extend_from_slice(&16_000u32.to_le_bytes());
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(&16u16.to_le_bytes());
+        buf.extend_from_slice(b"data");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf
+    }
+
+    /// A `ds64` whose `tableLength` field claims 0xFFFF_FFFF records but
+    /// whose body carries none must parse with an empty table — the
+    /// reservation is bounded by the bytes actually present, never the
+    /// declared count (~68 GiB of `([u8;4], u64)` otherwise). The lie is
+    /// still surfaced verbatim through `wav:rf64.table.count`.
+    #[test]
+    fn ds64_table_len_lie_does_not_over_reserve() {
+        let buf = rf64_with_ds64(0, 0, 0xFFFF_FFFF, &[]);
+        let dmx = try_open(buf).expect("RF64 with an empty ds64 table must parse");
+        let meta: std::collections::HashMap<_, _> = dmx.metadata().iter().cloned().collect();
+        assert_eq!(
+            meta.get("wav:rf64.table.count").map(String::as_str),
+            Some("4294967295"),
+            "the declared (lying) count is surfaced verbatim"
+        );
+        // No table records were actually decoded (none present in body).
+        assert!(!meta.contains_key("wav:rf64.table.0.id"));
+    }
+
+    /// A `ds64` table with a truthful count and matching record bytes
+    /// round-trips its records; a count that over-states the body is
+    /// clamped to the available records.
+    #[test]
+    fn ds64_table_count_clamped_to_available_records() {
+        // One real 12-byte record, but the header claims three.
+        let mut rec = Vec::new();
+        rec.extend_from_slice(b"junk");
+        rec.extend_from_slice(&0x1_0000_0000u64.to_le_bytes()); // 4 GiB override
+        let buf = rf64_with_ds64(0, 0, 3, &rec);
+        let dmx = try_open(buf).expect("RF64 with a partial ds64 table must parse");
+        let meta: std::collections::HashMap<_, _> = dmx.metadata().iter().cloned().collect();
+        assert_eq!(
+            meta.get("wav:rf64.table.0.id").map(String::as_str),
+            Some("junk")
+        );
+        assert_eq!(
+            meta.get("wav:rf64.table.0.size").map(String::as_str),
+            Some("4294967296")
+        );
+        // Only the one present record was decoded despite the count of 3.
+        assert!(!meta.contains_key("wav:rf64.table.1.id"));
     }
 }
