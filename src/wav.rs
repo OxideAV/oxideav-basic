@@ -2950,7 +2950,14 @@ impl SxmlChunk {
         let n_sub = u32::from_le_bytes([buf[10], buf[11], buf[12], buf[13]]) as usize;
 
         let mut off = Self::PREFIX_LEN;
-        let mut sub_chunks = Vec::with_capacity(n_sub);
+        // Cap the reservation to the records the body could physically
+        // hold (each SubXMLChunk is at least HEADER_LEN bytes). `n_sub` is
+        // an untrusted u32 — a 14-byte body declaring 0xFFFF_FFFF
+        // sub-chunks would otherwise reserve tens of gigabytes before the
+        // bounds-checked loop below even runs (an OOM DoS).
+        let sub_cap =
+            n_sub.min(buf.len().saturating_sub(Self::PREFIX_LEN) / SubXmlChunk::HEADER_LEN);
+        let mut sub_chunks = Vec::with_capacity(sub_cap);
         for _ in 0..n_sub {
             if off + SubXmlChunk::HEADER_LEN > buf.len() {
                 return None;
@@ -2980,7 +2987,11 @@ impl SxmlChunk {
         let n_align =
             u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]) as usize;
         off += 4;
-        let mut alignment_points = Vec::with_capacity(n_align);
+        // Same untrusted-count bound as the sub-chunk table above: each
+        // AlignmentPoint is SIZE bytes, so cap the reservation to what the
+        // remaining body could hold rather than the declared `n_align`.
+        let align_cap = n_align.min(buf.len().saturating_sub(off) / AlignmentPoint::SIZE);
+        let mut alignment_points = Vec::with_capacity(align_cap);
         for _ in 0..n_align {
             if off + AlignmentPoint::SIZE > buf.len() {
                 return None;
@@ -11974,5 +11985,32 @@ mod tests {
         // Sanity: the pristine bases still parse.
         assert!(try_open(base1).is_ok());
         assert!(try_open(base2).is_ok());
+    }
+
+    /// An `<sxml>` body declaring 0xFFFF_FFFF sub-chunks in a bare 14-byte
+    /// prefix must not pre-reserve tens of gigabytes: `parse` caps the
+    /// reservation to the records the body can hold, then returns `None`
+    /// for the truncated table. A passing run proves no OOM reservation.
+    #[test]
+    fn sxml_n_sub_count_lie_does_not_over_reserve() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0u16.to_le_bytes()); // fmtType
+        body.extend_from_slice(&0u32.to_le_bytes()); // subXMLCkTbSize low
+        body.extend_from_slice(&0u32.to_le_bytes()); // subXMLCkTbSize high
+        body.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // nSubXMLChunks (lie)
+        assert!(SxmlChunk::parse(&body).is_none());
+    }
+
+    /// The same untrusted-count guard on the `nAlignmentPoints` table: a
+    /// huge declared count with no records present must not over-reserve.
+    #[test]
+    fn sxml_n_align_count_lie_does_not_over_reserve() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0u16.to_le_bytes()); // fmtType
+        body.extend_from_slice(&0u32.to_le_bytes()); // subXMLCkTbSize low
+        body.extend_from_slice(&0u32.to_le_bytes()); // subXMLCkTbSize high
+        body.extend_from_slice(&0u32.to_le_bytes()); // nSubXMLChunks = 0
+        body.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // nAlignmentPoints (lie)
+        assert!(SxmlChunk::parse(&body).is_none());
     }
 }
