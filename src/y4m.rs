@@ -45,7 +45,7 @@
 //! | `mono`     | `w*h`   | 0              | 0              |
 //!
 //! `p10`/`p12`/`p14`/`p16` doubles every byte count (16-bit
-//! little-endian samples, per the ffmpeg convention).
+//! little-endian samples, per the format's de-facto convention).
 //!
 //! # Codec id
 //!
@@ -114,7 +114,7 @@ fn pixel_format_for_colorspace(c: &str) -> Option<(PixelFormat, u32, u32, u32)> 
         "444" => Some((PixelFormat::Yuv444P, 0, 0, 1)),
         "mono" => Some((PixelFormat::Gray8, 0, 0, 1)),
 
-        // 10/12-bit variants. The Y4M convention is little-endian per ffmpeg.
+        // 10/12-bit variants. The Y4M sample words are little-endian.
         "420p10" => Some((PixelFormat::Yuv420P10Le, 1, 1, 2)),
         "422p10" => Some((PixelFormat::Yuv422P10Le, 1, 0, 2)),
         "444p10" => Some((PixelFormat::Yuv444P10Le, 0, 0, 2)),
@@ -128,7 +128,7 @@ fn pixel_format_for_colorspace(c: &str) -> Option<(PixelFormat, u32, u32, u32)> 
 
 /// Inverse of [`pixel_format_for_colorspace`] — pick a Y4M `C<...>`
 /// token that the muxer can write for a given pixel format. Defaults
-/// stay close to the ffmpeg convention (`420mpeg2` → `420mpeg2`,
+/// stay close to the format's de-facto vocabulary (`420mpeg2` → `420mpeg2`,
 /// generic `Yuv420P` → `420jpeg`).
 fn colorspace_for_pixel_format(pf: PixelFormat) -> Result<&'static str> {
     Ok(match pf {
