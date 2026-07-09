@@ -11890,4 +11890,89 @@ mod tests {
         };
         assert!(matches!(err, Error::InvalidData(_)));
     }
+
+    /// Deterministic xorshift64 — a self-contained PRNG so the mutation
+    /// fuzz below is reproducible without pulling in an external crate.
+    fn xorshift64(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        x
+    }
+
+    /// Broad hostile-input net: take a valid, feature-rich WAV and hammer
+    /// it with deterministic byte-level mutations — single-byte flips,
+    /// 4-byte little-endian overwrites aimed at chunk-size fields, and
+    /// random truncations — then feed every variant to the demuxer. Not
+    /// one of the thousands of adversarial inputs may panic, hang, or
+    /// force an unbounded allocation; each must resolve to `Ok` or a typed
+    /// `Err`. This is the catch-all behind the targeted hardening tests:
+    /// a regression that reintroduces an index/arith panic anywhere on the
+    /// parse path trips here.
+    #[test]
+    fn mutation_fuzz_never_panics() {
+        // Base 1: a muxed PCM WAV carrying several optional chunks so the
+        // mutation offsets land on real chunk headers (fmt / bext / LIST
+        // INFO / cue / data).
+        let payload: Vec<u8> = (0..256u32).map(|i| (i & 0xFF) as u8).collect();
+        let stream = make_stream(SampleFormat::S16, 2, 44_100);
+        let info = InfoChunk::default()
+            .with_entry(*b"INAM", "title")
+            .with_entry(*b"IART", "artist");
+        let opts = WavMuxOptions::default()
+            .with_bext(BextChunk::default())
+            .with_info(info)
+            .with_cue(CueChunk::default());
+        let base1 = mux_to_bytes(&stream, &payload, opts, "fuzz-base1");
+        // Base 2: an RF64 file with a small ds64 table so the ds64 /
+        // sentinel-resolution paths are exercised under mutation.
+        let mut rec = Vec::new();
+        rec.extend_from_slice(b"big ");
+        rec.extend_from_slice(&123u64.to_le_bytes());
+        let base2 = rf64_with_ds64(64, 16, 1, &rec);
+
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        for base in [&base1, &base2] {
+            for _ in 0..4000 {
+                let mut m = base.clone();
+                let edits = 1 + (xorshift64(&mut state) % 8) as usize;
+                for _ in 0..edits {
+                    if m.is_empty() {
+                        break;
+                    }
+                    match xorshift64(&mut state) % 3 {
+                        0 => {
+                            // Single-byte flip.
+                            let off = (xorshift64(&mut state) as usize) % m.len();
+                            m[off] ^= (xorshift64(&mut state) & 0xFF) as u8;
+                        }
+                        1 => {
+                            // 4-byte LE overwrite — biased toward chunk-size
+                            // extremes to stress the size handling.
+                            if m.len() >= 4 {
+                                let off = (xorshift64(&mut state) as usize) % (m.len() - 3);
+                                let choices =
+                                    [0xFFFF_FFFFu32, 0xFFFF_FFFE, 0x8000_0000, 0x7FFF_FFFF, 0];
+                                let v = choices[(xorshift64(&mut state) as usize) % choices.len()];
+                                m[off..off + 4].copy_from_slice(&v.to_le_bytes());
+                            }
+                        }
+                        _ => {
+                            // Truncate to a random shorter length.
+                            let n = (xorshift64(&mut state) as usize) % m.len();
+                            m.truncate(n);
+                        }
+                    }
+                }
+                // The contract: resolve, never unwind. The result itself
+                // is intentionally discarded.
+                let _ = try_open(m);
+            }
+        }
+        // Sanity: the pristine bases still parse.
+        assert!(try_open(base1).is_ok());
+        assert!(try_open(base2).is_ok());
+    }
 }
