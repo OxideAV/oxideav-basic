@@ -207,6 +207,39 @@ fn resolve_chunk_size(id: &[u8; 4], on_wire: u32, ds64: Option<&Ds64>) -> Option
         .map(|(_, sz)| *sz)
 }
 
+/// Read a chunk body of `size` bytes into a fresh buffer, bounding the
+/// up-front allocation to what the stream can actually supply.
+///
+/// A malformed chunk header can declare a size far larger than the bytes
+/// that follow (up to `0xFFFF_FFFE` for a plain 32-bit RIFF chunk, or an
+/// arbitrary 64-bit value once an RF64/BW64 `ds64` override is in play).
+/// Allocating that eagerly — `vec![0u8; size as usize]` — lets a tiny
+/// hostile file force a multi-gigabyte allocation before the inevitable
+/// short read is even detected: a denial-of-service. Instead we grow the
+/// buffer incrementally as real bytes arrive, so a size-lie costs at most
+/// the bytes actually present plus one bounded scratch block. A genuine
+/// truncation is still rejected — the accumulated length must equal the
+/// declared `size` — preserving the strictness of the previous
+/// `read_exact` contract.
+fn read_chunk_body(input: &mut dyn ReadSeek, size: u64) -> Result<Vec<u8>> {
+    // Never pre-reserve more than one scratch block; the buffer grows to
+    // the true payload length via `extend_from_slice` below.
+    const SCRATCH: usize = 64 * 1024;
+    let mut buf = Vec::with_capacity(size.min(SCRATCH as u64) as usize);
+    let mut scratch = [0u8; SCRATCH];
+    let mut remaining = size;
+    while remaining > 0 {
+        let want = remaining.min(SCRATCH as u64) as usize;
+        let got = input.read(&mut scratch[..want])?;
+        if got == 0 {
+            return Err(Error::invalid("WAV chunk body truncated"));
+        }
+        buf.extend_from_slice(&scratch[..got]);
+        remaining -= got as u64;
+    }
+    Ok(buf)
+}
+
 // On-the-wire `wFormatTag` constants from RFC 2361 / `mmreg.h`. Public so
 // muxer callers can build `WAVE_FORMAT_EXTENSIBLE` streams against the
 // same dispatch table the demuxer uses.
@@ -486,8 +519,7 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
                 // a plain RIFF file the chunk must not appear; if it
                 // does we surface the keys but otherwise treat it as
                 // an unknown ahead-of-fmt extension and keep going.
-                let mut buf = vec![0u8; size as usize];
-                input.read_exact(&mut buf)?;
+                let buf = read_chunk_body(&mut *input, size)?;
                 let parsed = parse_ds64_chunk(&buf, &mut metadata)?;
                 ds64 = Some(parsed);
                 if size % 2 == 1 {
@@ -495,16 +527,14 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
                 }
             }
             b"fmt " => {
-                let mut buf = vec![0u8; size as usize];
-                input.read_exact(&mut buf)?;
+                let buf = read_chunk_body(&mut *input, size)?;
                 fmt = Some(parse_fmt(&buf)?);
                 if size % 2 == 1 {
                     input.seek(SeekFrom::Current(1))?;
                 }
             }
             b"fact" => {
-                let mut buf = vec![0u8; size as usize];
-                input.read_exact(&mut buf)?;
+                let buf = read_chunk_body(&mut *input, size)?;
                 // RF64/BW64: when the 32-bit `dwFileSize` carries the
                 // sentinel, the authoritative 64-bit sample count
                 // lives in `ds64.sampleCount` (EBU Tech 3306 §3 last
@@ -534,8 +564,7 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
                 // anchor; `INFO` / `adtl` LISTs are pure metadata and
                 // stay on the buffered path.
                 let list_start = input.stream_position()?;
-                let mut buf = vec![0u8; size as usize];
-                input.read_exact(&mut buf)?;
+                let buf = read_chunk_body(&mut *input, size)?;
                 if buf.len() >= 4 && &buf[0..4] == b"wavl" {
                     if let Some((off, sz)) = parse_wavl_list(&buf, list_start, &mut metadata) {
                         // The §3 grammar lets `<wave-data>` be a `wavl`
@@ -569,16 +598,14 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
                 }
             }
             b"bext" => {
-                let mut buf = vec![0u8; size as usize];
-                input.read_exact(&mut buf)?;
+                let buf = read_chunk_body(&mut *input, size)?;
                 bext = parse_bext_chunk(&buf, &mut metadata);
                 if size % 2 == 1 {
                     input.seek(SeekFrom::Current(1))?;
                 }
             }
             b"cue " => {
-                let mut buf = vec![0u8; size as usize];
-                input.read_exact(&mut buf)?;
+                let buf = read_chunk_body(&mut *input, size)?;
                 parse_cue_chunk(&buf, &mut metadata);
                 if cue.is_none() {
                     cue = CueChunk::parse(&buf);
@@ -588,8 +615,7 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
                 }
             }
             b"plst" => {
-                let mut buf = vec![0u8; size as usize];
-                input.read_exact(&mut buf)?;
+                let buf = read_chunk_body(&mut *input, size)?;
                 parse_plst_chunk(&buf, &mut metadata);
                 if plst.is_none() {
                     plst = PlaylistChunk::parse(&buf);
@@ -599,8 +625,7 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
                 }
             }
             b"smpl" => {
-                let mut buf = vec![0u8; size as usize];
-                input.read_exact(&mut buf)?;
+                let buf = read_chunk_body(&mut *input, size)?;
                 let parsed = parse_smpl_chunk(&buf, &mut metadata);
                 if smpl.is_none() {
                     smpl = parsed;
@@ -610,8 +635,7 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
                 }
             }
             b"inst" => {
-                let mut buf = vec![0u8; size as usize];
-                input.read_exact(&mut buf)?;
+                let buf = read_chunk_body(&mut *input, size)?;
                 let parsed = parse_inst_chunk(&buf, &mut metadata);
                 if inst.is_none() {
                     inst = parsed;
@@ -621,8 +645,7 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
                 }
             }
             b"acid" => {
-                let mut buf = vec![0u8; size as usize];
-                input.read_exact(&mut buf)?;
+                let buf = read_chunk_body(&mut *input, size)?;
                 acid = parse_acid_chunk(&buf, &mut metadata);
                 if size % 2 == 1 {
                     input.seek(SeekFrom::Current(1))?;
@@ -635,32 +658,28 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
                 // audioPackFormatID references. Body is a 4-byte count
                 // pre-amble followed by N fixed 40-byte `audioID`
                 // records.
-                let mut buf = vec![0u8; size as usize];
-                input.read_exact(&mut buf)?;
+                let buf = read_chunk_body(&mut *input, size)?;
                 chna = parse_chna_chunk(&buf, &mut metadata);
                 if size % 2 == 1 {
                     input.seek(SeekFrom::Current(1))?;
                 }
             }
             b"iXML" => {
-                let mut buf = vec![0u8; size as usize];
-                input.read_exact(&mut buf)?;
+                let buf = read_chunk_body(&mut *input, size)?;
                 parse_ixml_chunk(&buf, &mut metadata);
                 if size % 2 == 1 {
                     input.seek(SeekFrom::Current(1))?;
                 }
             }
             b"axml" => {
-                let mut buf = vec![0u8; size as usize];
-                input.read_exact(&mut buf)?;
+                let buf = read_chunk_body(&mut *input, size)?;
                 parse_axml_chunk(&buf, &mut metadata);
                 if size % 2 == 1 {
                     input.seek(SeekFrom::Current(1))?;
                 }
             }
             b"bxml" => {
-                let mut buf = vec![0u8; size as usize];
-                input.read_exact(&mut buf)?;
+                let buf = read_chunk_body(&mut *input, size)?;
                 parse_bxml_chunk(&buf, &mut metadata);
                 if size % 2 == 1 {
                     input.seek(SeekFrom::Current(1))?;
@@ -671,8 +690,7 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
                 // Segments the (optionally gzip) XML into per-sample-run
                 // SubXMLChunk records with an optional AlignmentPoint
                 // table for timestamp-based access.
-                let mut buf = vec![0u8; size as usize];
-                input.read_exact(&mut buf)?;
+                let buf = read_chunk_body(&mut *input, size)?;
                 let parsed = parse_sxml_chunk(&buf, &mut metadata);
                 if sxml.is_none() {
                     sxml = parsed;
@@ -682,16 +700,14 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
                 }
             }
             b"_PMX" => {
-                let mut buf = vec![0u8; size as usize];
-                input.read_exact(&mut buf)?;
+                let buf = read_chunk_body(&mut *input, size)?;
                 parse_pmx_chunk(&buf, &mut metadata);
                 if size % 2 == 1 {
                     input.seek(SeekFrom::Current(1))?;
                 }
             }
             b"CSET" => {
-                let mut buf = vec![0u8; size as usize];
-                input.read_exact(&mut buf)?;
+                let buf = read_chunk_body(&mut *input, size)?;
                 parse_cset_chunk(&buf, &mut metadata);
                 if size % 2 == 1 {
                     input.seek(SeekFrom::Current(1))?;
@@ -701,8 +717,7 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
                 // RIFF "Display" chunk: a clipboard-format type DWORD
                 // plus payload. The WAV convention is a CF_TEXT title
                 // ("SoundSchemeTitle" in the ExifTool RIFF tag table).
-                let mut buf = vec![0u8; size as usize];
-                input.read_exact(&mut buf)?;
+                let buf = read_chunk_body(&mut *input, size)?;
                 parse_disp_chunk(&buf, &mut metadata);
                 if disp.is_none() {
                     disp = DispChunk::parse(&buf);
@@ -717,8 +732,7 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
                 // RIFF tag table). The container layer surfaces only the
                 // 10-byte ID3v2 header fields for observability; frame
                 // decoding is `oxideav-id3`'s job, not this crate's.
-                let mut buf = vec![0u8; size as usize];
-                input.read_exact(&mut buf)?;
+                let buf = read_chunk_body(&mut *input, size)?;
                 parse_id3_chunk(&buf, &mut metadata);
                 if size % 2 == 1 {
                     input.seek(SeekFrom::Current(1))?;
@@ -758,8 +772,7 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
                 // but the spec allows it as a sibling of `data` at the
                 // top level too. We surface its sample count without
                 // synthesising real silence into the decoded stream.
-                let mut buf = vec![0u8; size as usize];
-                input.read_exact(&mut buf)?;
+                let buf = read_chunk_body(&mut *input, size)?;
                 surface_slnt_metadata(&mut metadata, &buf);
                 if size % 2 == 1 {
                     input.seek(SeekFrom::Current(1))?;
@@ -11600,5 +11613,123 @@ mod tests {
         fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
             self.0.borrow_mut().seek(from)
         }
+    }
+
+    // ---- Hostile-input hardening -----------------------------------------
+    // The demuxer walks an untrusted byte stream: every chunk header's
+    // 32-bit size (and, under RF64/BW64, the 64-bit `ds64` overrides) is
+    // attacker-controlled. These tests pin that malformed / adversarial
+    // input yields a typed `Err` (or a bounded, well-formed parse) and
+    // NEVER panics, hangs, or forces an unbounded allocation.
+
+    /// Attempt to open a raw byte buffer as a WAV, returning the Result so
+    /// the malformed-path tests can assert on it directly.
+    fn try_open(bytes: Vec<u8>) -> Result<WavDemuxer> {
+        open_wav_demuxer(Box::new(std::io::Cursor::new(bytes)))
+    }
+
+    /// Build a RIFF/WAVE whose single `fmt ` chunk is followed by one
+    /// raw chunk `id` whose declared size is `declared` but whose actual
+    /// body is `body`, then (optionally) a real `data` chunk. Lets the
+    /// hardening tests drive a size-lie without the muxer normalising it.
+    fn wav_with_lying_chunk(
+        id: &[u8; 4],
+        declared: u32,
+        body: &[u8],
+        trailing_data: bool,
+    ) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"RIFF");
+        buf.extend_from_slice(&0u32.to_le_bytes()); // riff size (unused by demuxer)
+        buf.extend_from_slice(b"WAVE");
+        // Minimal 16-byte PCM fmt.
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&16u32.to_le_bytes());
+        buf.extend_from_slice(&WAVE_FORMAT_PCM.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes()); // channels
+        buf.extend_from_slice(&8_000u32.to_le_bytes()); // sample_rate
+        buf.extend_from_slice(&16_000u32.to_le_bytes()); // byte_rate
+        buf.extend_from_slice(&2u16.to_le_bytes()); // block_align
+        buf.extend_from_slice(&16u16.to_le_bytes()); // bits
+                                                     // Lying chunk: header claims `declared` bytes, body is shorter.
+        buf.extend_from_slice(id);
+        buf.extend_from_slice(&declared.to_le_bytes());
+        buf.extend_from_slice(body);
+        if trailing_data {
+            buf.extend_from_slice(b"data");
+            buf.extend_from_slice(&0u32.to_le_bytes());
+        }
+        buf
+    }
+
+    /// A `fmt ` chunk that declares a 4 GiB body but supplies only a
+    /// handful of bytes must be rejected as truncated — not allocate the
+    /// 4 GiB the header lies about. (Before the bounded-read hardening the
+    /// demuxer did `vec![0u8; size]` up front, a trivial OOM DoS.)
+    #[test]
+    fn chunk_size_lie_rejected_without_huge_alloc() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"RIFF");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(b"WAVE");
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&0xFFFF_FFF0u32.to_le_bytes()); // ~4 GiB lie
+        buf.extend_from_slice(&[0u8; 8]); // only 8 real bytes follow
+        let err = match try_open(buf) {
+            Ok(_) => panic!("size-lie fmt chunk must be rejected"),
+            Err(e) => e,
+        };
+        // A truncated body, not a panic / OOM.
+        assert!(matches!(err, Error::InvalidData(_)));
+    }
+
+    /// The same lie on every buffered-body chunk id the loop handles is
+    /// rejected as truncated rather than allocating the declared size.
+    #[test]
+    fn every_buffered_chunk_id_survives_size_lie() {
+        for id in [
+            b"ds64", b"fact", b"LIST", b"bext", b"cue ", b"plst", b"smpl", b"inst", b"acid",
+            b"chna", b"iXML", b"axml", b"bxml", b"sxml", b"_PMX", b"CSET", b"DISP", b"id3 ",
+            b"slnt",
+        ] {
+            let buf = wav_with_lying_chunk(id, 0xFFFF_FFF0, &[0u8; 4], false);
+            // Either a clean typed error, or a bounded parse that stops at
+            // the truncated chunk — never a panic / OOM / hang.
+            let _ = try_open(buf);
+        }
+    }
+
+    /// Walking every truncation prefix of a fully-featured valid WAV must
+    /// never panic: each prefix either opens or returns a typed error.
+    #[test]
+    fn every_truncation_prefix_is_panic_free() {
+        let payload: Vec<u8> = (0..512u32).map(|i| (i & 0xFF) as u8).collect();
+        let stream = make_stream(SampleFormat::S16, 2, 48_000);
+        let opts = WavMuxOptions::default()
+            .with_bext(BextChunk::default())
+            .with_info(InfoChunk::default())
+            .with_cue(CueChunk::default());
+        let full = mux_to_bytes(&stream, &payload, opts, "trunc-prefix");
+        for len in 0..full.len() {
+            // Any prefix must resolve to Ok or Err, never unwind.
+            let _ = try_open(full[..len].to_vec());
+        }
+        // The complete buffer still parses.
+        assert!(try_open(full).is_ok());
+    }
+
+    /// A chunk header that is itself cut short mid-way (fewer than the
+    /// 8 header bytes remain) terminates the walk cleanly rather than
+    /// erroring — the loop treats an EOF at a chunk boundary as the end
+    /// of stream, so a valid leading `data` still yields a demuxer.
+    #[test]
+    fn truncated_trailing_chunk_header_is_tolerated() {
+        let payload = vec![0u8; 32];
+        let stream = make_stream(SampleFormat::U8, 1, 8_000);
+        let mut bytes = mux_to_bytes(&stream, &payload, WavMuxOptions::default(), "trunc-hdr");
+        // Append 3 stray bytes — a partial chunk header at EOF.
+        bytes.extend_from_slice(b"jun");
+        let dmx = try_open(bytes).expect("partial trailing header must not abort the parse");
+        assert_eq!(dmx.streams()[0].params.channels, Some(1));
     }
 }
