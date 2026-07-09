@@ -12013,4 +12013,71 @@ mod tests {
         body.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // nAlignmentPoints (lie)
         assert!(SxmlChunk::parse(&body).is_none());
     }
+
+    /// Per-chunk-id targeted fuzz: for every chunk id the demuxer
+    /// dispatches on, build a minimal `RIFF/WAVE/fmt ` file carrying that
+    /// one chunk with a pseudo-random body of pseudo-random length and a
+    /// size field that sometimes matches the body and sometimes lies, then
+    /// a trailing `data`. Feeds thousands of variants per id straight into
+    /// the matching parser (`parse_*` / `::parse`). Unlike the whole-file
+    /// mutation fuzz — whose bases only carry a handful of chunk types —
+    /// this reaches sxml / chna / smpl / inst / acid / disp / id3 / cset /
+    /// bxml / axml / ixml / bext / ltxt and friends directly. None may
+    /// panic, hang, or over-allocate; each resolves to Ok or a typed Err.
+    #[test]
+    fn per_chunk_body_fuzz_never_panics() {
+        const IDS: &[&[u8; 4]] = &[
+            b"ds64", b"fact", b"LIST", b"bext", b"cue ", b"plst", b"smpl", b"inst", b"acid",
+            b"chna", b"iXML", b"axml", b"bxml", b"sxml", b"_PMX", b"CSET", b"DISP", b"id3 ",
+            b"slnt", b"JUNK", b"PAD ", b"data",
+        ];
+        // LIST bodies are meaningful only when they open with a list type.
+        const LIST_TYPES: &[&[u8; 4]] = &[b"wavl", b"adtl", b"INFO", b"junk"];
+
+        let mut state: u64 = 0x1234_5678_9ABC_DEF0;
+        for id in IDS {
+            for _ in 0..3000 {
+                let body_len = (xorshift64(&mut state) % 72) as usize;
+                let mut body = Vec::with_capacity(body_len);
+                // For LIST, prepend a (sometimes valid) 4-byte list type.
+                if *id == b"LIST" && body_len >= 4 {
+                    let lt = LIST_TYPES[(xorshift64(&mut state) as usize) % LIST_TYPES.len()];
+                    body.extend_from_slice(lt);
+                }
+                while body.len() < body_len {
+                    body.push((xorshift64(&mut state) & 0xFF) as u8);
+                }
+                // Size field: usually the true body length, occasionally a
+                // lie (extreme or off-by-a-lot) to stress size handling.
+                let declared: u32 = match xorshift64(&mut state) % 4 {
+                    0 => 0xFFFF_FFFF,
+                    1 => 0xFFFF_FFFE,
+                    2 => (body_len as u32).wrapping_add(0x10),
+                    _ => body_len as u32,
+                };
+
+                let mut buf = Vec::new();
+                buf.extend_from_slice(b"RIFF");
+                buf.extend_from_slice(&0u32.to_le_bytes());
+                buf.extend_from_slice(b"WAVE");
+                buf.extend_from_slice(b"fmt ");
+                buf.extend_from_slice(&16u32.to_le_bytes());
+                buf.extend_from_slice(&WAVE_FORMAT_PCM.to_le_bytes());
+                buf.extend_from_slice(&1u16.to_le_bytes());
+                buf.extend_from_slice(&8_000u32.to_le_bytes());
+                buf.extend_from_slice(&16_000u32.to_le_bytes());
+                buf.extend_from_slice(&2u16.to_le_bytes());
+                buf.extend_from_slice(&16u16.to_le_bytes());
+                buf.extend_from_slice(*id);
+                buf.extend_from_slice(&declared.to_le_bytes());
+                buf.extend_from_slice(&body);
+                if body.len() % 2 == 1 {
+                    buf.push(0); // RIFF word-align pad
+                }
+                buf.extend_from_slice(b"data");
+                buf.extend_from_slice(&0u32.to_le_bytes());
+                let _ = try_open(buf);
+            }
+        }
+    }
 }
