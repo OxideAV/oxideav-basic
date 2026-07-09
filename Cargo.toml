@@ -15,3 +15,9 @@ categories = ["multimedia::encoding"]
 
 [dependencies]
 oxideav-core = "0.1"
+
+# Dependency-free micro-benchmark (`harness = false` → a plain `main`
+# timing loop on stable, no external bench-harness crate).
+[[bench]]
+name = "wav_roundtrip"
+harness = false
