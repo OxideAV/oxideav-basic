@@ -392,6 +392,33 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework �
   display ≥ 1.0). The forward map is a published mathematical fact
   transcribed from `docs/image/filter/tone-mapping-operators.md` §2.2.
 
+## Robustness
+
+The WAV demuxer treats its whole byte stream as untrusted: every chunk
+header's 32-bit size (and, under `RF64`/`BW64`, the 64-bit `ds64`
+overrides and record counts) is attacker-controlled. Malformed or
+adversarial input always resolves to a typed `Err` or a bounded parse —
+never a panic, hang, or unbounded allocation:
+
+- **Chunk-body reads** grow their buffer incrementally to the bytes
+  actually present, so a header that lies about a multi-gigabyte size
+  cannot force that allocation before the short read is detected.
+- **Count-driven tables** (`ds64` size table, `cue`/`plst` points,
+  `smpl` loops, `chna` records, `sxml` sub-chunks and alignment points)
+  cap their reservation to the records the body can physically hold,
+  never the declared 32-bit count.
+- **Forward skips** over `data`/`JUNK`/`PAD`/unknown bodies reject a size
+  beyond `i64::MAX` as malformed rather than wrapping the signed seek
+  offset into a backward (potentially looping) rewind; the notional
+  data-end is a saturating add.
+
+This is pinned by targeted regression tests plus two deterministic,
+dependency-free fuzz harnesses — a whole-file mutation net over
+feature-rich `RIFF` and `RF64` bases, and a per-chunk-id net that drives
+adversarial bodies straight into every individual chunk parser.
+`benches/wav_roundtrip.rs` (`cargo bench`, `harness = false`) times the
+demux/mux hot path.
+
 ## Usage
 
 ```toml
