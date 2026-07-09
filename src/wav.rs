@@ -244,6 +244,25 @@ fn read_chunk_body(input: &mut dyn ReadSeek, size: u64) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Advance the cursor forward over a chunk body of `size` bytes plus the
+/// RIFF word-alignment pad, without reading the body into memory.
+///
+/// `SeekFrom::Current` takes a *signed* `i64` offset. A malformed
+/// RF64/BW64 `ds64` override can declare a `size` beyond `i64::MAX`;
+/// casting that to `i64` wraps to a negative (backward) seek, which would
+/// rewind the cursor and re-parse earlier chunks — potentially forever.
+/// Reject such an out-of-range size as malformed instead of looping. The
+/// word-align pad is a saturating add so a `size` at the top of the u64
+/// range can't overflow-panic in a debug build before the range check.
+fn skip_chunk_body(input: &mut dyn ReadSeek, size: u64) -> Result<()> {
+    let padded = size.saturating_add(size & 1);
+    if padded > i64::MAX as u64 {
+        return Err(Error::invalid("WAV chunk size exceeds the seekable range"));
+    }
+    input.seek(SeekFrom::Current(padded as i64))?;
+    Ok(())
+}
+
 // On-the-wire `wFormatTag` constants from RFC 2361 / `mmreg.h`. Public so
 // muxer callers can build `WAVE_FORMAT_EXTENSIBLE` streams against the
 // same dispatch table the demuxer uses.
@@ -751,21 +770,15 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
                 // producer reserved (e.g. for in-place editing) and
                 // how many JUNK chunks appeared. Multiple JUNK chunks
                 // are allowed; the count/total-bytes accumulate.
-                input.seek(SeekFrom::Current(size as i64))?;
+                skip_chunk_body(&mut *input, size)?;
                 surface_junk_metadata(&mut metadata, size);
-                if size % 2 == 1 {
-                    input.seek(SeekFrom::Current(1))?;
-                }
             }
             b"PAD " => {
                 // RIFF "Pad" chunk: alignment padding for the following
                 // chunk. Like JUNK, the body carries no semantic data;
                 // we account for it under the parallel wav:pad.* keys.
-                input.seek(SeekFrom::Current(size as i64))?;
+                skip_chunk_body(&mut *input, size)?;
                 surface_pad_metadata(&mut metadata, size);
-                if size % 2 == 1 {
-                    input.seek(SeekFrom::Current(1))?;
-                }
             }
             b"slnt" => {
                 // Microsoft RIFF MCI §3 "Wave Data": the `slnt`
@@ -794,12 +807,10 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
                     data_offset = Some(input.stream_position()?);
                     data_size = Some(size);
                 }
-                let pad = size + (size % 2);
-                input.seek(SeekFrom::Current(pad as i64))?;
+                skip_chunk_body(&mut *input, size)?;
             }
             _ => {
-                let pad = size + (size % 2);
-                input.seek(SeekFrom::Current(pad as i64))?;
+                skip_chunk_body(&mut *input, size)?;
             }
         }
     }
@@ -901,7 +912,12 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
         input,
         streams: vec![stream],
         data_offset,
-        data_end: data_offset + data_size,
+        // Saturating: an RF64/BW64 `ds64` override can carry a `data_size`
+        // near the top of the u64 range; a plain `+` would overflow-panic
+        // in a debug build. The real payload is bounded by the stream, so
+        // clamping the notional end to u64::MAX is harmless — the decode
+        // cursor stops at real EOF regardless.
+        data_end: data_offset.saturating_add(data_size),
         cursor: data_offset,
         block_align,
         chunk_frames: 1024,
@@ -11817,5 +11833,61 @@ mod tests {
         );
         // Only the one present record was decoded despite the count of 3.
         assert!(!meta.contains_key("wav:rf64.table.1.id"));
+    }
+
+    /// `skip_chunk_body` advances the cursor forward for an in-range size
+    /// but rejects a size beyond `i64::MAX` — casting that to the signed
+    /// `SeekFrom::Current` offset would wrap to a backward seek.
+    #[test]
+    fn skip_chunk_body_rejects_out_of_range_size() {
+        let mut cur = std::io::Cursor::new(vec![0u8; 16]);
+        // In-range odd size: seeks forward past the (word-aligned) body.
+        skip_chunk_body(&mut cur, 3).expect("in-range skip must succeed");
+        assert_eq!(cur.position(), 4); // 3 body + 1 pad
+                                       // A size beyond i64::MAX is malformed, not a backward seek.
+        let mut cur2 = std::io::Cursor::new(vec![0u8; 16]);
+        let err = match skip_chunk_body(&mut cur2, (i64::MAX as u64) + 1) {
+            Ok(()) => panic!("out-of-range size must be rejected"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, Error::InvalidData(_)));
+        // The cursor was not rewound.
+        assert_eq!(cur2.position(), 0);
+    }
+
+    /// An RF64 file whose `data` chunk carries the 32-bit sentinel and a
+    /// `ds64.dataSize` override beyond `i64::MAX` is rejected cleanly —
+    /// the demuxer neither panics on the oversized forward seek nor loops
+    /// by wrapping it into a backward one.
+    #[test]
+    fn rf64_data_size_beyond_i64_max_rejected() {
+        let huge = 0x8000_0000_0000_0000u64; // > i64::MAX
+        let mut ds64 = Vec::new();
+        ds64.extend_from_slice(&0u64.to_le_bytes()); // riffSize
+        ds64.extend_from_slice(&huge.to_le_bytes()); // dataSize override
+        ds64.extend_from_slice(&0u64.to_le_bytes()); // sampleCount
+        ds64.extend_from_slice(&0u32.to_le_bytes()); // tableLength
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"RF64");
+        buf.extend_from_slice(&SIZE64_SENTINEL.to_le_bytes());
+        buf.extend_from_slice(b"WAVE");
+        buf.extend_from_slice(b"ds64");
+        buf.extend_from_slice(&(ds64.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&ds64);
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&16u32.to_le_bytes());
+        buf.extend_from_slice(&WAVE_FORMAT_PCM.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&8_000u32.to_le_bytes());
+        buf.extend_from_slice(&16_000u32.to_le_bytes());
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(&16u16.to_le_bytes());
+        buf.extend_from_slice(b"data");
+        buf.extend_from_slice(&SIZE64_SENTINEL.to_le_bytes()); // sentinel → ds64 override
+        let err = match try_open(buf) {
+            Ok(_) => panic!("out-of-range data override must be rejected"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, Error::InvalidData(_)));
     }
 }
