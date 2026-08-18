@@ -364,6 +364,81 @@ fn fmt_guid(g: &[u8; 16]) -> String {
     )
 }
 
+/// The 10 trailing bytes shared by BOTH subtype-GUID families
+/// (`…-0010-8000-00aa00389b71`): bytes `[6..16]` of the on-wire GUID.
+/// Family membership is then decided by `Data2` (bytes `[4..6]`):
+/// `0x0000` = `WAVEFORMATEX`-derived template, `0x0cea` = IEC 61937
+/// compressed-pass-through (per
+/// `docs/container/riff/waveformatextensible/ksdataformat-subtype-guids.md`
+/// §"How these GUIDs are generated").
+const GUID_DATAFORMAT_TAIL10: [u8; 10] =
+    [0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71];
+
+/// If `g` belongs to the IEC 61937 compressed-pass-through subtype
+/// family (`xxxxxxxx-0cea-0010-8000-00aa00389b71`, Windows 7+), return
+/// its `Data1` value. In this family `Data1` is keyed by CEA-861
+/// stream type — NOT a wave-format tag — with the Dolby MAT 2.0 / 2.1
+/// revisions extending the high bits (`0x0000010c` / `0x0000030c`) per
+/// `docs/container/riff/waveformatextensible/ms-representing-formats-iec61937.md`.
+fn iec61937_data1(g: &[u8; 16]) -> Option<u32> {
+    if u16::from_le_bytes([g[4], g[5]]) == 0x0CEA && g[6..16] == GUID_DATAFORMAT_TAIL10 {
+        Some(u32::from_le_bytes([g[0], g[1], g[2], g[3]]))
+    } else {
+        None
+    }
+}
+
+/// Symbolic `KSDATAFORMAT_SUBTYPE_*` name for a known SubFormat GUID,
+/// per the consolidated catalog in
+/// `docs/container/riff/waveformatextensible/ksdataformat-subtype-guids.md`.
+///
+/// Family 1 (`WAVEFORMATEX`-derived, `Data2 == 0x0000`) names the rows
+/// the catalog lists explicitly; other template GUIDs are "the tag in
+/// GUID form" and stay nameless here (the embedded tag is surfaced
+/// separately via `wav:fmt.subformat_tag`). Family 2 (IEC 61937,
+/// `Data2 == 0x0cea`) names every catalogued stream type including the
+/// Dolby MAT 2.0/2.1 revisions.
+fn subformat_name(g: &[u8; 16]) -> Option<&'static str> {
+    if let Some(tag) = waveformatex_tag(g) {
+        return Some(match tag {
+            0x0000 => "KSDATAFORMAT_SUBTYPE_WAVEFORMATEX",
+            0x0001 => "KSDATAFORMAT_SUBTYPE_PCM",
+            0x0002 => "KSDATAFORMAT_SUBTYPE_ADPCM",
+            0x0003 => "KSDATAFORMAT_SUBTYPE_IEEE_FLOAT",
+            0x0006 => "KSDATAFORMAT_SUBTYPE_ALAW",
+            0x0007 => "KSDATAFORMAT_SUBTYPE_MULAW",
+            0x0008 => "KSDATAFORMAT_SUBTYPE_DTS",
+            0x0009 => "KSDATAFORMAT_SUBTYPE_DRM",
+            0x0050 => "KSDATAFORMAT_SUBTYPE_MPEG",
+            // Also exposed as KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_DIGITAL
+            // (the documented worked example aliases the same value).
+            0x0092 => "KSDATAFORMAT_SUBTYPE_DOLBY_AC3_SPDIF",
+            // WMA Pro pass-through aliases the WMASPDIF tag GUID (the
+            // catalog's CEA-861 type 0x0e row).
+            0x0164 => "KSDATAFORMAT_SUBTYPE_IEC61937_WMA_PRO",
+            _ => return None,
+        });
+    }
+    if let Some(data1) = iec61937_data1(g) {
+        return Some(match data1 {
+            0x0003 => "KSDATAFORMAT_SUBTYPE_IEC61937_MPEG1",
+            0x0004 => "KSDATAFORMAT_SUBTYPE_IEC61937_MPEG2",
+            0x0005 => "KSDATAFORMAT_SUBTYPE_IEC61937_MPEG3",
+            0x0006 => "KSDATAFORMAT_SUBTYPE_IEC61937_AAC",
+            0x0008 => "KSDATAFORMAT_SUBTYPE_IEC61937_ATRAC",
+            0x0009 => "KSDATAFORMAT_SUBTYPE_IEC61937_ONE_BIT_AUDIO",
+            0x000A => "KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_DIGITAL_PLUS",
+            0x000B => "KSDATAFORMAT_SUBTYPE_IEC61937_DTS_HD",
+            0x000C => "KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_MLP",
+            0x000D => "KSDATAFORMAT_SUBTYPE_IEC61937_DST",
+            0x010C => "KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_MAT20",
+            0x030C => "KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_MAT21",
+            _ => return None,
+        });
+    }
+    None
+}
+
 /// `WAVEFORMATEXTENSIBLE.dwChannelMask` `SPEAKER_*` flag bits, ordered
 /// least-significant-bit first. Per
 /// `docs/container/riff/waveformatextensible/ms-waveformatextensible.html`
@@ -533,16 +608,42 @@ fn core_layout_for_mask(mask: u32, channels: u16) -> Option<ChannelLayout> {
 
 // --- Demuxer ---------------------------------------------------------------
 
-fn open_demuxer(input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
-    Ok(Box::new(open_wav_demuxer(input)?))
+fn open_demuxer(input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
+    Ok(Box::new(open_wav_demuxer_with(input, codecs)?))
 }
 
 /// Open a WAV/RF64/BW64 demuxer returning the concrete [`WavDemuxer`]
 /// so the typed accessor surface ([`WavDemuxer::format_tag`],
 /// [`WavDemuxer::channel_mask`], [`WavDemuxer::acid`], …) is reachable
-/// without downcasting. The registry path wraps this in a
-/// `Box<dyn Demuxer>`.
-pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
+/// without downcasting. The registry path wraps
+/// [`open_wav_demuxer_with`] in a `Box<dyn Demuxer>`.
+///
+/// This convenience form resolves no external codec tags
+/// ([`oxideav_core::NullCodecResolver`]): `wFormatTag` values this
+/// crate does not map directly stay unsupported / synthesised. Use
+/// [`open_wav_demuxer_with`] to route unmapped tags through a real
+/// registry.
+pub fn open_wav_demuxer(input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
+    open_wav_demuxer_with(input, &oxideav_core::NullCodecResolver)
+}
+
+/// Like [`open_wav_demuxer`], but resolves `wFormatTag` values this
+/// crate does not map directly through the supplied [`CodecResolver`].
+///
+/// The resolver sees a [`oxideav_core::CodecTag::WaveFormat`] probe —
+/// for a legacy `WAVEFORMATEX` stream the on-wire tag, for a
+/// `WAVE_FORMAT_EXTENSIBLE` stream the legacy tag extracted from a
+/// `DEFINE_WAVEFORMATEX_GUID`-template SubFormat (per
+/// `docs/container/riff/waveformatextensible/ms-converting-format-tags-and-subformat-guids.md`
+/// the two are equivalent) — with `bits_per_sample` / `channels` /
+/// `sample_rate` hints and the raw `fmt ` chunk bytes as the header
+/// blob. Non-template SubFormat GUIDs are NOT resolvable through
+/// [`CodecTag`](oxideav_core::CodecTag) (it has no GUID form) and keep
+/// synthesising `wav:guid_<canonical-text>` ids.
+pub fn open_wav_demuxer_with(
+    mut input: Box<dyn ReadSeek>,
+    codecs: &dyn CodecResolver,
+) -> Result<WavDemuxer> {
     let mut hdr = [0u8; 12];
     input.read_exact(&mut hdr)?;
     let magic: [u8; 4] = [hdr[0], hdr[1], hdr[2], hdr[3]];
@@ -556,6 +657,9 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
     // Walk chunks until we hit "data"; parse "fmt ", "ds64" and "LIST"
     // along the way.
     let mut fmt: Option<WaveFmt> = None;
+    // Raw `fmt ` chunk bytes, preserved for `ProbeContext::header` when
+    // an unmapped `wFormatTag` is handed to the `CodecResolver`.
+    let mut fmt_raw: Option<Vec<u8>> = None;
     let mut metadata: Vec<(String, String)> = Vec::new();
     // `fact` chunk's `dwFileSize` (per-channel sample count) when present.
     // Required for non-PCM / `wavl LIST` waveform data per
@@ -661,6 +765,10 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
                 if size % 2 == 1 {
                     input.seek(SeekFrom::Current(1))?;
                 }
+                // Keep the raw chunk bytes: they become the
+                // `ProbeContext::header` blob when an unmapped tag is
+                // handed to the CodecResolver.
+                fmt_raw = Some(buf);
             }
             b"fact" => {
                 let buf = read_chunk_body(&mut *input, size)?;
@@ -927,7 +1035,7 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
         data_offset.ok_or_else(|| Error::invalid("WAV missing data / wavl waveform"))?;
     let data_size = data_size.unwrap_or(0);
 
-    let codec_id = resolve_codec(&fmt)?;
+    let codec_id = resolve_codec(&fmt, fmt_raw.as_deref().unwrap_or(&[]), codecs)?;
     // Sample format hint for the decoded shape (NOT the on-wire layout
     // — A-law/μ-law expand to S16 once decoded, mirroring the
     // round-75 `oxideav-avi` audio_codec_sample_format helper). For
@@ -1023,6 +1131,23 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
             // the mapping.
             if let Some(tag) = waveformatex_tag(sub) {
                 metadata.push(("wav:fmt.subformat_tag".to_string(), format!("0x{tag:04X}")));
+            }
+            // Symbolic KSDATAFORMAT_SUBTYPE_* name for the catalogued
+            // GUIDs (both the WAVEFORMATEX-derived family and the IEC
+            // 61937 pass-through family).
+            if let Some(name) = subformat_name(sub) {
+                metadata.push(("wav:fmt.subformat_name".to_string(), name.to_string()));
+            }
+            // IEC 61937 family (Data2 == 0x0cea): the payload is a
+            // packetised compressed bitstream, not decodable PCM. The
+            // CEA-861 stream type is the Data1 low byte (the MAT
+            // 2.0/2.1 revisions extend the high bits but share type
+            // 0x0c).
+            if let Some(data1) = iec61937_data1(sub) {
+                metadata.push((
+                    "wav:fmt.iec61937_stream_type".to_string(),
+                    format!("0x{:02X}", data1 & 0xFF),
+                ));
             }
         }
     }
@@ -4673,15 +4798,43 @@ fn codec_for_tag(tag: u16, bits: u16) -> Result<Option<CodecId>> {
     })
 }
 
-fn resolve_codec(fmt: &WaveFmt) -> Result<CodecId> {
+/// Hand an unmapped legacy `wFormatTag` to the [`CodecResolver`]: the
+/// registry walks every codec registration claiming
+/// `CodecTag::WaveFormat(tag)` (the RFC 2361 value space —
+/// `docs/container/riff/rfc2361-wav.txt`) and returns the
+/// highest-confidence claim. The raw `fmt ` chunk bytes ride along as
+/// the header blob so per-codec probes can inspect codec-specific
+/// extension fields past the common prefix.
+fn resolve_tag_via_registry(
+    fmt: &WaveFmt,
+    raw_fmt: &[u8],
+    tag: u16,
+    codecs: &dyn CodecResolver,
+) -> Option<CodecId> {
+    let probe_tag = oxideav_core::CodecTag::wave_format(tag);
+    let ctx = oxideav_core::ProbeContext::new(&probe_tag)
+        .header(raw_fmt)
+        .bits(fmt.bits_per_sample)
+        .channels(fmt.channels)
+        .sample_rate(fmt.sample_rate);
+    codecs.resolve_tag(&ctx)
+}
+
+fn resolve_codec(fmt: &WaveFmt, raw_fmt: &[u8], codecs: &dyn CodecResolver) -> Result<CodecId> {
     if fmt.format_tag != FMT_EXTENSIBLE {
-        return match codec_for_tag(fmt.format_tag, fmt.bits_per_sample)? {
-            Some(id) => Ok(id),
-            None => Err(Error::unsupported(format!(
-                "unsupported WAV format tag 0x{:04x}",
-                fmt.format_tag
-            ))),
-        };
+        if let Some(id) = codec_for_tag(fmt.format_tag, fmt.bits_per_sample)? {
+            return Ok(id);
+        }
+        // Not a format this crate maps directly — the registry may
+        // hold a codec claiming the tag (ADPCM families, MP3, …; the
+        // RFC 2361 registry names the value space).
+        if let Some(id) = resolve_tag_via_registry(fmt, raw_fmt, fmt.format_tag, codecs) {
+            return Ok(id);
+        }
+        return Err(Error::unsupported(format!(
+            "unsupported WAV format tag 0x{:04x}",
+            fmt.format_tag
+        )));
     }
 
     let sub = fmt
@@ -4715,12 +4868,27 @@ fn resolve_codec(fmt: &WaveFmt) -> Result<CodecId> {
             if let Some(id) = codec_for_tag(tag, depth)? {
                 return Ok(id);
             }
+            // Template GUID whose embedded tag this crate doesn't map
+            // directly — same registry route as the legacy path, since
+            // the GUID is documented as equivalent to the tag.
+            if let Some(id) = resolve_tag_via_registry(fmt, raw_fmt, tag, codecs) {
+                return Ok(id);
+            }
         }
     }
     // Not a (mappable) WAVEFORMATEX-template GUID — synthesise a
     // `wav:guid_<text>` id so downstream make_decoder fails naming the
     // actual GUID rather than the opaque 0xFFFE tag. Mirrors the
-    // `avi:guid_<...>` pattern in oxideav-avi.
+    // `avi:guid_<...>` pattern in oxideav-avi. This includes the IEC
+    // 61937 pass-through family (`Data2 == 0x0cea`): per
+    // docs/container/riff/waveformatextensible/ksdataformat-subtype-guids.md
+    // §"Decoder dispatch guidance" its `Data1` is a CEA-861 stream
+    // type, NOT a wave-format tag, and must never be fed through
+    // `EXTRACT_WAVEFORMATEX_ID` (the `0x0cea` Data2 makes the template
+    // test fail, which is the intended guard). `CodecTag` has no
+    // 128-bit GUID form, so GUID-keyed registry resolution is out of
+    // this container's reach — the synthesised id plus the
+    // `wav:fmt.subformat_name` metadata keep the stream identifiable.
     Ok(CodecId::new(format!("wav:guid_{}", fmt_guid(&sub))))
 }
 
@@ -6672,6 +6840,213 @@ mod tests {
         assert_eq!(
             md.get("wav:fmt.subformat_tag").map(String::as_str),
             Some("0x0055")
+        );
+    }
+
+    /// `subformat_name` resolves the catalogued `KSDATAFORMAT_SUBTYPE_*`
+    /// rows in BOTH GUID families per
+    /// docs/container/riff/waveformatextensible/ksdataformat-subtype-guids.md,
+    /// and stays `None` for uncatalogued template tags and foreign GUIDs.
+    #[test]
+    fn subformat_name_catalog() {
+        assert_eq!(subformat_name(&GUID_PCM), Some("KSDATAFORMAT_SUBTYPE_PCM"));
+        assert_eq!(
+            subformat_name(&GUID_MULAW),
+            Some("KSDATAFORMAT_SUBTYPE_MULAW")
+        );
+        // Template GUID for MS ADPCM (tag 0x0002).
+        let mut g = GUID_PCM;
+        g[0] = 0x02;
+        assert_eq!(subformat_name(&g), Some("KSDATAFORMAT_SUBTYPE_ADPCM"));
+        // The documented worked example: tag 0x0092.
+        g[0] = 0x92;
+        assert_eq!(
+            subformat_name(&g),
+            Some("KSDATAFORMAT_SUBTYPE_DOLBY_AC3_SPDIF")
+        );
+        // Uncatalogued template tag (MP3, 0x0055) has no symbolic
+        // KSDATAFORMAT_SUBTYPE_* constant — identified via
+        // wav:fmt.subformat_tag instead.
+        g[0] = 0x55;
+        assert_eq!(subformat_name(&g), None);
+        // IEC 61937 family (Data2 == 0x0cea).
+        assert_eq!(
+            subformat_name(&iec61937_guid(0x000A)),
+            Some("KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_DIGITAL_PLUS")
+        );
+        assert_eq!(
+            subformat_name(&iec61937_guid(0x010C)),
+            Some("KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_MAT20")
+        );
+        assert_eq!(subformat_name(&iec61937_guid(0x00FF)), None);
+        // Foreign GUID: neither family.
+        let foreign: [u8; 16] = [0xAB; 16];
+        assert_eq!(subformat_name(&foreign), None);
+        assert_eq!(iec61937_data1(&foreign), None);
+    }
+
+    /// Build an IEC 61937 pass-through SubFormat GUID
+    /// (`<data1>-0cea-0010-8000-00aa00389b71`) on-wire.
+    fn iec61937_guid(data1: u32) -> [u8; 16] {
+        let mut g = [0u8; 16];
+        g[0..4].copy_from_slice(&data1.to_le_bytes());
+        g[4..6].copy_from_slice(&0x0CEAu16.to_le_bytes());
+        g[6..16].copy_from_slice(&GUID_DATAFORMAT_TAIL10);
+        g
+    }
+
+    /// An IEC 61937 pass-through stream (compressed bitstream framed as
+    /// PCM-shaped samples) is never mistaken for a wave-format tag: no
+    /// `wav:fmt.subformat_tag`, the codec id stays a synthesised
+    /// `wav:guid_<text>`, and the CEA-861 stream type + symbolic name
+    /// surface for identification.
+    #[test]
+    fn extensible_iec61937_family_identified_not_tag_routed() {
+        let buf = extensible_wav_with_guid(&iec61937_guid(0x000A), 16);
+        use std::io::Cursor;
+        let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(buf));
+        let dmx = open_demuxer(rs, &oxideav_core::NullCodecResolver).unwrap();
+        let s = &dmx.streams()[0];
+        assert!(
+            s.params.codec_id.as_str().starts_with("wav:guid_"),
+            "IEC 61937 GUID must synthesise wav:guid_<text>, got {:?}",
+            s.params.codec_id.as_str()
+        );
+        let md: std::collections::HashMap<_, _> = dmx.metadata().iter().cloned().collect();
+        assert_eq!(md.get("wav:fmt.subformat_tag"), None);
+        assert_eq!(
+            md.get("wav:fmt.subformat_name").map(String::as_str),
+            Some("KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_DIGITAL_PLUS")
+        );
+        assert_eq!(
+            md.get("wav:fmt.iec61937_stream_type").map(String::as_str),
+            Some("0x0A")
+        );
+    }
+
+    /// Hints a [`OneTagResolver`] probe observed:
+    /// `(bits_per_sample, channels, sample_rate, header_len)`.
+    type SeenProbe = (Option<u16>, Option<u16>, Option<u32>, usize);
+
+    /// Test resolver: claims exactly one wave-format tag and records
+    /// the hints it was probed with.
+    struct OneTagResolver {
+        tag: u16,
+        id: &'static str,
+        seen: std::sync::Mutex<Vec<SeenProbe>>,
+    }
+
+    impl CodecResolver for OneTagResolver {
+        fn resolve_tag(&self, ctx: &oxideav_core::ProbeContext) -> Option<CodecId> {
+            self.seen.lock().unwrap().push((
+                ctx.bits_per_sample,
+                ctx.channels,
+                ctx.sample_rate,
+                ctx.header.map(<[u8]>::len).unwrap_or(0),
+            ));
+            match ctx.tag {
+                oxideav_core::CodecTag::WaveFormat(t) if *t == self.tag => {
+                    Some(CodecId::new(self.id))
+                }
+                _ => None,
+            }
+        }
+    }
+
+    /// Hand-build a minimal legacy 16-byte-`fmt ` WAV with an arbitrary
+    /// `wFormatTag` and an empty `data` chunk.
+    fn legacy_wav_with_tag(tag: u16, bits: u16) -> Vec<u8> {
+        let block_align = (bits / 8).max(1);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"RIFF");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(b"WAVE");
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&16u32.to_le_bytes());
+        buf.extend_from_slice(&tag.to_le_bytes());
+        buf.extend_from_slice(&2u16.to_le_bytes()); // channels
+        buf.extend_from_slice(&32_000u32.to_le_bytes()); // sample_rate
+        buf.extend_from_slice(&(32_000 * block_align as u32 * 2).to_le_bytes());
+        buf.extend_from_slice(&(block_align * 2).to_le_bytes());
+        buf.extend_from_slice(&bits.to_le_bytes());
+        buf.extend_from_slice(b"data");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf
+    }
+
+    /// A legacy `WAVEFORMATEX` tag this crate does not map directly
+    /// (previously a hard "unsupported" error) now routes through the
+    /// supplied `CodecResolver` — the registry owns the RFC 2361 tag
+    /// value space — with the container hints and the raw `fmt ` bytes
+    /// in the probe context.
+    #[test]
+    fn legacy_unmapped_tag_routes_through_resolver() {
+        let resolver = OneTagResolver {
+            tag: 0x0055,
+            id: "mp3",
+            seen: std::sync::Mutex::new(Vec::new()),
+        };
+        let buf = legacy_wav_with_tag(0x0055, 0);
+        use std::io::Cursor;
+        let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(buf));
+        let dmx = open_demuxer(rs, &resolver).expect("resolver-claimed tag opens");
+        assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "mp3");
+        let seen = resolver.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "resolver probed exactly once");
+        let (bits, ch, sr, header_len) = seen[0];
+        assert_eq!(bits, Some(0));
+        assert_eq!(ch, Some(2));
+        assert_eq!(sr, Some(32_000));
+        assert_eq!(header_len, 16, "raw fmt chunk rides as the header blob");
+
+        // Without a registry claim the tag still errors as before.
+        let buf = legacy_wav_with_tag(0x0055, 0);
+        let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(buf));
+        assert!(matches!(
+            open_demuxer(rs, &oxideav_core::NullCodecResolver),
+            Err(Error::Unsupported(_))
+        ));
+    }
+
+    /// The EXTENSIBLE template-GUID path hands the EXTRACTED legacy tag
+    /// to the resolver — a SubFormat of `{00000055-…}` resolves exactly
+    /// like `wFormatTag = 0x0055` (the documented equivalence), instead
+    /// of falling through to the synthesised `wav:guid_<text>` id.
+    #[test]
+    fn extensible_template_guid_routes_through_resolver() {
+        let resolver = OneTagResolver {
+            tag: 0x0055,
+            id: "mp3",
+            seen: std::sync::Mutex::new(Vec::new()),
+        };
+        let mut mp3_guid = GUID_PCM;
+        mp3_guid[0] = 0x55;
+        let buf = extensible_wav_with_guid(&mp3_guid, 16);
+        use std::io::Cursor;
+        let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(buf));
+        let dmx = open_demuxer(rs, &resolver).unwrap();
+        assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "mp3");
+        assert_eq!(resolver.seen.lock().unwrap().len(), 1);
+    }
+
+    /// Formats this crate maps directly (PCM / IEEE-float / A-law /
+    /// μ-law) never consult the resolver — the container's own mapping
+    /// wins, so a registry cannot shadow the native ids.
+    #[test]
+    fn native_formats_do_not_consult_resolver() {
+        let resolver = OneTagResolver {
+            tag: 0x0001,
+            id: "shadow_pcm",
+            seen: std::sync::Mutex::new(Vec::new()),
+        };
+        let buf = legacy_wav_with_tag(FMT_PCM, 16);
+        use std::io::Cursor;
+        let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(buf));
+        let dmx = open_demuxer(rs, &resolver).unwrap();
+        assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "pcm_s16le");
+        assert!(
+            resolver.seen.lock().unwrap().is_empty(),
+            "native tag must not reach the resolver"
         );
     }
 
