@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/OxideAV/oxideav-basic/compare/v0.0.9...v0.0.10) - 2026-08-18
+
+### Other
+
+- union overrides apply to the automatic EXTENSIBLE promotion
+- Samples-union member selection — wSamplesPerBlock for block-compressed subformats
+- EXTENSIBLE black-box interop fixtures + doc surface refresh
+- automatic WAVE_FORMAT_EXTENSIBLE promotion in the muxer
+- KSDATAFORMAT subtype naming, IEC 61937 family, resolver tag routing
+- surface dwChannelMask through core ChannelLayout + mismatch flag
+- EXTENSIBLE routing by container size + Samples-union validation
+- describe Y4M little-endian + colorspace-token conventions on their own terms
+- document WAV demuxer hostile-input robustness + bench
+- add dependency-free read/write hot-path micro-benchmark
+- per-chunk-id targeted fuzz reaching every parser directly
+- cap sxml sub-chunk / alignment-point reservations to body size
+- deterministic mutation-fuzz net over the demuxer parse path
+- guard chunk-skip seeks against i64-overflow backward wrap
+- cap ds64 table reservation to available records (OOM hardening)
+- bound chunk-body allocation against size-lies (DoS hardening)
+- add CI / crates.io / docs.rs / MIT-license badges
+- smpl + inst chunks read+write symmetric — typed structs + writers
+- document DISP / id3 / PAD chunks + LIST INFO write side
+- typed WavDemuxer::disp() / info() accessors
+- LIST INFO write side — InfoChunk/InfoEntry + with_info
+- id3 chunk write side — WavMuxOptions::with_id3
+- parse PAD (alignment-padding) chunk
+- DISP (Display) chunk write side — typed DispChunk + with_disp
+- parse DISP (Display) + id3 (embedded ID3v2 tag) chunks
+- sxml (serialized-XML ADM carrier) read+write — README + CHANGELOG
+- symmetric sxml (serialized-XML) muxer write support per BS.2088 §7
+- read BW64/ADM sxml (serialized-XML) chunk per ITU-R BS.2088-2 §7
+- end-to-end demux->re-emit->demux symmetry test for cue/plst/adtl
+- cue/plst/adtl symmetric read+write + trailing-chunk scan (CHANGELOG + README)
+- symmetric cue / plst / LIST adtl muxer write support
+- typed cue / plst / LIST adtl read + post-data trailing-chunk scan
+- test RF64 Reserve overflow→promotion via streamed >4 GiB sparse sink
+- RF64/BW64 64-bit large-file write side (ds64 + JUNK on-the-fly conversion)
+- integration round-trip test for combined acid + chna metadata
+- classify chna audioID refs by ADM prefix + BS.2088 §3 definition scope
+- BWF bext chunk read+write with typed BextChunk surface
+- parse BW64/ADM bxml (compressed XML) chunk per ITU-R BS.2088-2 §6
+- BW64/ADM chna (channel-allocation) chunk read+write
+- recognise extended LIST INFO sub-IDs (ExifTool RIFF Info Tags)
+
 ### Fixed
 
 - WAV `WAVE_FORMAT_EXTENSIBLE` codec routing now dispatches on the `wBitsPerSample` **container size**, not the union's `wValidBitsPerSample` — per `docs/container/riff/waveformatextensible/ms-waveformatextensible.html` §`Samples.wValidBitsPerSample` ("wBitsPerSample is the container size") and `ms-extensible-wave-format.html` ("a 20-bit sample can be stored left-justified within a three-byte container"), the `data` chunk carries container-sized samples and the union WORD only states how many bits carry signal. A 24-valid-bits-in-32-bit-container stream previously mis-resolved to `pcm_s24le` (wrong interleave stride); it now resolves to `pcm_s32le` with the precision surfaced separately via `wav:fmt.valid_bits_per_sample` / `WavDemuxer::valid_bits_per_sample`
