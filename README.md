@@ -46,30 +46,59 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework �
   is parsed end-to-end — the 22-byte extension's `wValidBitsPerSample`,
   `dwChannelMask` and SubFormat GUID are surfaced through both
   `wav:fmt.*` metadata keys and typed accessors on the concrete
-  `WavDemuxer`. The `dwChannelMask` bitmap is also decoded into a
-  human-readable `SPEAKER_*` layout (`wav:fmt.channel_layout` +
-  `WavDemuxer::channel_layout`), `+`-joined least-significant-bit-first
-  per the 18 documented flag bits (`FRONT_LEFT 0x1` ..
-  `TOP_BACK_RIGHT 0x20000`) in
-  `docs/container/riff/waveformatextensible/ms-waveformatextensible.html`;
-  bits above the highest defined flag are preserved as
-  `UNKNOWN(0x...)`. Any SubFormat GUID built from the `KSMedia.h`
-  `DEFINE_WAVEFORMATEX_GUID(x)` template — `{0000xxxx-0000-0010-8000-
-  00AA00389B71}`, where the leading 16 bits carry the legacy
-  `wFormatTag` `x` — resolves through the SAME `wFormatTag` dispatch the
-  legacy `WAVEFORMATEX` path uses, implementing the documented
-  `IS_VALID_WAVEFORMATEX_GUID` / `EXTRACT_WAVEFORMATEX_ID` macros from
-  `docs/container/riff/waveformatextensible/ms-converting-format-tags-and-subformat-guids.md`.
-  This generalises the four hand-listed `KSDATAFORMAT_SUBTYPE_*` GUIDs
-  (PCM `0x0001`, IEEE_FLOAT `0x0003`, ALAW `0x0006`, MULAW `0x0007`) to
-  every tag-derived GUID, and surfaces the embedded tag as
-  `wav:fmt.subformat_tag` (e.g. an EXTENSIBLE file whose SubFormat is
-  `{00000055-...}` is observably MP3-tagged even though this crate
-  doesn't decode MP3). Template GUIDs whose embedded tag isn't a format
-  this crate maps directly, and non-template (unknown) GUIDs, both
-  synthesise a `wav:guid_<canonical-text>` id.
-  `WavMuxOptions::with_extensible(mask)`
-  opts the muxer into writing a 40-byte EXTENSIBLE `fmt ` chunk. The
+  `WavDemuxer`. The wire codec dispatches on the `wBitsPerSample`
+  **container size** (the `data` chunk carries container-sized,
+  left-justified samples); `wValidBitsPerSample` is precision-of-signal
+  metadata, validated per the staged struct doc (a claim exceeding the
+  container, or a container that isn't a non-zero multiple of 8,
+  rejects; a zero union WORD is tolerated). The `dwChannelMask` bitmap
+  is decoded two ways: a human-readable `SPEAKER_*` list
+  (`wav:fmt.channel_layout` + `WavDemuxer::channel_layout`), `+`-joined
+  least-significant-bit-first per the 18 documented flag bits
+  (`FRONT_LEFT 0x1` .. `TOP_BACK_RIGHT 0x20000`) in
+  `docs/container/riff/waveformatextensible/ms-waveformatextensible.html`
+  (bits above the highest defined flag are preserved as
+  `UNKNOWN(0x...)`), and oxideav-core's typed `ChannelLayout` on
+  `CodecParameters::channel_layout` via position-SET matching (both
+  5.1 rows of the staged standard-layouts table land on `Surround51`;
+  assigned-but-unnamed sets fall back to `DiscreteN`; a set-bit vs
+  `nChannels` disagreement leaves the field unset and flags
+  `wav:fmt.channel_mask_mismatch`). Any SubFormat GUID built from the
+  `KSMedia.h` `DEFINE_WAVEFORMATEX_GUID(x)` template —
+  `{0000xxxx-0000-0010-8000-00AA00389B71}`, where the leading 16 bits
+  carry the legacy `wFormatTag` `x` — resolves through the SAME
+  `wFormatTag` dispatch the legacy `WAVEFORMATEX` path uses,
+  implementing the documented `IS_VALID_WAVEFORMATEX_GUID` /
+  `EXTRACT_WAVEFORMATEX_ID` macros from
+  `docs/container/riff/waveformatextensible/ms-converting-format-tags-and-subformat-guids.md`,
+  with the embedded tag surfaced as `wav:fmt.subformat_tag`. Tags this
+  crate doesn't map directly (ADPCM families, MP3, … — the RFC 2361
+  value space in `docs/container/riff/rfc2361-wav.txt`) route through
+  the `CodecResolver` threaded into `open()` on both the legacy and
+  the template-GUID paths (`open_wav_demuxer_with` exposes the same on
+  the concrete type), so registry-claimed tags resolve to their codec
+  crate's id; only unclaimed tags and non-template GUIDs synthesise a
+  `wav:guid_<canonical-text>` id. Catalogued GUIDs additionally
+  surface their symbolic name (`wav:fmt.subformat_name`) per the
+  consolidated `KSDATAFORMAT_SUBTYPE_*` catalog
+  (`docs/container/riff/waveformatextensible/ksdataformat-subtype-guids.md`),
+  including the IEC 61937 compressed-pass-through family
+  (`Data2 == 0x0cea`, Dolby MAT 2.0/2.1 revisions included) whose
+  CEA-861 stream type surfaces as `wav:fmt.iec61937_stream_type` and
+  which is guarded from the wave-format-tag route (its `Data1` is a
+  stream type, not a tag). On the write side the muxer follows the
+  staged encoder guidance automatically: more than two channels or a
+  container size above 16 bits promote the `fmt ` chunk to the 40-byte
+  EXTENSIBLE form with `dwChannelMask` derived from the stream's typed
+  `ChannelLayout` (else the channel-count default; `DiscreteN` writes
+  mask `0`), while classic ≤ 2-channel / ≤ 16-bit output stays
+  byte-identical to the historical muxer.
+  `WavMuxOptions::with_extensible(mask)` still forces the form with an
+  explicit mask and `with_legacy_waveformatex()` suppresses the
+  automatic promotion; round-trip is symmetric and the promoted output
+  is pinned against a black-box validator plus tool-generated
+  multi-channel / 24-bit / float fixtures in
+  `tests/wav_extensible_interop.rs`. The
   `bext` Broadcast Audio Extension chunk (EBU Tech 3285 v2 §2.3) is
   supported on BOTH the read and write sides through the typed
   `wav::BextChunk` struct (602-byte fixed body + optional variable-length

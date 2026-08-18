@@ -13,28 +13,48 @@
 //! Per `docs/container/riff/waveformatextensible/README.md` the demuxer
 //! parses the 22-byte extension and surfaces:
 //!
-//! - `wValidBitsPerSample` — actual bit precision (may differ from the
-//!   `wBitsPerSample` container size for 24-in-32-bit PCM).
+//! - `wValidBitsPerSample` — signal precision (may be less than the
+//!   `wBitsPerSample` container size, e.g. 24-in-32-bit PCM). The wire
+//!   codec always dispatches on the CONTAINER size — the `data` chunk
+//!   carries container-sized, left-justified samples. A precision
+//!   claim exceeding the container, or a container that isn't a
+//!   non-zero multiple of 8, rejects as malformed.
 //! - `dwChannelMask` — `SPEAKER_*` bitmap describing the channel
-//!   ordering of the interleaved PCM byte stream.
+//!   ordering of the interleaved PCM byte stream, surfaced both as a
+//!   human-readable list and as oxideav-core's typed [`ChannelLayout`]
+//!   on `CodecParameters::channel_layout` (position-set matching; a
+//!   set-bit/`nChannels` disagreement flags
+//!   `wav:fmt.channel_mask_mismatch` instead).
 //! - `SubFormat` GUID — the codec identifier when the legacy
 //!   `wFormatTag` is the EXTENSIBLE escape hatch.
 //!
-//! Well-known `KSDATAFORMAT_SUBTYPE_*` GUIDs (PCM, IEEE_FLOAT, ALAW,
-//! MULAW) are mapped to the same codec ids the legacy
-//! `WAVEFORMATEX` path would have produced. Unknown GUIDs synthesise a
-//! `wav:guid_<canonical-text>` codec id so downstream
+//! Any `DEFINE_WAVEFORMATEX_GUID`-template GUID dispatches through the
+//! same `wFormatTag` route the legacy `WAVEFORMATEX` path uses —
+//! first this crate's own PCM / IEEE-float / A-law / μ-law mapping,
+//! then the [`CodecResolver`] threaded into `open()` (the registry
+//! owns the RFC 2361 tag value space). Catalogued
+//! `KSDATAFORMAT_SUBTYPE_*` GUIDs surface their symbolic name, the
+//! IEC 61937 pass-through family (`Data2 == 0x0cea`) additionally its
+//! CEA-861 stream type; unclaimed tags and non-template GUIDs
+//! synthesise a `wav:guid_<canonical-text>` codec id so downstream
 //! `CodecRegistry::make_decoder` lookups fail cleanly naming the
 //! actual GUID.
 //!
 //! The extension fields are also exposed verbatim through
 //! `Demuxer::metadata` under the keys
 //! `wav:fmt.valid_bits_per_sample` / `wav:fmt.channel_mask` /
-//! `wav:fmt.channel_layout` / `wav:fmt.subformat` (matching the
-//! round-75 `oxideav-avi` shape, but single-stream so no per-stream
-//! index). `wav:fmt.channel_layout` is the `dwChannelMask` bitmap
-//! decoded into a `+`-separated list of `SPEAKER_*` positions per
-//! `docs/container/riff/waveformatextensible/ms-waveformatextensible.html`.
+//! `wav:fmt.channel_layout` / `wav:fmt.subformat` /
+//! `wav:fmt.subformat_tag` / `wav:fmt.subformat_name` /
+//! `wav:fmt.iec61937_stream_type` (matching the round-75 `oxideav-avi`
+//! shape, but single-stream so no per-stream index).
+//!
+//! On the write side the muxer promotes the `fmt ` chunk to the
+//! 40-byte EXTENSIBLE form automatically for more than two channels or
+//! containers above 16 bits (the staged encoder guidance), deriving
+//! `dwChannelMask` from the stream's typed [`ChannelLayout`];
+//! [`WavMuxOptions::with_extensible`] forces the form,
+//! [`WavMuxOptions::with_legacy_waveformatex`] suppresses the
+//! promotion.
 
 use oxideav_core::{
     ChannelLayout, ChannelPosition, CodecId, CodecParameters, CodecResolver, Error, MediaType,
@@ -532,7 +552,7 @@ fn speaker_bit(pos: ChannelPosition) -> Option<u32> {
 
 /// Derive the `WAVEFORMATEXTENSIBLE.dwChannelMask` for a core
 /// [`ChannelLayout`] by OR-ing each speaker position's `SPEAKER_*` flag
-/// bit (per the staged bit table — see [`speaker_bit`]).
+/// bit (per the staged bit table — see `speaker_bit`).
 ///
 /// [`ChannelLayout::DiscreteN`] returns `0`: the mask semantics for "no
 /// assigned speaker positions" (channels are direct-out / discrete),
@@ -5227,8 +5247,7 @@ fn open_muxer(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Box<
 /// §"What's covered"): more than two channels or a container size
 /// above 16 bits promote the header to `WAVE_FORMAT_EXTENSIBLE`
 /// (`wFormatTag = 0xFFFE`, 40-byte `fmt `), with `dwChannelMask`
-/// derived from the stream's typed
-/// [`ChannelLayout`](oxideav_core::ChannelLayout); everything else
+/// derived from the stream's typed [`ChannelLayout`]; everything else
 /// keeps the classic 16-byte `WAVEFORMAT`, byte-identical to the
 /// historical output. [`Self::with_extensible`] forces the EXTENSIBLE
 /// form with an explicit mask, [`Self::with_legacy_waveformatex`]
