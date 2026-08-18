@@ -13,12 +13,16 @@
 //! Per `docs/container/riff/waveformatextensible/README.md` the demuxer
 //! parses the 22-byte extension and surfaces:
 //!
-//! - `wValidBitsPerSample` — signal precision (may be less than the
-//!   `wBitsPerSample` container size, e.g. 24-in-32-bit PCM). The wire
-//!   codec always dispatches on the CONTAINER size — the `data` chunk
-//!   carries container-sized, left-justified samples. A precision
-//!   claim exceeding the container, or a container that isn't a
-//!   non-zero multiple of 8, rejects as malformed.
+//! - the `Samples` union — `wValidBitsPerSample` (signal precision,
+//!   may be less than the `wBitsPerSample` container size, e.g.
+//!   24-in-32-bit PCM) for the precision-semantics family (PCM /
+//!   IEEE-float / A-law / μ-law / IEC 61937), `wSamplesPerBlock` for
+//!   block-compressed subformats. The wire codec always dispatches on
+//!   the CONTAINER size — the `data` chunk carries container-sized,
+//!   left-justified samples. In the precision reading, a claim
+//!   exceeding the container or a container that isn't a non-zero
+//!   multiple of 8 rejects as malformed; the block reading accepts
+//!   any values (a 4-bit nibble container is normal there).
 //! - `dwChannelMask` — `SPEAKER_*` bitmap describing the channel
 //!   ordering of the interleaved PCM byte stream, surfaced both as a
 //!   human-readable list and as oxideav-core's typed [`ChannelLayout`]
@@ -405,6 +409,29 @@ fn iec61937_data1(g: &[u8; 16]) -> Option<u32> {
         Some(u32::from_le_bytes([g[0], g[1], g[2], g[3]]))
     } else {
         None
+    }
+}
+
+/// Which member of the EXTENSIBLE `Samples` union the SubFormat gives
+/// meaning to. Per
+/// `docs/container/riff/waveformatextensible/ms-waveformatextensible.html`
+/// §`Samples` the union is `wValidBitsPerSample` (signal precision in a
+/// byte-aligned container) OR `wSamplesPerBlock` ("used with compressed
+/// formats that have a fixed number of samples within each block";
+/// `0` = variable).
+///
+/// Precision semantics: the linear/companded template subformats (PCM,
+/// IEEE_FLOAT, ALAW, MULAW) and the IEC 61937 pass-through family —
+/// the staged `ms-representing-formats-iec61937.md` worked examples
+/// all set 16-bit containers with `wValidBitsPerSample = 16`.
+/// Everything else (other template tags — the block-compressed RFC
+/// 2361 registry formats — and vendor GUIDs) reads as
+/// `wSamplesPerBlock`.
+fn union_is_precision(sub: &[u8; 16]) -> bool {
+    match waveformatex_tag(sub) {
+        Some(FMT_PCM | FMT_IEEE_FLOAT | FMT_ALAW | FMT_MULAW) => true,
+        Some(_) => false,
+        None => iec61937_data1(sub).is_some(),
     }
 }
 
@@ -1116,11 +1143,22 @@ pub fn open_wav_demuxer_with(
     // index — WAV is single-stream by construction). Only emitted when
     // the on-wire wFormatTag is EXTENSIBLE and the extension parsed.
     if fmt.format_tag == FMT_EXTENSIBLE {
-        if let Some(valid) = fmt.valid_bits_per_sample {
-            metadata.push((
-                "wav:fmt.valid_bits_per_sample".to_string(),
-                valid.to_string(),
-            ));
+        if let Some(word) = fmt.valid_bits_per_sample {
+            // The union WORD surfaces under the member name the
+            // SubFormat gives it (see `union_is_precision`).
+            let precision = fmt
+                .subformat
+                .as_ref()
+                .map(union_is_precision)
+                .unwrap_or(true);
+            if precision {
+                metadata.push((
+                    "wav:fmt.valid_bits_per_sample".to_string(),
+                    word.to_string(),
+                ));
+            } else {
+                metadata.push(("wav:fmt.samples_per_block".to_string(), word.to_string()));
+            }
         }
         if let Some(mask) = fmt.channel_mask {
             metadata.push(("wav:fmt.channel_mask".to_string(), format!("0x{mask:08X}")));
@@ -4757,31 +4795,40 @@ fn parse_fmt(buf: &[u8]) -> Result<WaveFmt> {
                 "WAVE_FORMAT_EXTENSIBLE cbSize must be >= 22, got {cb_size}"
             )));
         }
-        let valid = u16::from_le_bytes([buf[18], buf[19]]);
+        let union_word = u16::from_le_bytes([buf[18], buf[19]]);
+        let mask = u32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]]);
+        let mut g = [0u8; 16];
+        g.copy_from_slice(&buf[24..40]);
         // Container-size invariants per
         // docs/container/riff/waveformatextensible/ms-waveformatextensible.html
         // §Samples.wValidBitsPerSample: "wBitsPerSample is the container
         // size and must be a multiple of 8, whereas wValidBitsPerSample
-        // can be any value not exceeding the container size." A zero
-        // union WORD is tolerated (some writers leave the union unset);
-        // a precision that CLAIMS more bits than the container carries,
-        // or a container that is not byte-aligned, is malformed.
-        if bits_per_sample == 0 || bits_per_sample % 8 != 0 {
-            return Err(Error::invalid(format!(
-                "WAVE_FORMAT_EXTENSIBLE wBitsPerSample (container size) must be \
-                 a non-zero multiple of 8, got {bits_per_sample}"
-            )));
+        // can be any value not exceeding the container size." These
+        // rules describe the union's PRECISION member, so they apply
+        // only when the SubFormat gives the union that meaning (see
+        // `union_is_precision`) — for block-compressed subformats the
+        // union WORD is `wSamplesPerBlock` (any value, `0` = variable)
+        // and `wBitsPerSample` is not a byte-aligned container (e.g. a
+        // 4-bit nibble-packed stream). A zero union WORD is tolerated
+        // in the precision reading too (some writers leave the union
+        // unset); a precision that CLAIMS more bits than the container
+        // carries, or a non-byte-aligned container, is malformed.
+        if union_is_precision(&g) {
+            if bits_per_sample == 0 || bits_per_sample % 8 != 0 {
+                return Err(Error::invalid(format!(
+                    "WAVE_FORMAT_EXTENSIBLE wBitsPerSample (container size) must be \
+                     a non-zero multiple of 8, got {bits_per_sample}"
+                )));
+            }
+            if union_word > bits_per_sample {
+                return Err(Error::invalid(format!(
+                    "WAVE_FORMAT_EXTENSIBLE wValidBitsPerSample ({union_word}) exceeds \
+                     the wBitsPerSample container size ({bits_per_sample})"
+                )));
+            }
         }
-        if valid > bits_per_sample {
-            return Err(Error::invalid(format!(
-                "WAVE_FORMAT_EXTENSIBLE wValidBitsPerSample ({valid}) exceeds \
-                 the wBitsPerSample container size ({bits_per_sample})"
-            )));
-        }
-        valid_bits_per_sample = Some(valid);
-        channel_mask = Some(u32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]]));
-        let mut g = [0u8; 16];
-        g.copy_from_slice(&buf[24..40]);
+        valid_bits_per_sample = Some(union_word);
+        channel_mask = Some(mask);
         subformat = Some(g);
     }
     Ok(WaveFmt {
@@ -5004,11 +5051,31 @@ impl WavDemuxer {
         self.format_tag
     }
 
-    /// `WAVEFORMATEXTENSIBLE.Samples.wValidBitsPerSample` — actual bit
-    /// precision per sample. `None` for legacy `WAVEFORMATEX` streams
-    /// (non-EXTENSIBLE `wFormatTag`).
+    /// `WAVEFORMATEXTENSIBLE.Samples.wValidBitsPerSample` — signal
+    /// precision per sample (never exceeds the `wBitsPerSample`
+    /// container size; `0` = writer left the union unset). `None` for
+    /// legacy `WAVEFORMATEX` streams AND for SubFormats whose union
+    /// WORD means [`Self::samples_per_block`] instead — the `Samples`
+    /// union has exactly one active member per format.
     pub fn valid_bits_per_sample(&self) -> Option<u16> {
-        self.valid_bits_per_sample
+        match &self.subformat {
+            Some(g) if !union_is_precision(g) => None,
+            _ => self.valid_bits_per_sample,
+        }
+    }
+
+    /// `WAVEFORMATEXTENSIBLE.Samples.wSamplesPerBlock` — fixed sample
+    /// count per compressed block, "used in buffer estimation"; `0`
+    /// means a variable per-block count. `Some` only for EXTENSIBLE
+    /// SubFormats with block-compressed union semantics (everything
+    /// outside the PCM / IEEE-float / A-law / μ-law / IEC 61937
+    /// precision family — see the module docs); the precision family
+    /// reads the same WORD as [`Self::valid_bits_per_sample`].
+    pub fn samples_per_block(&self) -> Option<u16> {
+        match &self.subformat {
+            Some(g) if !union_is_precision(g) => self.valid_bits_per_sample,
+            _ => None,
+        }
     }
 
     /// `WAVEFORMATEXTENSIBLE.dwChannelMask` — `SPEAKER_*` bitmap
@@ -6772,6 +6839,91 @@ mod tests {
         assert!(
             matches!(err, Some(Error::InvalidData(_))),
             "valid_bits > container must yield Error::InvalidData, got {err:?}"
+        );
+    }
+
+    /// `union_is_precision` — the linear/companded templates and the
+    /// IEC 61937 family read the union as `wValidBitsPerSample`;
+    /// block-compressed templates and vendor GUIDs read it as
+    /// `wSamplesPerBlock`.
+    #[test]
+    fn samples_union_member_selection() {
+        assert!(union_is_precision(&GUID_PCM));
+        assert!(union_is_precision(&GUID_IEEE_FLOAT));
+        assert!(union_is_precision(&GUID_ALAW));
+        assert!(union_is_precision(&GUID_MULAW));
+        assert!(union_is_precision(&iec61937_guid(0x000A)));
+        let mut adpcm = GUID_PCM;
+        adpcm[0] = 0x02;
+        assert!(!union_is_precision(&adpcm));
+        let mut mp3 = GUID_PCM;
+        mp3[0] = 0x55;
+        assert!(!union_is_precision(&mp3));
+        let vendor: [u8; 16] = [0xAB; 16];
+        assert!(!union_is_precision(&vendor));
+    }
+
+    /// A block-compressed EXTENSIBLE stream (template ADPCM SubFormat,
+    /// 4-bit nibble-packed container, union WORD = samples per block)
+    /// must NOT trip the precision-family validation, and the union
+    /// WORD surfaces as `wav:fmt.samples_per_block` / the
+    /// `samples_per_block()` accessor — never as valid bits.
+    #[test]
+    fn extensible_block_compressed_union_is_samples_per_block() {
+        let mut adpcm_guid = GUID_PCM;
+        adpcm_guid[0] = 0x02;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"RIFF");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(b"WAVE");
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&40u32.to_le_bytes());
+        buf.extend_from_slice(&FMT_EXTENSIBLE.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes()); // channels
+        buf.extend_from_slice(&22_050u32.to_le_bytes()); // sample_rate
+        buf.extend_from_slice(&11_155u32.to_le_bytes()); // byte_rate
+        buf.extend_from_slice(&256u16.to_le_bytes()); // block_align
+        buf.extend_from_slice(&4u16.to_le_bytes()); // wBitsPerSample = 4 (nibbles)
+        buf.extend_from_slice(&22u16.to_le_bytes()); // cbSize
+        buf.extend_from_slice(&505u16.to_le_bytes()); // wSamplesPerBlock
+        buf.extend_from_slice(&0x00004u32.to_le_bytes()); // dwChannelMask (FC)
+        buf.extend_from_slice(&adpcm_guid);
+        buf.extend_from_slice(b"data");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+
+        use std::io::Cursor;
+        let dmx = open_wav_demuxer(Box::new(Cursor::new(buf)))
+            .expect("block-compressed EXTENSIBLE must not trip precision validation");
+        assert_eq!(dmx.samples_per_block(), Some(505));
+        assert_eq!(
+            dmx.valid_bits_per_sample(),
+            None,
+            "the union has one active member — precision must not be claimed"
+        );
+        let md: std::collections::HashMap<_, _> = dmx.metadata().iter().cloned().collect();
+        assert_eq!(
+            md.get("wav:fmt.samples_per_block").map(String::as_str),
+            Some("505")
+        );
+        assert_eq!(md.get("wav:fmt.valid_bits_per_sample"), None);
+        assert_eq!(
+            md.get("wav:fmt.subformat_name").map(String::as_str),
+            Some("KSDATAFORMAT_SUBTYPE_ADPCM")
+        );
+    }
+
+    /// The IEC 61937 family keeps PRECISION union semantics (the
+    /// staged worked examples all set 16-in-16), so the
+    /// exceeds-container reject still applies to it.
+    #[test]
+    fn extensible_iec61937_keeps_precision_validation() {
+        let buf = extensible_wav_with_guid_bits(&iec61937_guid(0x000A), 16, 24);
+        use std::io::Cursor;
+        let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(buf));
+        let err = open_demuxer(rs, &oxideav_core::NullCodecResolver).err();
+        assert!(
+            matches!(err, Some(Error::InvalidData(_))),
+            "IEC 61937 precision claim above the container must reject, got {err:?}"
         );
     }
 

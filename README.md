@@ -48,10 +48,16 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework �
   `wav:fmt.*` metadata keys and typed accessors on the concrete
   `WavDemuxer`. The wire codec dispatches on the `wBitsPerSample`
   **container size** (the `data` chunk carries container-sized,
-  left-justified samples); `wValidBitsPerSample` is precision-of-signal
-  metadata, validated per the staged struct doc (a claim exceeding the
-  container, or a container that isn't a non-zero multiple of 8,
-  rejects; a zero union WORD is tolerated). The `dwChannelMask` bitmap
+  left-justified samples); the `Samples` union WORD surfaces under the
+  member the SubFormat gives it — `wValidBitsPerSample`
+  (precision-of-signal, PCM / IEEE-float / A-law / μ-law / IEC 61937)
+  or `wSamplesPerBlock` (`wav:fmt.samples_per_block` +
+  `WavDemuxer::samples_per_block`, block-compressed subformats). The
+  precision reading is validated per the staged struct doc (a claim
+  exceeding the container, or a container that isn't a non-zero
+  multiple of 8, rejects; a zero union WORD is tolerated); the block
+  reading accepts any values (4-bit nibble containers are normal
+  there). The `dwChannelMask` bitmap
   is decoded two ways: a human-readable `SPEAKER_*` list
   (`wav:fmt.channel_layout` + `WavDemuxer::channel_layout`), `+`-joined
   least-significant-bit-first per the 18 documented flag bits
