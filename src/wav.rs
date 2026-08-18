@@ -5327,7 +5327,16 @@ fn open_muxer(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Box<
 /// IEEE_FLOAT / ALAW / MULAW).
 #[derive(Clone, Debug, Default)]
 pub struct WavMuxOptions {
-    extensible: Option<ExtensibleOpts>,
+    /// Explicit `dwChannelMask`: forces the EXTENSIBLE form (see
+    /// [`Self::with_extensible`]).
+    explicit_mask: Option<u32>,
+    /// `wValidBitsPerSample` override, applied whenever the EXTENSIBLE
+    /// form is written (explicit or automatic); ignored for classic
+    /// `WAVEFORMAT` output.
+    valid_bits: Option<u16>,
+    /// SubFormat GUID override, applied whenever the EXTENSIBLE form
+    /// is written; ignored for classic output.
+    subformat_override: Option<[u8; 16]>,
     /// Suppress the automatic `WAVE_FORMAT_EXTENSIBLE` promotion (see
     /// [`Self::with_legacy_waveformatex`]). Has no effect when
     /// [`Self::with_extensible`] explicitly opted in.
@@ -5381,42 +5390,35 @@ pub enum Rf64Mode {
     Force,
 }
 
-#[derive(Clone, Debug)]
-struct ExtensibleOpts {
-    channel_mask: u32,
-    valid_bits_per_sample: Option<u16>,
-    subformat: Option<[u8; 16]>,
-}
-
 impl WavMuxOptions {
     /// Opt into `WAVE_FORMAT_EXTENSIBLE` muxing with the supplied
-    /// `dwChannelMask`. The muxer derives `wValidBitsPerSample` and
-    /// SubFormat from the codec-id automatically; use the
-    /// finer-grained setters to override.
+    /// explicit `dwChannelMask` (also used when the automatic
+    /// promotion would not have fired). The muxer derives
+    /// `wValidBitsPerSample` and SubFormat from the codec-id
+    /// automatically; use the finer-grained setters to override.
     pub fn with_extensible(mut self, channel_mask: u32) -> Self {
-        self.extensible = Some(ExtensibleOpts {
-            channel_mask,
-            valid_bits_per_sample: None,
-            subformat: None,
-        });
+        self.explicit_mask = Some(channel_mask);
         self
     }
 
-    /// Override `wValidBitsPerSample` for an extensible stream. Has no
-    /// effect unless [`Self::with_extensible`] was also called.
+    /// Override `wValidBitsPerSample` — e.g. `20` for a 20-in-24-bit
+    /// stream per the staged struct doc's worked example. Applies
+    /// whenever the EXTENSIBLE form is written (explicit
+    /// [`Self::with_extensible`] or the automatic promotion); ignored
+    /// for classic `WAVEFORMAT` output, which cannot carry the field.
+    /// For a precision-semantics SubFormat a value exceeding the
+    /// container `wBitsPerSample` makes `write_header` fail — the
+    /// demuxer would reject the file, so the muxer refuses to write it.
     pub fn with_valid_bits_per_sample(mut self, valid_bps: u16) -> Self {
-        if let Some(opts) = self.extensible.as_mut() {
-            opts.valid_bits_per_sample = Some(valid_bps);
-        }
+        self.valid_bits = Some(valid_bps);
         self
     }
 
-    /// Override the 16-byte SubFormat GUID. Has no effect unless
-    /// [`Self::with_extensible`] was also called.
+    /// Override the 16-byte SubFormat GUID. Applies whenever the
+    /// EXTENSIBLE form is written (explicit or automatic); ignored for
+    /// classic `WAVEFORMAT` output.
     pub fn with_subformat(mut self, guid: [u8; 16]) -> Self {
-        if let Some(opts) = self.extensible.as_mut() {
-            opts.subformat = Some(guid);
-        }
+        self.subformat_override = Some(guid);
         self
     }
 
@@ -5609,7 +5611,9 @@ pub fn open_muxer_with(
         sample_rate,
         channel_layout: s.params.channel_layout,
         shape,
-        extensible: opts.extensible,
+        explicit_mask: opts.explicit_mask,
+        valid_bits: opts.valid_bits,
+        subformat_override: opts.subformat_override,
         legacy_fmt: opts.legacy_fmt,
         acid: opts.acid,
         chna: opts.chna,
@@ -5713,7 +5717,14 @@ struct WavMuxer {
     /// without an explicit mask.
     channel_layout: Option<ChannelLayout>,
     shape: WireShape,
-    extensible: Option<ExtensibleOpts>,
+    /// Explicit `dwChannelMask` — forces the EXTENSIBLE form.
+    explicit_mask: Option<u32>,
+    /// `wValidBitsPerSample` override, applied whenever the EXTENSIBLE
+    /// form is written.
+    valid_bits: Option<u16>,
+    /// SubFormat GUID override, applied whenever the EXTENSIBLE form
+    /// is written.
+    subformat_override: Option<[u8; 16]>,
     /// Suppress the automatic EXTENSIBLE promotion (explicit
     /// [`WavMuxOptions::with_extensible`] still wins).
     legacy_fmt: bool,
@@ -5813,17 +5824,13 @@ impl Muxer for WavMuxer {
         // `DiscreteN` layout yields mask `0` ("no assigned speaker
         // positions"), which is legal. Classic ≤ 2-channel / ≤ 16-bit
         // output is byte-identical to the historical muxer.
-        let extensible: Option<ExtensibleOpts> = match &self.extensible {
-            Some(opts) => Some(opts.clone()),
+        let extensible: Option<u32> = match self.explicit_mask {
+            Some(mask) => Some(mask),
             None if !self.legacy_fmt && (self.channels > 2 || bits_per_sample > 16) => {
                 let layout = self
                     .channel_layout
                     .unwrap_or_else(|| ChannelLayout::from_count(self.channels));
-                Some(ExtensibleOpts {
-                    channel_mask: channel_mask_for_layout(layout),
-                    valid_bits_per_sample: None,
-                    subformat: None,
-                })
+                Some(channel_mask_for_layout(layout))
             }
             None => None,
         };
@@ -5885,17 +5892,28 @@ impl Muxer for WavMuxer {
         self.output.write_all(&block_align.to_le_bytes())?;
         self.output.write_all(&bits_per_sample.to_le_bytes())?;
 
-        if let Some(opts) = &extensible {
+        if let Some(channel_mask) = extensible {
             // cbSize (22) + 22-byte extension. Layout per
             // docs/container/riff/waveformatextensible/README.md
             // §"Structure layout".
-            self.output.write_all(&22u16.to_le_bytes())?;
-            let valid = opts.valid_bits_per_sample.unwrap_or(bits_per_sample);
-            self.output.write_all(&valid.to_le_bytes())?;
-            self.output.write_all(&opts.channel_mask.to_le_bytes())?;
-            let guid = opts
-                .subformat
+            let valid = self.valid_bits.unwrap_or(bits_per_sample);
+            let guid = self
+                .subformat_override
                 .unwrap_or_else(|| self.shape.well_known_guid());
+            // Mux/demux symmetry guard: for a precision-semantics
+            // SubFormat a `wValidBitsPerSample` above the container is
+            // exactly what the demuxer rejects as malformed, so refuse
+            // to write it (the staged struct doc: "any value not
+            // exceeding the container size").
+            if union_is_precision(&guid) && valid > bits_per_sample {
+                return Err(Error::invalid(format!(
+                    "WAV muxer: wValidBitsPerSample override ({valid}) exceeds the \
+                     wBitsPerSample container size ({bits_per_sample})"
+                )));
+            }
+            self.output.write_all(&22u16.to_le_bytes())?;
+            self.output.write_all(&valid.to_le_bytes())?;
+            self.output.write_all(&channel_mask.to_le_bytes())?;
             self.output.write_all(&guid)?;
         }
 
@@ -7359,6 +7377,56 @@ mod tests {
             .with_extensible(0x3);
         let buf = mux_to_bytes(&stream, &payload, opts, "legacy-vs-explicit");
         assert_eq!(fmt_body(&buf).len(), 40, "explicit with_extensible wins");
+    }
+
+    /// `with_valid_bits_per_sample` / `with_subformat` now apply to the
+    /// automatic promotion too — a 20-in-24 stream needs no explicit
+    /// mask, and a vendor SubFormat override lands in the auto-written
+    /// extension.
+    #[test]
+    fn union_overrides_apply_to_auto_promotion() {
+        let payload = vec![0u8; 6 * 10];
+        let stream = make_stream(SampleFormat::S24, 2, 48_000);
+        let opts = WavMuxOptions::default().with_valid_bits_per_sample(20);
+        let buf = mux_to_bytes(&stream, &payload, opts, "auto-valid-20");
+        let body = fmt_body(&buf);
+        assert_eq!(body.len(), 40);
+        assert_eq!(u16::from_le_bytes([body[18], body[19]]), 20);
+        let dmx = open_demux_from_bytes(buf);
+        let md: std::collections::HashMap<_, _> = dmx.metadata().iter().cloned().collect();
+        assert_eq!(
+            md.get("wav:fmt.valid_bits_per_sample").map(String::as_str),
+            Some("20")
+        );
+        assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "pcm_s24le");
+
+        let payload = vec![0u8; 12 * 4];
+        let stream = make_stream(SampleFormat::S16, 6, 48_000);
+        let vendor: [u8; 16] = [0xAB; 16];
+        let opts = WavMuxOptions::default().with_subformat(vendor);
+        let buf = mux_to_bytes(&stream, &payload, opts, "auto-subformat");
+        let body = fmt_body(&buf);
+        assert_eq!(&body[24..40], &vendor);
+    }
+
+    /// A precision claim above the container is refused at
+    /// `write_header` — the demuxer would reject the file, so the
+    /// muxer never writes it (mux/demux symmetry).
+    #[test]
+    fn mux_rejects_precision_claim_above_container() {
+        let stream = make_stream(SampleFormat::S24, 2, 48_000);
+        let tmp = std::env::temp_dir().join("oxideav-basic-wav-r77-valid-overflow.wav");
+        let _ = std::fs::remove_file(&tmp);
+        let f = std::fs::File::create(&tmp).unwrap();
+        let ws: Box<dyn WriteSeek> = Box::new(f);
+        let opts = WavMuxOptions::default().with_valid_bits_per_sample(32);
+        let mut mux = open_muxer_with(ws, std::slice::from_ref(&stream), opts).unwrap();
+        let err = mux.write_header().err();
+        assert!(
+            matches!(err, Some(Error::InvalidData(_))),
+            "valid-bits override above the container must fail write_header, got {err:?}"
+        );
+        let _ = std::fs::remove_file(&tmp);
     }
 
     /// An explicit `with_extensible` mask overrides the layout-derived
