@@ -37,8 +37,8 @@
 //! `docs/container/riff/waveformatextensible/ms-waveformatextensible.html`.
 
 use oxideav_core::{
-    CodecId, CodecParameters, CodecResolver, Error, MediaType, Packet, Result, SampleFormat,
-    StreamInfo, TimeBase,
+    ChannelLayout, ChannelPosition, CodecId, CodecParameters, CodecResolver, Error, MediaType,
+    Packet, Result, SampleFormat, StreamInfo, TimeBase,
 };
 use oxideav_core::{ContainerRegistry, Demuxer, Muxer, ReadSeek, WriteSeek};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -423,6 +423,112 @@ fn channel_mask_layout(mask: u32) -> Option<String> {
         parts.push(format!("UNKNOWN(0x{unknown:X})"));
     }
     Some(parts.join("+"))
+}
+
+/// `dwChannelMask` flag bit for a core [`ChannelPosition`], per the
+/// `SPEAKER_*` bit table in
+/// `docs/container/riff/waveformatextensible/ms-waveformatextensible.html`
+/// (bit 0 `SPEAKER_FRONT_LEFT 0x1` … bit 17 `SPEAKER_TOP_BACK_RIGHT
+/// 0x20000`). Returns `None` for positions the mask vocabulary cannot
+/// express (none today — the core position set is a subset of the 18
+/// documented flags — but `ChannelPosition` is `#[non_exhaustive]`, so
+/// future additions degrade gracefully to "no flag bit").
+fn speaker_bit(pos: ChannelPosition) -> Option<u32> {
+    use ChannelPosition::*;
+    Some(match pos {
+        FrontLeft => 0x1,
+        FrontRight => 0x2,
+        FrontCenter => 0x4,
+        LowFrequency => 0x8,
+        BackLeft => 0x10,
+        BackRight => 0x20,
+        FrontLeftOfCenter => 0x40,
+        FrontRightOfCenter => 0x80,
+        BackCenter => 0x100,
+        SideLeft => 0x200,
+        SideRight => 0x400,
+        TopFrontLeft => 0x1000,
+        TopFrontRight => 0x4000,
+        TopBackLeft => 0x8000,
+        TopBackRight => 0x20000,
+        _ => return None,
+    })
+}
+
+/// Derive the `WAVEFORMATEXTENSIBLE.dwChannelMask` for a core
+/// [`ChannelLayout`] by OR-ing each speaker position's `SPEAKER_*` flag
+/// bit (per the staged bit table — see [`speaker_bit`]).
+///
+/// [`ChannelLayout::DiscreteN`] returns `0`: the mask semantics for "no
+/// assigned speaker positions" (channels are direct-out / discrete),
+/// which is exactly what an unknown layout is. Note the derived mask
+/// follows the CORE canonical position set — e.g. `Surround51` (whose
+/// surrounds are the side pair) yields `0x60F`, the staged table's
+/// "5.1 (DVD-style side)" row, and `Quad` (side surrounds) yields
+/// `0x603` rather than the back-pair `0x33` row.
+pub fn channel_mask_for_layout(layout: ChannelLayout) -> u32 {
+    layout
+        .positions()
+        .iter()
+        .filter_map(|&p| speaker_bit(p))
+        .fold(0, |acc, b| acc | b)
+}
+
+/// Map a `dwChannelMask` to a core [`ChannelLayout`] by position-SET
+/// equality (the mask is a set — the on-wire interleave order is always
+/// ascending bit order regardless of the layout's canonical naming
+/// order).
+///
+/// Returns `None` when the mask is `0` (no assigned positions) or when
+/// the number of set bits differs from `channels` — the staged struct
+/// doc says the two "should be the same", so a mismatch means the mask
+/// cannot be trusted to describe the interleaved stream (the caller
+/// surfaces the mismatch as metadata instead).
+///
+/// Two aliases from the staged standard-layouts table
+/// (`docs/container/riff/waveformatextensible/README.md`) map masks
+/// whose surround pair is the BACK pair onto the closest core layout:
+/// `0x33` ("Quad", FL FR BL BR) → [`ChannelLayout::Quad`] and `0x3F`
+/// ("5.1 (Microsoft)", FL FR FC LFE BL BR) → [`ChannelLayout::Surround51`].
+/// Recognised-but-unnamed masks fall back to
+/// [`ChannelLayout::DiscreteN`] so a downstream consumer never invents
+/// a named layout that contradicts the explicit mask.
+fn core_layout_for_mask(mask: u32, channels: u16) -> Option<ChannelLayout> {
+    if mask == 0 || mask.count_ones() != channels as u32 {
+        return None;
+    }
+    // Staged-table aliases first (back-pair variants of Quad / 5.1).
+    match mask {
+        0x33 => return Some(ChannelLayout::Quad),
+        0x3F => return Some(ChannelLayout::Surround51),
+        _ => {}
+    }
+    // Generic position-set match against every named core layout whose
+    // positions are known. `Stereo` precedes `LoRo`/`LtRt` (identical
+    // position sets — plain stereo is the honest default for a WAV
+    // mask; the downmix variants are codec-level semantics a container
+    // bitmap cannot express).
+    const NAMED: [ChannelLayout; 13] = [
+        ChannelLayout::Mono,
+        ChannelLayout::Stereo,
+        ChannelLayout::Stereo21,
+        ChannelLayout::Surround30,
+        ChannelLayout::Quad,
+        ChannelLayout::Surround40,
+        ChannelLayout::Surround41,
+        ChannelLayout::Surround50,
+        ChannelLayout::Surround51,
+        ChannelLayout::Surround60,
+        ChannelLayout::Surround61,
+        ChannelLayout::Surround70,
+        ChannelLayout::Surround71,
+    ];
+    for cand in NAMED {
+        if channel_mask_for_layout(cand) == mask {
+            return Some(cand);
+        }
+    }
+    Some(ChannelLayout::DiscreteN(channels))
 }
 
 // --- Demuxer ---------------------------------------------------------------
@@ -863,6 +969,15 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
     params.channels = Some(fmt.channels);
     params.sample_rate = Some(fmt.sample_rate);
     params.sample_format = sample_fmt;
+    // Surface the EXTENSIBLE dwChannelMask through the core typed
+    // layout (position-set match; `None` for mask 0 / bit-count
+    // mismatch, DiscreteN for assigned-but-unnamed position sets — see
+    // `core_layout_for_mask`). Consumers keep getting the
+    // `ChannelLayout::from_count` inference via `resolved_layout()`
+    // when this stays `None`.
+    params.channel_layout = fmt
+        .channel_mask
+        .and_then(|m| core_layout_for_mask(m, fmt.channels));
     // bit_rate uses the on-wire bytes_per_second (== block_align *
     // sample_rate) — for A-law/μ-law that's 8 * channels * rate, NOT
     // the post-decode S16 rate.
@@ -883,6 +998,18 @@ pub fn open_wav_demuxer(mut input: Box<dyn ReadSeek>) -> Result<WavDemuxer> {
             metadata.push(("wav:fmt.channel_mask".to_string(), format!("0x{mask:08X}")));
             if let Some(layout) = channel_mask_layout(mask) {
                 metadata.push(("wav:fmt.channel_layout".to_string(), layout));
+            }
+            // The staged struct doc says the number of set bits "should
+            // be the same as the number of channels specified in
+            // WAVEFORMATEX.nChannels" — a "should", so a mismatch is
+            // flagged rather than rejected (mask 0 = "no assigned
+            // positions" is always legal and not a mismatch).
+            let bits = mask.count_ones();
+            if mask != 0 && bits != fmt.channels as u32 {
+                metadata.push((
+                    "wav:fmt.channel_mask_mismatch".to_string(),
+                    format!("mask_bits={bits} channels={}", fmt.channels),
+                ));
             }
         }
         if let Some(sub) = &fmt.subformat {
@@ -6013,6 +6140,9 @@ mod tests {
         let s = &dmx.streams()[0];
         assert_eq!(s.params.codec_id, CodecId::new("pcm_s16le"));
         assert_eq!(wave_format_tag(&s.params), Some(FMT_EXTENSIBLE));
+        // The 0x3F "5.1 (Microsoft)" mask surfaces through the core
+        // typed channel layout as well.
+        assert_eq!(s.params.channel_layout, Some(ChannelLayout::Surround51));
 
         // Metadata round-trip.
         let md: std::collections::HashMap<String, String> =
@@ -6126,6 +6256,137 @@ mod tests {
             channel_mask_layout(0x80000000),
             Some("UNKNOWN(0x80000000)".to_string())
         );
+    }
+
+    /// `channel_mask_for_layout` derives the `SPEAKER_*` bit union from
+    /// the core layout's canonical positions (staged bit table). Core
+    /// layouts whose surrounds are the side pair land on the side-pair
+    /// mask rows (`Surround51` → `0x60F`, the staged "5.1 (DVD-style
+    /// side)" row).
+    #[test]
+    fn channel_mask_for_layout_values() {
+        assert_eq!(channel_mask_for_layout(ChannelLayout::Mono), 0x4);
+        assert_eq!(channel_mask_for_layout(ChannelLayout::Stereo), 0x3);
+        assert_eq!(channel_mask_for_layout(ChannelLayout::Stereo21), 0xB);
+        assert_eq!(channel_mask_for_layout(ChannelLayout::Surround30), 0x7);
+        assert_eq!(channel_mask_for_layout(ChannelLayout::Quad), 0x603);
+        assert_eq!(channel_mask_for_layout(ChannelLayout::Surround51), 0x60F);
+        assert_eq!(channel_mask_for_layout(ChannelLayout::Surround71), 0x63F);
+        // Unknown layout ⇒ mask 0 ("no assigned speaker positions").
+        assert_eq!(channel_mask_for_layout(ChannelLayout::DiscreteN(11)), 0);
+    }
+
+    /// `core_layout_for_mask` position-SET matching: the staged
+    /// standard-layout masks resolve to the corresponding core layouts,
+    /// including the two back-pair alias rows (`0x33` Quad and `0x3F`
+    /// "5.1 (Microsoft)").
+    #[test]
+    fn core_layout_for_mask_named_layouts() {
+        use ChannelLayout::*;
+        let table: &[(u32, u16, ChannelLayout)] = &[
+            (0x4, 1, Mono),
+            (0x3, 2, Stereo),
+            (0xB, 3, Stereo21),
+            (0x7, 3, Surround30),
+            (0x33, 4, Quad),  // staged-table alias (back pair)
+            (0x603, 4, Quad), // core canonical (side pair)
+            (0x107, 4, Surround40),
+            (0x10F, 5, Surround41),
+            (0x607, 5, Surround50),
+            (0x3F, 6, Surround51),  // staged "5.1 (Microsoft)" alias
+            (0x60F, 6, Surround51), // staged "5.1 (DVD-style side)"
+            (0x707, 6, Surround60),
+            (0x70F, 7, Surround61),
+            (0x637, 7, Surround70),
+            (0x63F, 8, Surround71), // staged "7.1"
+        ];
+        for &(mask, ch, want) in table {
+            assert_eq!(
+                core_layout_for_mask(mask, ch),
+                Some(want),
+                "mask 0x{mask:X} with {ch} channels"
+            );
+        }
+    }
+
+    /// Masks that assign positions but match no named core layout fall
+    /// back to `DiscreteN` (never inventing a contradicting named
+    /// layout); mask 0 and a set-bit/channel-count mismatch yield
+    /// `None`.
+    #[test]
+    fn core_layout_for_mask_fallbacks() {
+        // FRONT_LEFT + TOP_CENTER — assigned but unnamed.
+        assert_eq!(
+            core_layout_for_mask(0x801, 2),
+            Some(ChannelLayout::DiscreteN(2))
+        );
+        // Mask 0: "no assigned speaker positions".
+        assert_eq!(core_layout_for_mask(0, 2), None);
+        // Bit-count / nChannels mismatch: the mask cannot be trusted.
+        assert_eq!(core_layout_for_mask(0x3, 6), None);
+        assert_eq!(core_layout_for_mask(0x3F, 2), None);
+    }
+
+    /// Every named core layout survives the layout → mask → layout
+    /// round trip (`LoRo`/`LtRt` collapse to `Stereo` — a container
+    /// bitmap cannot express downmix semantics).
+    #[test]
+    fn core_layout_mask_round_trip() {
+        use ChannelLayout::*;
+        for l in [
+            Mono, Stereo, Stereo21, Surround30, Quad, Surround40, Surround41, Surround50,
+            Surround51, Surround60, Surround61, Surround70, Surround71,
+        ] {
+            let mask = channel_mask_for_layout(l);
+            assert_eq!(
+                core_layout_for_mask(mask, l.channel_count()),
+                Some(l),
+                "layout {l:?} (mask 0x{mask:X}) must round-trip"
+            );
+        }
+        for l in [LoRo, LtRt] {
+            assert_eq!(
+                core_layout_for_mask(channel_mask_for_layout(l), 2),
+                Some(Stereo)
+            );
+        }
+    }
+
+    /// A mask whose set-bit count disagrees with `nChannels` surfaces
+    /// the `wav:fmt.channel_mask_mismatch` observability key (the
+    /// staged doc's "should be the same" is a flag, not a reject) and
+    /// leaves the typed `CodecParameters::channel_layout` unset.
+    #[test]
+    fn extensible_mask_channel_count_mismatch_flagged() {
+        // Hand-build: 1 channel but a stereo mask (0x3).
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"RIFF");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(b"WAVE");
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&40u32.to_le_bytes());
+        buf.extend_from_slice(&FMT_EXTENSIBLE.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes()); // channels = 1
+        buf.extend_from_slice(&44_100u32.to_le_bytes());
+        buf.extend_from_slice(&88_200u32.to_le_bytes());
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(&16u16.to_le_bytes());
+        buf.extend_from_slice(&22u16.to_le_bytes());
+        buf.extend_from_slice(&16u16.to_le_bytes());
+        buf.extend_from_slice(&0x3u32.to_le_bytes()); // mask says 2ch
+        buf.extend_from_slice(&GUID_PCM);
+        buf.extend_from_slice(b"data");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+
+        use std::io::Cursor;
+        let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(buf));
+        let dmx = open_demuxer(rs, &oxideav_core::NullCodecResolver).unwrap();
+        let md: std::collections::HashMap<_, _> = dmx.metadata().iter().cloned().collect();
+        assert_eq!(
+            md.get("wav:fmt.channel_mask_mismatch").map(String::as_str),
+            Some("mask_bits=2 channels=1")
+        );
+        assert_eq!(dmx.streams()[0].params.channel_layout, None);
     }
 
     /// EXTENSIBLE muxing of A-law: muxer writes `wFormatTag = 0xFFFE`
