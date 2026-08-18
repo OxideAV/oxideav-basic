@@ -4439,7 +4439,12 @@ struct WaveFmt {
     bits_per_sample: u16,
     /// `wValidBitsPerSample` from the 22-byte EXTENSIBLE extension.
     /// `None` for plain `WAVEFORMATEX`; `Some(0)` is a writer that left
-    /// the union zero — the demuxer falls back to `bits_per_sample`.
+    /// the union zero (tolerated — precision is then the container
+    /// size). Guaranteed `<= bits_per_sample` when non-zero: a claim of
+    /// more precision than the container carries is rejected at parse
+    /// time. The value describes signal precision only — the on-wire
+    /// sample layout (and therefore the codec id) always follows the
+    /// `bits_per_sample` container size.
     valid_bits_per_sample: Option<u16>,
     /// `dwChannelMask` — SPEAKER_* bitmap. `None` outside EXTENSIBLE.
     channel_mask: Option<u32>,
@@ -4480,7 +4485,28 @@ fn parse_fmt(buf: &[u8]) -> Result<WaveFmt> {
                 "WAVE_FORMAT_EXTENSIBLE cbSize must be >= 22, got {cb_size}"
             )));
         }
-        valid_bits_per_sample = Some(u16::from_le_bytes([buf[18], buf[19]]));
+        let valid = u16::from_le_bytes([buf[18], buf[19]]);
+        // Container-size invariants per
+        // docs/container/riff/waveformatextensible/ms-waveformatextensible.html
+        // §Samples.wValidBitsPerSample: "wBitsPerSample is the container
+        // size and must be a multiple of 8, whereas wValidBitsPerSample
+        // can be any value not exceeding the container size." A zero
+        // union WORD is tolerated (some writers leave the union unset);
+        // a precision that CLAIMS more bits than the container carries,
+        // or a container that is not byte-aligned, is malformed.
+        if bits_per_sample == 0 || bits_per_sample % 8 != 0 {
+            return Err(Error::invalid(format!(
+                "WAVE_FORMAT_EXTENSIBLE wBitsPerSample (container size) must be \
+                 a non-zero multiple of 8, got {bits_per_sample}"
+            )));
+        }
+        if valid > bits_per_sample {
+            return Err(Error::invalid(format!(
+                "WAVE_FORMAT_EXTENSIBLE wValidBitsPerSample ({valid}) exceeds \
+                 the wBitsPerSample container size ({bits_per_sample})"
+            )));
+        }
+        valid_bits_per_sample = Some(valid);
         channel_mask = Some(u32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]]));
         let mut g = [0u8; 16];
         g.copy_from_slice(&buf[24..40]);
@@ -4499,11 +4525,12 @@ fn parse_fmt(buf: &[u8]) -> Result<WaveFmt> {
     })
 }
 
-/// Resolve a legacy `wFormatTag` + decode precision to a concrete PCM /
+/// Resolve a legacy `wFormatTag` + container size to a concrete PCM /
 /// G.711 codec id, or `None` if the tag is not one of the formats this
-/// crate maps directly. `bits` is the active precision (the container
-/// `wBitsPerSample` on the legacy path, or the EXTENSIBLE union's
-/// `wValidBitsPerSample` when that is non-zero).
+/// crate maps directly. `bits` is the `wBitsPerSample` container size
+/// on BOTH the legacy and the EXTENSIBLE path — the container size is
+/// what defines the on-wire sample layout (the EXTENSIBLE union's
+/// `wValidBitsPerSample` is precision-of-signal metadata only).
 ///
 /// Shared by the legacy `WAVEFORMATEX` path and the EXTENSIBLE path: per
 /// `docs/container/riff/waveformatextensible/ms-converting-format-tags-and-subformat-guids.md`,
@@ -4533,16 +4560,19 @@ fn resolve_codec(fmt: &WaveFmt) -> Result<CodecId> {
     let sub = fmt
         .subformat
         .ok_or_else(|| Error::invalid("extensible WAV missing subformat"))?;
-    // Per docs/container/riff/waveformatextensible/README.md
-    // §"On using these specs": the actual codec precision is the
-    // SubFormat union's wValidBitsPerSample, NOT the WAVEFORMATEX
-    // wBitsPerSample (the container size). Fall back to the
-    // container size only when the union is zero — some writers
-    // leave it unset.
-    let depth = fmt
-        .valid_bits_per_sample
-        .filter(|&v| v > 0)
-        .unwrap_or(fmt.bits_per_sample);
+    // The on-wire sample layout is the CONTAINER size, not the union's
+    // wValidBitsPerSample. Per
+    // docs/container/riff/waveformatextensible/ms-extensible-wave-format.html
+    // §"Unlike WAVEFORMATEX": "a 20-bit sample can be stored
+    // left-justified within a three-byte container" — the bytes in the
+    // `data` chunk are container-sized samples, and wValidBitsPerSample
+    // only states how many of those bits carry signal. So a
+    // 24-valid-bits-in-32-bit-container stream decodes as `pcm_s32le`
+    // (the low 8 bits are zero), NOT `pcm_s24le` — the container size
+    // is what `nBlockAlign` and the interleaved byte layout follow.
+    // The precision is surfaced separately via
+    // `wav:fmt.valid_bits_per_sample` / `WavDemuxer::valid_bits_per_sample`.
+    let depth = fmt.bits_per_sample;
     // Any SubFormat GUID built from the `KSMedia.h`
     // `DEFINE_WAVEFORMATEX_GUID(x)` template carries the legacy
     // `wFormatTag` `x` in its leading 16 bits and is, per
@@ -6181,7 +6211,16 @@ mod tests {
     /// `wValidBitsPerSample`, and an empty `data` chunk. Bypasses the
     /// muxer so the SubFormat GUID can be chosen directly.
     fn extensible_wav_with_guid(guid: &[u8; 16], bits: u16) -> Vec<u8> {
-        let block_align = bits / 8;
+        extensible_wav_with_guid_bits(guid, bits, bits)
+    }
+
+    /// Like [`extensible_wav_with_guid`] but with independent container
+    /// (`wBitsPerSample`) and precision (`wValidBitsPerSample`) values,
+    /// for exercising the reduced-precision-in-larger-container form
+    /// (e.g. 20-in-24, 24-in-32) and the malformed
+    /// precision-exceeds-container reject.
+    fn extensible_wav_with_guid_bits(guid: &[u8; 16], container: u16, valid: u16) -> Vec<u8> {
+        let block_align = container / 8;
         let mut buf = Vec::new();
         buf.extend_from_slice(b"RIFF");
         buf.extend_from_slice(&0u32.to_le_bytes());
@@ -6193,14 +6232,113 @@ mod tests {
         buf.extend_from_slice(&44_100u32.to_le_bytes()); // sample_rate
         buf.extend_from_slice(&(44_100 * block_align as u32).to_le_bytes()); // byte_rate
         buf.extend_from_slice(&block_align.to_le_bytes()); // block_align
-        buf.extend_from_slice(&bits.to_le_bytes()); // bits_per_sample
+        buf.extend_from_slice(&container.to_le_bytes()); // bits_per_sample
         buf.extend_from_slice(&22u16.to_le_bytes()); // cbSize
-        buf.extend_from_slice(&bits.to_le_bytes()); // wValidBitsPerSample
+        buf.extend_from_slice(&valid.to_le_bytes()); // wValidBitsPerSample
         buf.extend_from_slice(&0x00004u32.to_le_bytes()); // dwChannelMask (FC)
         buf.extend_from_slice(guid); // SubFormat
         buf.extend_from_slice(b"data");
         buf.extend_from_slice(&0u32.to_le_bytes());
         buf
+    }
+
+    /// 24 valid bits in a 32-bit container must route by the CONTAINER
+    /// size: the `data` chunk carries 4-byte samples (low byte zero),
+    /// so the wire codec is `pcm_s32le` — `pcm_s24le` would misread the
+    /// interleave. Precision still surfaces through
+    /// `wav:fmt.valid_bits_per_sample`. Per
+    /// docs/container/riff/waveformatextensible/ms-waveformatextensible.html
+    /// §Samples.wValidBitsPerSample ("wBitsPerSample is the container
+    /// size") and ms-extensible-wave-format.html ("a 20-bit sample can
+    /// be stored left-justified within a three-byte container").
+    #[test]
+    fn extensible_reduced_precision_routes_by_container_size() {
+        // 24-in-32: PCM subformat, container 32 → pcm_s32le.
+        let buf = extensible_wav_with_guid_bits(&GUID_PCM, 32, 24);
+        use std::io::Cursor;
+        let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(buf));
+        let dmx = open_demuxer(rs, &oxideav_core::NullCodecResolver).unwrap();
+        let s = &dmx.streams()[0];
+        assert_eq!(s.params.codec_id.as_str(), "pcm_s32le");
+        let md: std::collections::HashMap<_, _> = dmx.metadata().iter().cloned().collect();
+        assert_eq!(
+            md.get("wav:fmt.valid_bits_per_sample").map(String::as_str),
+            Some("24")
+        );
+
+        // 20-in-24 (the documented worked example): container 24 →
+        // pcm_s24le with 20 valid bits.
+        let buf = extensible_wav_with_guid_bits(&GUID_PCM, 24, 20);
+        let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(buf));
+        let dmx = open_demuxer(rs, &oxideav_core::NullCodecResolver).unwrap();
+        let s = &dmx.streams()[0];
+        assert_eq!(s.params.codec_id.as_str(), "pcm_s24le");
+        let md: std::collections::HashMap<_, _> = dmx.metadata().iter().cloned().collect();
+        assert_eq!(
+            md.get("wav:fmt.valid_bits_per_sample").map(String::as_str),
+            Some("20")
+        );
+    }
+
+    /// A zero union WORD (writer left `wValidBitsPerSample` unset) is
+    /// tolerated — the container size carries the precision.
+    #[test]
+    fn extensible_zero_valid_bits_tolerated() {
+        let buf = extensible_wav_with_guid_bits(&GUID_PCM, 16, 0);
+        use std::io::Cursor;
+        let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(buf));
+        let dmx = open_demuxer(rs, &oxideav_core::NullCodecResolver).unwrap();
+        assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "pcm_s16le");
+    }
+
+    /// `wValidBitsPerSample` may be "any value not exceeding the
+    /// container size" — a precision that CLAIMS more bits than the
+    /// container carries is malformed and must reject.
+    #[test]
+    fn extensible_valid_bits_exceeding_container_rejected() {
+        let buf = extensible_wav_with_guid_bits(&GUID_PCM, 16, 24);
+        use std::io::Cursor;
+        let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(buf));
+        let err = open_demuxer(rs, &oxideav_core::NullCodecResolver).err();
+        assert!(
+            matches!(err, Some(Error::InvalidData(_))),
+            "valid_bits > container must yield Error::InvalidData, got {err:?}"
+        );
+    }
+
+    /// The EXTENSIBLE container size "must be a multiple of 8" — a
+    /// 20-bit `wBitsPerSample` belongs in a 24-bit container with
+    /// `wValidBitsPerSample = 20`, never on the wire directly.
+    #[test]
+    fn extensible_container_bits_not_byte_multiple_rejected() {
+        for bad in [20u16, 0u16] {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(b"RIFF");
+            buf.extend_from_slice(&0u32.to_le_bytes());
+            buf.extend_from_slice(b"WAVE");
+            buf.extend_from_slice(b"fmt ");
+            buf.extend_from_slice(&40u32.to_le_bytes());
+            buf.extend_from_slice(&FMT_EXTENSIBLE.to_le_bytes());
+            buf.extend_from_slice(&1u16.to_le_bytes());
+            buf.extend_from_slice(&44_100u32.to_le_bytes());
+            buf.extend_from_slice(&88_200u32.to_le_bytes());
+            buf.extend_from_slice(&2u16.to_le_bytes());
+            buf.extend_from_slice(&bad.to_le_bytes()); // non-byte-aligned container
+            buf.extend_from_slice(&22u16.to_le_bytes());
+            buf.extend_from_slice(&16u16.to_le_bytes());
+            buf.extend_from_slice(&0x00004u32.to_le_bytes());
+            buf.extend_from_slice(&GUID_PCM);
+            buf.extend_from_slice(b"data");
+            buf.extend_from_slice(&0u32.to_le_bytes());
+
+            use std::io::Cursor;
+            let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(buf));
+            let err = open_demuxer(rs, &oxideav_core::NullCodecResolver).err();
+            assert!(
+                matches!(err, Some(Error::InvalidData(_))),
+                "container bits {bad} must yield Error::InvalidData, got {err:?}"
+            );
+        }
     }
 
     /// `waveformatex_tag` extracts the embedded legacy `wFormatTag` from

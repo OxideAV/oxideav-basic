@@ -7,7 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- WAV `WAVE_FORMAT_EXTENSIBLE` codec routing now dispatches on the `wBitsPerSample` **container size**, not the union's `wValidBitsPerSample` — per `docs/container/riff/waveformatextensible/ms-waveformatextensible.html` §`Samples.wValidBitsPerSample` ("wBitsPerSample is the container size") and `ms-extensible-wave-format.html` ("a 20-bit sample can be stored left-justified within a three-byte container"), the `data` chunk carries container-sized samples and the union WORD only states how many bits carry signal. A 24-valid-bits-in-32-bit-container stream previously mis-resolved to `pcm_s24le` (wrong interleave stride); it now resolves to `pcm_s32le` with the precision surfaced separately via `wav:fmt.valid_bits_per_sample` / `WavDemuxer::valid_bits_per_sample`
+
 ### Other
+
+- WAV demuxer validates the EXTENSIBLE `Samples` union per the staged struct doc: `wValidBitsPerSample > wBitsPerSample` (a precision claim exceeding the container) and a container size that is zero or not a multiple of 8 are both rejected as malformed; a zero union WORD (writer left it unset) stays tolerated with the container size as the effective precision
 
 - `smpl` (Sampler) + `inst` (Instrument) chunks **read+write symmetric** (RIFF MCI §3) — promoted from read-only metadata-key surfaces to typed `wav::SmplChunk` / `wav::SampleLoop` / `wav::InstChunk` public types with byte-lossless `parse`/`to_bytes` (the `smpl` loop array + vendor `sampler_data` tail round-trip verbatim; `num_sample_loops` re-derived from the actual loop count on write). `WavMuxOptions::with_smpl` / `with_inst` write the chunks ahead of `data` (RIFF §2 word-aligned), and the typed views are reachable via `WavDemuxer::smpl()` / `inst()`. The existing `wav:smpl.*` / `wav:inst.*` read keys are unchanged (the parsers now delegate to the typed structs)
 - typed `WavDemuxer::disp()` / `info()` accessors — the `DISP` and `LIST INFO` typed views are now captured during the chunk walk and reachable on the concrete demuxer (matching the typed-view pattern of every other chunk), `None` when absent. `info()` carries every sub-ID verbatim (incl. unknown/vendor) for re-emission via `with_info`
