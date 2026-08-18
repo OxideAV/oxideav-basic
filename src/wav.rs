@@ -5211,63 +5211,28 @@ impl Demuxer for WavDemuxer {
 // --- Muxer -----------------------------------------------------------------
 
 fn open_muxer(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Box<dyn Muxer>> {
-    if streams.len() != 1 {
-        return Err(Error::unsupported("WAV supports exactly one audio stream"));
-    }
-    let s = &streams[0];
-    if s.params.media_type != MediaType::Audio {
-        return Err(Error::invalid("WAV stream must be audio"));
-    }
-    let channels = s
-        .params
-        .channels
-        .ok_or_else(|| Error::invalid("WAV muxer: missing channels"))?;
-    let sample_rate = s
-        .params
-        .sample_rate
-        .ok_or_else(|| Error::invalid("WAV muxer: missing sample rate"))?;
     // Codec-id directs which `wFormatTag` flavour and on-wire shape the
     // muxer writes. A-law / μ-law take the dedicated tag-6/7 paths;
     // every other id falls back to the PCM/IEEE-FLOAT sample-format
-    // lookup. Extensible muxing is opt-in via [`WavMuxOptions`] (see
-    // [`open_muxer_with`] below) — the default path writes the
-    // legacy 16-byte `WAVEFORMAT` for maximum compatibility.
-    let shape = wire_shape_for_params(&s.params)?;
-    Ok(Box::new(WavMuxer {
-        output,
-        channels,
-        sample_rate,
-        shape,
-        extensible: None,
-        acid: None,
-        chna: None,
-        sxml: None,
-        bext: None,
-        disp: None,
-        id3: None,
-        info: None,
-        smpl: None,
-        inst: None,
-        cue: None,
-        plst: None,
-        adtl: None,
-        rf64: Rf64Mode::Never,
-        riff_size_offset: 0,
-        data_size_offset: 0,
-        fact_size_offset: None,
-        ds64_body_offset: None,
-        magic_is_64bit: false,
-        data_bytes: 0,
-        header_written: false,
-        trailer_written: false,
-    }))
+    // lookup. The `fmt ` chunk flavour follows the staged encoder
+    // guidance automatically (see [`WavMuxer::write_header`]); the
+    // opt-in / opt-out knobs live on [`WavMuxOptions`].
+    open_muxer_with(output, streams, WavMuxOptions::default())
 }
 
-/// Optional muxer configuration: write a `WAVE_FORMAT_EXTENSIBLE`
-/// (`wFormatTag = 0xFFFE`) header with the supplied `dwChannelMask`,
-/// `wValidBitsPerSample`, and SubFormat GUID. See
-/// `docs/container/riff/waveformatextensible/README.md` §"Channel-mask"
-/// for the standard layouts.
+/// Optional muxer configuration.
+///
+/// The `fmt ` chunk flavour follows the staged encoder guidance
+/// automatically (`docs/container/riff/waveformatextensible/README.md`
+/// §"What's covered"): more than two channels or a container size
+/// above 16 bits promote the header to `WAVE_FORMAT_EXTENSIBLE`
+/// (`wFormatTag = 0xFFFE`, 40-byte `fmt `), with `dwChannelMask`
+/// derived from the stream's typed
+/// [`ChannelLayout`](oxideav_core::ChannelLayout); everything else
+/// keeps the classic 16-byte `WAVEFORMAT`, byte-identical to the
+/// historical output. [`Self::with_extensible`] forces the EXTENSIBLE
+/// form with an explicit mask, [`Self::with_legacy_waveformatex`]
+/// suppresses the automatic promotion.
 ///
 /// When `valid_bits_per_sample` is `None` the muxer reuses the
 /// container `wBitsPerSample` (computed from the codec's
@@ -5277,6 +5242,10 @@ fn open_muxer(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Box<
 #[derive(Clone, Debug, Default)]
 pub struct WavMuxOptions {
     extensible: Option<ExtensibleOpts>,
+    /// Suppress the automatic `WAVE_FORMAT_EXTENSIBLE` promotion (see
+    /// [`Self::with_legacy_waveformatex`]). Has no effect when
+    /// [`Self::with_extensible`] explicitly opted in.
+    legacy_fmt: bool,
     acid: Option<AcidChunk>,
     chna: Option<ChnaChunk>,
     sxml: Option<SxmlChunk>,
@@ -5362,6 +5331,21 @@ impl WavMuxOptions {
         if let Some(opts) = self.extensible.as_mut() {
             opts.subformat = Some(guid);
         }
+        self
+    }
+
+    /// Suppress the automatic `WAVE_FORMAT_EXTENSIBLE` promotion and
+    /// keep the classic 16-byte `WAVEFORMAT` `fmt ` chunk even for
+    /// streams the staged encoder guidance says should prefer the
+    /// EXTENSIBLE form (more than two channels, or a container size
+    /// above 16 bits — see
+    /// `docs/container/riff/waveformatextensible/README.md`
+    /// §"What's covered"). Useful when re-muxing a stream that was
+    /// legacy-tagged on input and the caller wants a byte-conservative
+    /// round trip. Has no effect when [`Self::with_extensible`]
+    /// explicitly opted in — the explicit opt-in wins.
+    pub fn with_legacy_waveformatex(mut self) -> Self {
+        self.legacy_fmt = true;
         self
     }
 
@@ -5537,8 +5521,10 @@ pub fn open_muxer_with(
         output,
         channels,
         sample_rate,
+        channel_layout: s.params.channel_layout,
         shape,
         extensible: opts.extensible,
+        legacy_fmt: opts.legacy_fmt,
         acid: opts.acid,
         chna: opts.chna,
         sxml: opts.sxml,
@@ -5635,8 +5621,16 @@ struct WavMuxer {
     output: Box<dyn WriteSeek>,
     channels: u16,
     sample_rate: u32,
+    /// Caller-declared typed channel layout from
+    /// `CodecParameters::channel_layout` — drives the derived
+    /// `dwChannelMask` when the automatic EXTENSIBLE promotion fires
+    /// without an explicit mask.
+    channel_layout: Option<ChannelLayout>,
     shape: WireShape,
     extensible: Option<ExtensibleOpts>,
+    /// Suppress the automatic EXTENSIBLE promotion (explicit
+    /// [`WavMuxOptions::with_extensible`] still wins).
+    legacy_fmt: bool,
     /// Caller-supplied Acidizer metadata, emitted as a 24-byte `acid`
     /// chunk between the format chunks and `data` when present.
     acid: Option<AcidChunk>,
@@ -5721,10 +5715,37 @@ impl Muxer for WavMuxer {
         let block_align = (bits_per_sample / 8) * self.channels;
         let byte_rate = self.sample_rate * block_align as u32;
 
-        // On-wire wFormatTag: caller's extensible opt-in overrides the
-        // per-codec default (the underlying shape still drives
+        // `fmt ` chunk flavour. Explicit `with_extensible` always wins;
+        // otherwise the staged encoder guidance decides
+        // (docs/container/riff/waveformatextensible/README.md
+        // §"What's covered": "for ≥ 3 channels OR > 16-bit …, prefer
+        // WAVEFORMATEXTENSIBLE over the legacy WAVEFORMATEX") unless
+        // the caller opted out via `with_legacy_waveformatex`. The
+        // automatic promotion derives `dwChannelMask` from the
+        // stream's typed `ChannelLayout` when declared, else from the
+        // channel-count default (`ChannelLayout::from_count`); a
+        // `DiscreteN` layout yields mask `0` ("no assigned speaker
+        // positions"), which is legal. Classic ≤ 2-channel / ≤ 16-bit
+        // output is byte-identical to the historical muxer.
+        let extensible: Option<ExtensibleOpts> = match &self.extensible {
+            Some(opts) => Some(opts.clone()),
+            None if !self.legacy_fmt && (self.channels > 2 || bits_per_sample > 16) => {
+                let layout = self
+                    .channel_layout
+                    .unwrap_or_else(|| ChannelLayout::from_count(self.channels));
+                Some(ExtensibleOpts {
+                    channel_mask: channel_mask_for_layout(layout),
+                    valid_bits_per_sample: None,
+                    subformat: None,
+                })
+            }
+            None => None,
+        };
+
+        // On-wire wFormatTag: the EXTENSIBLE escape hatch when the
+        // extension is written (the underlying shape still drives
         // wBitsPerSample / block_align / byte_rate).
-        let format_tag = if self.extensible.is_some() {
+        let format_tag = if extensible.is_some() {
             FMT_EXTENSIBLE
         } else {
             self.shape.format_tag()
@@ -5768,7 +5789,7 @@ impl Muxer for WavMuxer {
 
         // fmt chunk: 16 bytes for plain WAVEFORMAT, 40 bytes for
         // WAVEFORMATEXTENSIBLE (16 + 2 cbSize + 22 ext).
-        let fmt_size: u32 = if self.extensible.is_some() { 40 } else { 16 };
+        let fmt_size: u32 = if extensible.is_some() { 40 } else { 16 };
         self.output.write_all(b"fmt ")?;
         self.output.write_all(&fmt_size.to_le_bytes())?;
         self.output.write_all(&format_tag.to_le_bytes())?;
@@ -5778,7 +5799,7 @@ impl Muxer for WavMuxer {
         self.output.write_all(&block_align.to_le_bytes())?;
         self.output.write_all(&bits_per_sample.to_le_bytes())?;
 
-        if let Some(opts) = &self.extensible {
+        if let Some(opts) = &extensible {
             // cbSize (22) + 22-byte extension. Layout per
             // docs/container/riff/waveformatextensible/README.md
             // §"Structure layout".
@@ -7048,6 +7069,161 @@ mod tests {
             resolver.seen.lock().unwrap().is_empty(),
             "native tag must not reach the resolver"
         );
+    }
+
+    /// Slice the on-wire `fmt ` body out of a muxed file (assumes the
+    /// canonical head `RIFF+size+WAVE+"fmt "+size` layout the muxer
+    /// writes when no `ds64`/`JUNK` placeholder precedes it).
+    fn fmt_body(buf: &[u8]) -> &[u8] {
+        assert_eq!(&buf[12..16], b"fmt ");
+        let size = u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]) as usize;
+        &buf[20..20 + size]
+    }
+
+    /// Container sizes above 16 bits auto-promote to EXTENSIBLE per
+    /// the staged encoder guidance — a default-options 24-bit stereo
+    /// mux writes the 40-byte `fmt ` with the PCM SubFormat, the
+    /// stereo mask derived from the typed layout default, and
+    /// `wValidBitsPerSample = 24`; the demuxer round-trips it all.
+    #[test]
+    fn auto_extensible_for_deep_samples() {
+        let payload = vec![0u8; 6 * 50]; // 50 stereo s24 frames
+        let stream = make_stream(SampleFormat::S24, 2, 48_000);
+        let buf = mux_to_bytes(&stream, &payload, WavMuxOptions::default(), "auto-ext-s24");
+
+        let body = fmt_body(&buf);
+        assert_eq!(body.len(), 40, "24-bit output must be EXTENSIBLE");
+        assert_eq!(u16::from_le_bytes([body[0], body[1]]), FMT_EXTENSIBLE);
+        assert_eq!(u16::from_le_bytes([body[16], body[17]]), 22); // cbSize
+        assert_eq!(u16::from_le_bytes([body[18], body[19]]), 24); // valid bits
+        assert_eq!(
+            u32::from_le_bytes([body[20], body[21], body[22], body[23]]),
+            0x3, // Stereo (from_count default)
+        );
+        assert_eq!(&body[24..40], &GUID_PCM);
+
+        let dmx = open_demux_from_bytes(buf);
+        let s = &dmx.streams()[0];
+        assert_eq!(s.params.codec_id.as_str(), "pcm_s24le");
+        assert_eq!(s.params.channel_layout, Some(ChannelLayout::Stereo));
+        assert_eq!(wave_format_tag(&s.params), Some(FMT_EXTENSIBLE));
+    }
+
+    /// More than two channels auto-promote to EXTENSIBLE. Without a
+    /// caller-declared layout the mask follows the channel-count
+    /// default (6ch → `Surround51` → `0x60F`, the staged "5.1
+    /// (DVD-style side)" row); a declared typed layout wins (4ch
+    /// `Quad` → `0x603`, the core side-pair quad).
+    #[test]
+    fn auto_extensible_for_multichannel() {
+        let payload = vec![0u8; 12 * 20]; // 20 6ch s16 frames
+        let stream = make_stream(SampleFormat::S16, 6, 48_000);
+        let buf = mux_to_bytes(&stream, &payload, WavMuxOptions::default(), "auto-ext-6ch");
+        let body = fmt_body(&buf);
+        assert_eq!(body.len(), 40);
+        assert_eq!(
+            u32::from_le_bytes([body[20], body[21], body[22], body[23]]),
+            0x60F,
+        );
+        let dmx = open_demux_from_bytes(buf);
+        assert_eq!(
+            dmx.streams()[0].params.channel_layout,
+            Some(ChannelLayout::Surround51)
+        );
+
+        let payload = vec![0u8; 8 * 20]; // 20 4ch s16 frames
+        let mut stream = make_stream(SampleFormat::S16, 4, 48_000);
+        stream.params.channel_layout = Some(ChannelLayout::Quad);
+        let buf = mux_to_bytes(&stream, &payload, WavMuxOptions::default(), "auto-ext-quad");
+        let body = fmt_body(&buf);
+        assert_eq!(
+            u32::from_le_bytes([body[20], body[21], body[22], body[23]]),
+            0x603,
+        );
+        let dmx = open_demux_from_bytes(buf);
+        assert_eq!(
+            dmx.streams()[0].params.channel_layout,
+            Some(ChannelLayout::Quad)
+        );
+    }
+
+    /// The classic 16-byte `fmt ` is preserved for everything the
+    /// guidance leaves alone: ≤ 2 channels at ≤ 16-bit containers,
+    /// including the 8-bit G.711 tags.
+    #[test]
+    fn classic_fmt_preserved_below_promotion_thresholds() {
+        let stream = make_stream(SampleFormat::S16, 2, 44_100);
+        let buf = mux_to_bytes(&stream, &[0u8; 4], WavMuxOptions::default(), "classic-s16");
+        let body = fmt_body(&buf);
+        assert_eq!(body.len(), 16);
+        assert_eq!(u16::from_le_bytes([body[0], body[1]]), FMT_PCM);
+
+        let stream = make_g711_stream("pcm_alaw", 2, 8_000);
+        let buf = mux_to_bytes(&stream, &[0u8; 4], WavMuxOptions::default(), "classic-alaw");
+        let body = fmt_body(&buf);
+        assert_eq!(body.len(), 16);
+        assert_eq!(u16::from_le_bytes([body[0], body[1]]), FMT_ALAW);
+    }
+
+    /// `with_legacy_waveformatex` suppresses the automatic promotion —
+    /// a 24-bit stereo stream keeps the classic 16-byte `fmt ` (which
+    /// CAN describe it, just ambiguously) and still demuxes to
+    /// `pcm_s24le` through the legacy tag route. An explicit
+    /// `with_extensible` wins over the opt-out.
+    #[test]
+    fn legacy_waveformatex_opt_out() {
+        let payload = vec![0u8; 6 * 10];
+        let stream = make_stream(SampleFormat::S24, 2, 48_000);
+        let opts = WavMuxOptions::default().with_legacy_waveformatex();
+        let buf = mux_to_bytes(&stream, &payload, opts, "legacy-optout-s24");
+        let body = fmt_body(&buf);
+        assert_eq!(body.len(), 16);
+        assert_eq!(u16::from_le_bytes([body[0], body[1]]), FMT_PCM);
+        assert_eq!(u16::from_le_bytes([body[14], body[15]]), 24);
+        let dmx = open_demux_from_bytes(buf);
+        assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "pcm_s24le");
+
+        let opts = WavMuxOptions::default()
+            .with_legacy_waveformatex()
+            .with_extensible(0x3);
+        let buf = mux_to_bytes(&stream, &payload, opts, "legacy-vs-explicit");
+        assert_eq!(fmt_body(&buf).len(), 40, "explicit with_extensible wins");
+    }
+
+    /// An explicit `with_extensible` mask overrides the layout-derived
+    /// automatic mask.
+    #[test]
+    fn explicit_mask_overrides_auto_mask() {
+        let payload = vec![0u8; 12 * 4];
+        let stream = make_stream(SampleFormat::S16, 6, 48_000);
+        let opts = WavMuxOptions::default().with_extensible(0x3F);
+        let buf = mux_to_bytes(&stream, &payload, opts, "explicit-mask-wins");
+        let body = fmt_body(&buf);
+        assert_eq!(
+            u32::from_le_bytes([body[20], body[21], body[22], body[23]]),
+            0x3F,
+        );
+    }
+
+    /// A channel count with no named default layout (`DiscreteN`)
+    /// auto-promotes with mask `0` — "no assigned speaker positions"
+    /// is the honest bitmap for an unknown layout, and the demuxer
+    /// maps it back to an unset typed layout.
+    #[test]
+    fn auto_extensible_discrete_channels_mask_zero() {
+        let payload = vec![0u8; 22 * 4]; // 4 11ch s16 frames
+        let stream = make_stream(SampleFormat::S16, 11, 48_000);
+        let buf = mux_to_bytes(&stream, &payload, WavMuxOptions::default(), "auto-ext-11ch");
+        let body = fmt_body(&buf);
+        assert_eq!(body.len(), 40);
+        assert_eq!(
+            u32::from_le_bytes([body[20], body[21], body[22], body[23]]),
+            0
+        );
+        let dmx = open_demux_from_bytes(buf);
+        let s = &dmx.streams()[0];
+        assert_eq!(s.params.channel_layout, None);
+        assert_eq!(s.params.channels, Some(11));
     }
 
     /// `WAVE_FORMAT_EXTENSIBLE` with cbSize < 22 must reject — the spec
