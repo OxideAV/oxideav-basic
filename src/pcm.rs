@@ -72,9 +72,12 @@ pub fn register(reg: &mut CodecRegistry) {
         ),
     ] {
         let _ = bits;
+        // The encoder writes its one interleaved layout; pipelines
+        // convert other layouts (planar, other widths) in front of it.
         let caps = CodecCapabilities::audio(format!("{id}_sw"))
             .with_lossless(true)
-            .with_intra_only(true);
+            .with_intra_only(true)
+            .with_sample_formats(sample_format_for(&CodecId::new(id)).into_iter().collect());
         let mut info = CodecInfo::new(CodecId::new(id))
             .capabilities(caps)
             .decoder(make_decoder)
@@ -88,7 +91,8 @@ pub fn register(reg: &mut CodecRegistry) {
     for id in SLIN_ALIASES {
         let caps = CodecCapabilities::audio(format!("{id}_sw"))
             .with_lossless(true)
-            .with_intra_only(true);
+            .with_intra_only(true)
+            .with_sample_formats(vec![SampleFormat::S16]);
         // Same factories as pcm_s16le — `sample_format_for` maps all the
         // slin aliases to SampleFormat::S16 below. No WAVEFORMATEX claim.
         reg.register(
@@ -357,4 +361,23 @@ pub fn params(format: SampleFormat, channels: u16, sample_rate: u32) -> Result<C
 /// Default time base for a PCM audio stream: 1 / sample_rate.
 pub fn time_base_for(sample_rate: u32) -> TimeBase {
     TimeBase::new(1, sample_rate as i64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encoders_declare_their_interleaved_layout() {
+        let mut reg = CodecRegistry::new();
+        register(&mut reg);
+        for (id, fmt) in [
+            ("pcm_s16le", SampleFormat::S16),
+            ("pcm_f32le", SampleFormat::F32),
+            ("pcm_u8", SampleFormat::U8),
+        ] {
+            let imp = &reg.implementations(&CodecId::new(id))[0];
+            assert_eq!(imp.caps.accepted_sample_formats, vec![fmt], "{id}");
+        }
+    }
 }
