@@ -3,6 +3,7 @@
 
 pub mod filter;
 pub mod pcm;
+pub mod rawvideo;
 pub mod slin;
 pub mod wav;
 pub mod y4m;
@@ -14,6 +15,7 @@ use oxideav_core::RuntimeContext;
 /// Register every codec provided by `oxideav-basic` in a [`CodecRegistry`].
 pub fn register_codecs(reg: &mut CodecRegistry) {
     pcm::register(reg);
+    rawvideo::register(reg);
 }
 
 /// Register every container provided by `oxideav-basic` in a [`ContainerRegistry`].
