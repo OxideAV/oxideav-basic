@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.12](https://github.com/OxideAV/oxideav-basic/compare/v0.0.11...v0.0.12) - 2026-10-23
+
+### Other
+
+- hardware-engine crates load OS APIs through dlsym, not libloading
+- edition 2024, MSRV 1.95
+
 ### Changed
 
 - edition 2024, MSRV 1.95.
