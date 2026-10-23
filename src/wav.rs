@@ -3765,11 +3765,7 @@ impl DispChunk {
         let text = String::from_utf8_lossy(&self.data[..end])
             .trim()
             .to_string();
-        if text.is_empty() {
-            None
-        } else {
-            Some(text)
-        }
+        if text.is_empty() { None } else { Some(text) }
     }
 
     /// Parse a `DISP` chunk body. Returns `None` when the body is
@@ -4814,7 +4810,7 @@ fn parse_fmt(buf: &[u8]) -> Result<WaveFmt> {
         // unset); a precision that CLAIMS more bits than the container
         // carries, or a non-byte-aligned container, is malformed.
         if union_is_precision(&g) {
-            if bits_per_sample == 0 || bits_per_sample % 8 != 0 {
+            if bits_per_sample == 0 || !bits_per_sample.is_multiple_of(8) {
                 return Err(Error::invalid(format!(
                     "WAVE_FORMAT_EXTENSIBLE wBitsPerSample (container size) must be \
                      a non-zero multiple of 8, got {bits_per_sample}"
@@ -4930,17 +4926,17 @@ fn resolve_codec(fmt: &WaveFmt, raw_fmt: &[u8], codecs: &dyn CodecResolver) -> R
     // ALAW 0x0006 / MULAW 0x0007) to every tag-derived GUID. The
     // recursion guard (`tag != FMT_EXTENSIBLE`) rejects the degenerate
     // GUID whose embedded tag is 0xFFFE itself.
-    if let Some(tag) = waveformatex_tag(&sub) {
-        if tag != FMT_EXTENSIBLE {
-            if let Some(id) = codec_for_tag(tag, depth)? {
-                return Ok(id);
-            }
-            // Template GUID whose embedded tag this crate doesn't map
-            // directly — same registry route as the legacy path, since
-            // the GUID is documented as equivalent to the tag.
-            if let Some(id) = resolve_tag_via_registry(fmt, raw_fmt, tag, codecs) {
-                return Ok(id);
-            }
+    if let Some(tag) = waveformatex_tag(&sub)
+        && tag != FMT_EXTENSIBLE
+    {
+        if let Some(id) = codec_for_tag(tag, depth)? {
+            return Ok(id);
+        }
+        // Template GUID whose embedded tag this crate doesn't map
+        // directly — same registry route as the legacy path, since
+        // the GUID is documented as equivalent to the tag.
+        if let Some(id) = resolve_tag_via_registry(fmt, raw_fmt, tag, codecs) {
+            return Ok(id);
         }
     }
     // Not a (mappable) WAVEFORMATEX-template GUID — synthesise a
@@ -7517,7 +7513,7 @@ mod tests {
         buf.extend_from_slice(&16_000u32.to_le_bytes()); // byte_rate
         buf.extend_from_slice(&2u16.to_le_bytes()); // block_align
         buf.extend_from_slice(&16u16.to_le_bytes()); // bits_per_sample
-                                                     // bext chunk.
+        // bext chunk.
         buf.extend_from_slice(b"bext");
         buf.extend_from_slice(&(bext_body.len() as u32).to_le_bytes());
         buf.extend_from_slice(bext_body);
@@ -8147,10 +8143,11 @@ mod tests {
         adtl.extend_from_slice(&[0u8; 6]);
         let bytes = wav_with_cue_and_adtl(&cue_body, Some(&adtl));
         let dmx = open_demux_from_bytes(bytes);
-        assert!(dmx
-            .metadata()
-            .iter()
-            .all(|(k, _)| !k.starts_with("wav:adtl.file.")));
+        assert!(
+            dmx.metadata()
+                .iter()
+                .all(|(k, _)| !k.starts_with("wav:adtl.file."))
+        );
         assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
     }
 
@@ -8643,10 +8640,11 @@ mod tests {
     fn acid_truncated_is_skipped() {
         let bytes = wav_with_acid(&[0u8; 23]);
         let dmx = open_demux_from_bytes(bytes);
-        assert!(!dmx
-            .metadata()
-            .iter()
-            .any(|(k, _)| k.starts_with("wav:acid")));
+        assert!(
+            !dmx.metadata()
+                .iter()
+                .any(|(k, _)| k.starts_with("wav:acid"))
+        );
         assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
     }
 
@@ -8888,10 +8886,11 @@ mod tests {
     fn chna_truncated_is_skipped() {
         let bytes = wav_with_chna(&[0u8; 3]);
         let dmx = open_demux_from_bytes(bytes);
-        assert!(!dmx
-            .metadata()
-            .iter()
-            .any(|(k, _)| k.starts_with("wav:chna")));
+        assert!(
+            !dmx.metadata()
+                .iter()
+                .any(|(k, _)| k.starts_with("wav:chna"))
+        );
         assert_eq!(dmx.streams()[0].params.codec_id, CodecId::new("pcm_s16le"));
     }
 
@@ -9280,9 +9279,10 @@ mod tests {
         let md: std::collections::HashMap<String, String> =
             dmx.metadata().iter().cloned().collect();
         assert_eq!(md.get("wav:plst.count"), Some(&"0".to_string()));
-        assert!(md
-            .keys()
-            .all(|k| !k.starts_with("wav:plst.") || k == "wav:plst.count"));
+        assert!(
+            md.keys()
+                .all(|k| !k.starts_with("wav:plst.") || k == "wav:plst.count")
+        );
     }
 
     /// An odd-length `plst` body forces a pad byte; the `data` chunk
@@ -12003,9 +12003,10 @@ mod tests {
         assert_eq!(md.get("title"), Some(&"Title".to_string()));
         assert_eq!(md.get("artist"), Some(&"Artist".to_string()));
         // No synthetic key created for the unknown FOURCC.
-        assert!(md
-            .keys()
-            .all(|k| !k.contains("IZZZ") && !k.contains("izzz")));
+        assert!(
+            md.keys()
+                .all(|k| !k.contains("IZZZ") && !k.contains("izzz"))
+        );
     }
 
     // -------- RF64 / BW64 (EBU Tech 3306 / ITU-R BS.2088) ---------------
@@ -12871,7 +12872,7 @@ mod tests {
         buf.extend_from_slice(&16_000u32.to_le_bytes()); // byte_rate
         buf.extend_from_slice(&2u16.to_le_bytes()); // block_align
         buf.extend_from_slice(&16u16.to_le_bytes()); // bits
-                                                     // Lying chunk: header claims `declared` bytes, body is shorter.
+        // Lying chunk: header claims `declared` bytes, body is shorter.
         buf.extend_from_slice(id);
         buf.extend_from_slice(&declared.to_le_bytes());
         buf.extend_from_slice(body);
@@ -13044,7 +13045,7 @@ mod tests {
         // In-range odd size: seeks forward past the (word-aligned) body.
         skip_chunk_body(&mut cur, 3).expect("in-range skip must succeed");
         assert_eq!(cur.position(), 4); // 3 body + 1 pad
-                                       // A size beyond i64::MAX is malformed, not a backward seek.
+        // A size beyond i64::MAX is malformed, not a backward seek.
         let mut cur2 = std::io::Cursor::new(vec![0u8; 16]);
         let err = match skip_chunk_body(&mut cur2, (i64::MAX as u64) + 1) {
             Ok(()) => panic!("out-of-range size must be rejected"),

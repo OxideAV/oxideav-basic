@@ -27,7 +27,7 @@ use oxideav_core::{
     StreamInfo, TimeBase,
 };
 use oxideav_core::{
-    ContainerRegistry, Demuxer, Muxer, ProbeData, ReadSeek, WriteSeek, PROBE_SCORE_EXTENSION,
+    ContainerRegistry, Demuxer, Muxer, PROBE_SCORE_EXTENSION, ProbeData, ReadSeek, WriteSeek,
 };
 use std::io::{Read, Seek, SeekFrom, Write};
 

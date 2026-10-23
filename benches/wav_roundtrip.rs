@@ -18,7 +18,7 @@ use std::io::Cursor;
 use std::time::Instant;
 
 use oxideav_basic::pcm;
-use oxideav_basic::wav::{open_muxer_with, open_wav_demuxer, WavMuxOptions};
+use oxideav_basic::wav::{WavMuxOptions, open_muxer_with, open_wav_demuxer};
 use oxideav_core::{Demuxer, Error, Packet, SampleFormat, StreamInfo, TimeBase, WriteSeek};
 
 fn build_stream() -> StreamInfo {

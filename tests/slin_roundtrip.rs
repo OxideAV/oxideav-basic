@@ -14,7 +14,7 @@ use oxideav_basic::{register_containers, slin};
 use oxideav_core::{
     CodecId, CodecParameters, MediaType, Packet, SampleFormat, StreamInfo, TimeBase,
 };
-use oxideav_core::{ContainerRegistry, ProbeData, WriteSeek, PROBE_SCORE_EXTENSION};
+use oxideav_core::{ContainerRegistry, PROBE_SCORE_EXTENSION, ProbeData, WriteSeek};
 
 /// Build a 1-channel S16LE stream description for the muxer.
 fn mono_s16_stream(sample_rate: u32) -> StreamInfo {
