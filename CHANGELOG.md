@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.12](https://github.com/OxideAV/oxideav-basic/compare/v0.0.11...v0.0.12) - 2026-11-07
+
+### Other
+
+- reject non-ASCII headers before slicing tokens; hostile-input sweep
+- every linear-PCM wire layout, output_params, StreamParams on encoders
+- hardware-engine crates load OS APIs through dlsym, not libloading
+- edition 2024, MSRV 1.95
+
 ### Added
 
 - PCM decoders + encoders for `pcm_s16be`, `pcm_s24be`, `pcm_s32be`,
