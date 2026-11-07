@@ -229,10 +229,15 @@ fn open_muxer(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Box<
     if s.params.media_type != MediaType::Audio {
         return Err(Error::invalid("slin stream must be audio"));
     }
+    if super::pcm::layout_for(&s.params.codec_id).is_some_and(|l| !l.is_native()) {
+        return Err(Error::unsupported(
+            "slin muxer requires S16LE samples (pcm_s16le or slin* codec id)",
+        ));
+    }
     let fmt = s
         .params
         .sample_format
-        .or_else(|| super::pcm::sample_format_for(&s.params.codec_id))
+        .or_else(|| super::pcm::native_sample_format_for(&s.params.codec_id))
         .ok_or_else(|| Error::invalid("slin muxer: unknown sample format"))?;
     if fmt != SampleFormat::S16 {
         return Err(Error::unsupported(

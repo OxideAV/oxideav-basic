@@ -158,3 +158,19 @@ fn registry_probe_input_picks_slin_on_extension() {
     let name = reg.probe_input(&mut cur, Some("sln16")).expect("probe");
     assert_eq!(name, "slin");
 }
+
+/// A big-endian 16-bit stream decodes to S16 (its `sample_format`), but
+/// its packets are big-endian: the headerless little-endian container
+/// must refuse it rather than write swapped samples.
+#[test]
+fn muxer_refuses_big_endian_pcm() {
+    let mut reg = ContainerRegistry::new();
+    register_containers(&mut reg);
+    let mut stream = mono_s16_stream(8_000);
+    stream.params.codec_id = CodecId::new("pcm_s16be");
+    let ws: Box<dyn WriteSeek> = Box::new(Cursor::new(Vec::<u8>::new()));
+    assert!(
+        reg.open_muxer("slin", ws, std::slice::from_ref(&stream))
+            .is_err()
+    );
+}

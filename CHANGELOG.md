@@ -7,9 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- PCM decoders + encoders for `pcm_s16be`, `pcm_s24be`, `pcm_s32be`,
+  `pcm_f32be`, `pcm_f64be` and the offset-binary `pcm_u16le/be`,
+  `pcm_u24le/be`, `pcm_u32le/be` (decoded to the core
+  two's-complement little-endian formats), bit-exact against black-box
+  `ffmpeg -f <fmt>` conversions.
+- `pcm::PcmLayout`, `pcm::layout_for`, `pcm::native_sample_format_for`,
+  `pcm::codec_ids`.
+- PCM and `rawvideo` decoders implement `output_params()` (generation
+  stays `0`; they never emit `Frame::StreamParams`).
+- PCM encoders follow a `Frame::StreamParams` change of sample rate /
+  channels / layout; `rawvideo` follows width / height / pixel format /
+  frame rate. Anything they cannot follow is `Error::Unsupported`
+  (was `InvalidData`) and leaves the encoder unchanged.
+
 ### Changed
 
 - edition 2024, MSRV 1.95.
+- `pcm::sample_format_for` answers the decoded sample format for every
+  supported id (e.g. `S16` for `pcm_s16be`).
+
+### Fixed
+
+- WAV and `.sln` muxers refuse big-endian / wide offset-binary PCM ids
+  instead of writing their bytes as little-endian samples.
+- PCM and `rawvideo` decoders' `reset()` leaves the end-of-stream state
+  (a seek after `flush()` answered `Eof` instead of `NeedMore`).
+- PCM factories reject zero channels / a zero sample rate; encoder
+  frame-size arithmetic and the `rawvideo` stride check no longer
+  overflow on hostile sizes.
 
 ## [0.0.11](https://github.com/OxideAV/oxideav-basic/compare/v0.0.10...v0.0.11) - 2026-10-04
 

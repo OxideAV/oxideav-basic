@@ -15,6 +15,21 @@
 //!
 //! Palette formats (`Pal8`) are rejected: the palette is out-of-band
 //! side data a raw payload has no room for.
+//!
+//! # Stream parameters and mid-stream changes
+//!
+//! A raw packet has no header, so the decoder's
+//! [`Decoder::output_params`] is the stream's geometry (width, height,
+//! pixel format, frame rate) from construction on and its generation
+//! stays `0` — it never emits a [`Frame::StreamParams`] event.
+//!
+//! The encoder follows a [`Frame::StreamParams`] event that changes the
+//! width, height, pixel format or frame rate: each packet is one
+//! self-contained picture, so later packets carry the new geometry and
+//! [`Encoder::output_params`] describes it from then on. An event for
+//! a non-video stream, or for a geometry the codec cannot carry (empty
+//! picture, palette format), is rejected with [`Error::Unsupported`]
+//! and leaves the encoder unchanged.
 
 use std::collections::VecDeque;
 
@@ -93,22 +108,29 @@ impl Layout {
 
 /// Build a `rawvideo` decoder for `params`.
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
+    let layout = Layout::from_params(params, "decoder")?;
     Ok(Box::new(RawVideoDecoder {
-        id: CodecId::new(CODEC_ID),
-        layout: Layout::from_params(params, "decoder")?,
+        output: output_params_for(params),
+        layout,
         pending: VecDeque::new(),
         eof: false,
     }))
 }
 
-/// Build a `rawvideo` encoder for `params`.
-pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
-    let layout = Layout::from_params(params, "encoder")?;
+/// The `rawvideo` stream description of `params`' picture geometry.
+fn output_params_for(params: &CodecParameters) -> CodecParameters {
     let mut output = CodecParameters::video(CodecId::new(CODEC_ID));
     output.width = params.width;
     output.height = params.height;
     output.pixel_format = params.pixel_format;
     output.frame_rate = params.frame_rate;
+    output
+}
+
+/// Build a `rawvideo` encoder for `params`.
+pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
+    let layout = Layout::from_params(params, "encoder")?;
+    let output = output_params_for(params);
     Ok(Box::new(RawVideoEncoder {
         layout,
         output,
@@ -117,7 +139,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
 }
 
 struct RawVideoDecoder {
-    id: CodecId,
+    output: CodecParameters,
     layout: Layout,
     pending: VecDeque<Packet>,
     eof: bool,
@@ -125,7 +147,7 @@ struct RawVideoDecoder {
 
 impl Decoder for RawVideoDecoder {
     fn codec_id(&self) -> &CodecId {
-        &self.id
+        &self.output.codec_id
     }
 
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
@@ -168,12 +190,49 @@ impl Decoder for RawVideoDecoder {
         self.eof = true;
         Ok(())
     }
+
+    fn reset(&mut self) -> Result<()> {
+        // A seek resumes decoding: drop queued pictures and leave the
+        // end-of-stream state, so an empty poll answers NeedMore.
+        self.pending.clear();
+        self.eof = false;
+        Ok(())
+    }
+
+    fn output_pixel_format(&self) -> Option<PixelFormat> {
+        self.output.pixel_format
+    }
+
+    fn output_params(&self) -> Option<CodecParameters> {
+        Some(self.output.clone())
+    }
 }
 
 struct RawVideoEncoder {
     layout: Layout,
     output: CodecParameters,
     queue: VecDeque<Packet>,
+}
+
+impl RawVideoEncoder {
+    /// Follow a mid-stream geometry change (see the module docs).
+    fn reconfigure(&mut self, p: &CodecParameters) -> Result<()> {
+        if p.media_type != oxideav_core::MediaType::Video {
+            return Err(Error::unsupported(
+                "rawvideo encoder: stream-params event for a non-video stream",
+            ));
+        }
+        let mut next = self.output.clone();
+        next.width = p.width.or(next.width);
+        next.height = p.height.or(next.height);
+        next.pixel_format = p.pixel_format.or(next.pixel_format);
+        next.frame_rate = p.frame_rate.or(next.frame_rate);
+        let layout = Layout::from_params(&next, "encoder")
+            .map_err(|e| Error::unsupported(format!("rawvideo encoder cannot follow: {e}")))?;
+        self.layout = layout;
+        self.output = next;
+        Ok(())
+    }
 }
 
 impl Encoder for RawVideoEncoder {
@@ -186,8 +245,10 @@ impl Encoder for RawVideoEncoder {
     }
 
     fn send_frame(&mut self, frame: &Frame) -> Result<()> {
-        let Frame::Video(v) = frame else {
-            return Err(Error::invalid("rawvideo encoder requires video frames"));
+        let v = match frame {
+            Frame::Video(v) => v,
+            Frame::StreamParams(p) => return self.reconfigure(p),
+            _ => return Err(Error::invalid("rawvideo encoder requires video frames")),
         };
         let image = v.image_planes();
         if image.len() != self.layout.planes.len() {
@@ -199,7 +260,11 @@ impl Encoder for RawVideoEncoder {
         }
         let mut data = Vec::with_capacity(self.layout.frame_bytes);
         for (plane, &(row, rows)) in image.iter().zip(&self.layout.planes) {
-            if plane.stride < row || plane.data.len() < plane.stride * (rows - 1) + row {
+            let needed = plane
+                .stride
+                .checked_mul(rows - 1)
+                .and_then(|n| n.checked_add(row));
+            if plane.stride < row || needed.is_none_or(|n| plane.data.len() < n) {
                 return Err(Error::invalid(
                     "rawvideo encoder: plane smaller than the picture geometry",
                 ));
@@ -295,6 +360,66 @@ mod tests {
             panic!()
         };
         assert_eq!(v.planes[0].data, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn decoder_states_geometry_and_resets_out_of_eof() {
+        let mut d = make_decoder(&params(PixelFormat::Rgb24, 2, 1)).unwrap();
+        let out = d.output_params().unwrap();
+        assert_eq!((out.width, out.height), (Some(2), Some(1)));
+        assert_eq!(out.pixel_format, Some(PixelFormat::Rgb24));
+        assert_eq!(d.output_pixel_format(), Some(PixelFormat::Rgb24));
+        assert_eq!(d.output_params_generation(), 0);
+        d.flush().unwrap();
+        assert!(matches!(d.receive_frame(), Err(Error::Eof)));
+        d.reset().unwrap();
+        assert!(matches!(d.receive_frame(), Err(Error::NeedMore)));
+    }
+
+    #[test]
+    fn encoder_follows_geometry_change() {
+        let mut e = make_encoder(&params(PixelFormat::Gray8, 2, 2)).unwrap();
+        let ev = params(PixelFormat::Rgb24, 1, 1);
+        e.send_frame(&Frame::StreamParams(Box::new(ev))).unwrap();
+        assert_eq!(e.output_params().pixel_format, Some(PixelFormat::Rgb24));
+        assert_eq!(e.output_params().width, Some(1));
+        let frame = VideoFrame {
+            pts: Some(0),
+            planes: vec![VideoPlane {
+                stride: 3,
+                data: vec![7, 8, 9],
+            }],
+        };
+        e.send_frame(&Frame::Video(frame)).unwrap();
+        assert_eq!(e.receive_packet().unwrap().data, vec![7, 8, 9]);
+    }
+
+    #[test]
+    fn encoder_refuses_unfollowable_events_unchanged() {
+        let mut e = make_encoder(&params(PixelFormat::Gray8, 2, 2)).unwrap();
+        for ev in [
+            params(PixelFormat::Pal8, 2, 2),
+            params(PixelFormat::Gray8, 0, 2),
+            CodecParameters::audio(CodecId::new("pcm_s16le")),
+        ] {
+            let r = e.send_frame(&Frame::StreamParams(Box::new(ev)));
+            assert!(matches!(r, Err(Error::Unsupported(_))), "{r:?}");
+        }
+        assert_eq!(e.output_params().pixel_format, Some(PixelFormat::Gray8));
+        assert_eq!(e.output_params().width, Some(2));
+    }
+
+    #[test]
+    fn encoder_rejects_overflowing_stride() {
+        let mut e = make_encoder(&params(PixelFormat::Gray8, 2, 3)).unwrap();
+        let frame = VideoFrame {
+            pts: None,
+            planes: vec![VideoPlane {
+                stride: usize::MAX,
+                data: vec![0; 6],
+            }],
+        };
+        assert!(e.send_frame(&Frame::Video(frame)).is_err());
     }
 
     #[test]

@@ -5683,9 +5683,25 @@ fn wire_shape_for_params(p: &CodecParameters) -> Result<WireShape> {
         "pcm_mulaw" => return Ok(WireShape::Mulaw),
         _ => {}
     }
+    // WAVE data is little-endian two's-complement (offset binary at
+    // 8 bits): a PCM id whose wire layout differs (pcm_s16be, pcm_u24le,
+    // ...) must be re-encoded to its native counterpart first — its
+    // `sample_format` describes the decoded samples, not the packets.
+    if let Some(layout) = super::pcm::layout_for(&p.codec_id)
+        && !layout.is_native()
+    {
+        return Err(Error::unsupported(format!(
+            "WAV stores little-endian PCM; encode {} as {} first",
+            p.codec_id,
+            layout
+                .decoded_sample_format()
+                .and_then(super::pcm::codec_id_for)
+                .map_or_else(|| "a native PCM id".to_string(), |c| c.to_string())
+        )));
+    }
     let fmt = p
         .sample_format
-        .or_else(|| super::pcm::sample_format_for(&p.codec_id))
+        .or_else(|| super::pcm::native_sample_format_for(&p.codec_id))
         .ok_or_else(|| Error::unsupported(format!("WAV: unknown PCM codec {}", p.codec_id)))?;
     Ok(match fmt {
         SampleFormat::U8 => WireShape::IntPcm { bits: 8 },
@@ -6232,6 +6248,22 @@ mod tests {
             start_time: Some(0),
             params,
         }
+    }
+
+    #[test]
+    fn muxer_refuses_non_little_endian_pcm_ids() {
+        // A big-endian / offset-binary-wide id carries the decoded core
+        // format as its `sample_format`; its packets are not WAVE data.
+        for id in ["pcm_s16be", "pcm_s24be", "pcm_u16le", "pcm_f32be"] {
+            let mut s = make_stream(SampleFormat::S16, 2, 48_000);
+            s.params.codec_id = CodecId::new(id);
+            let out: Box<dyn WriteSeek> = Box::new(std::io::Cursor::new(Vec::new()));
+            let r = open_muxer(out, std::slice::from_ref(&s));
+            assert!(matches!(r, Err(Error::Unsupported(_))), "{id}");
+        }
+        let s = make_stream(SampleFormat::S24, 2, 48_000);
+        let out: Box<dyn WriteSeek> = Box::new(std::io::Cursor::new(Vec::new()));
+        assert!(open_muxer(out, std::slice::from_ref(&s)).is_ok());
     }
 
     fn wave_format_tag(p: &CodecParameters) -> Option<u16> {

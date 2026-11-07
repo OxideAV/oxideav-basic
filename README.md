@@ -8,8 +8,24 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework â€
 
 ## What's included
 
-- **PCM codecs**: `pcm_u8`, `pcm_s16le`, `pcm_s24le`, `pcm_s32le`, `pcm_f32le`,
-  `pcm_f64le`.
+- **PCM codecs** (decoder + encoder each): `pcm_u8`, `pcm_s8`,
+  `pcm_{s,u}{16,24,32}{le,be}` and `pcm_f{32,64}{le,be}` â€” every
+  linear-PCM layout the WAV / AIFF / QuickTime (`twos`, `sowt`, `in24`,
+  `in32`, `fl32`, `fl64`, `lpcm` flags) / Matroska / MPEG LPCM
+  demuxers hand out, plus the Asterisk `slin*` aliases. Decoders emit
+  the core little-endian two's-complement format (`S16` / `S24` /
+  `S32` / `F32` / `F64`, `U8` / `S8` at 8 bits) and state it through
+  `output_params()` (generation fixed at `0`: raw PCM has no header to
+  change shape from); encoders take that format and write the wire
+  layout. Bit-exact both ways against black-box `ffmpeg -f <fmt>`
+  conversions (vendored fixtures in `tests/fixtures/pcm/`).
+  `pcm::layout_for` / `pcm::native_sample_format_for` tell a
+  container whether an id's packets already are core samples.
+  Encoders follow a `Frame::StreamParams` change of sample rate /
+  channel count / layout; a sample-format change, a non-audio event or
+  a zero shape is `Error::Unsupported`. 64-bit integer PCM is not
+  registered (no core 64-bit integer sample format); G.711 lives in
+  `oxideav-g711`.
 - **WAV** container: RIFF/WAVE (plus EBU Tech 3306 / ITU-R BS.2088
   `RF64` and `BW64` 64-bit-extended forms) demuxer + muxer with
   `fmt`, `data`, and
