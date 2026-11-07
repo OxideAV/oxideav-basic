@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.13](https://github.com/OxideAV/oxideav-basic/compare/v0.0.12...v0.0.13) - 2026-11-07
+
+### Other
+
+- API hygiene: #[non_exhaustive] on WAV chunk records and growable enums
+
 ### Added
 
 - `Default` on the WAV chunk records `CuePoint`, `PlaylistSegment`,
