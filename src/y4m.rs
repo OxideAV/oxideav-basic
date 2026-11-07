@@ -210,8 +210,13 @@ fn parse_header(line: &[u8]) -> Result<Y4mHeader> {
     // Per the spec the header is plain ASCII; surface a clear error
     // rather than letting String::from_utf8 panic on the rare bogus
     // file that contains arbitrary bytes after the magic.
-    let body = std::str::from_utf8(&line[MAGIC.len()..])
-        .map_err(|_| Error::invalid("y4m: non-ASCII header"))?;
+    let body = &line[MAGIC.len()..];
+    // ASCII, not merely UTF-8: the tag/value split below slices each
+    // token after its first byte, which must be a whole character.
+    if !body.is_ascii() {
+        return Err(Error::invalid("y4m: non-ASCII header"));
+    }
+    let body = std::str::from_utf8(body).map_err(|_| Error::invalid("y4m: non-ASCII header"))?;
 
     let mut width: Option<u32> = None;
     let mut height: Option<u32> = None;
@@ -602,6 +607,14 @@ mod tests {
             hdr.x_params[0],
             ("XYSCSS".to_string(), "420JPEG".to_string())
         );
+    }
+
+    #[test]
+    fn parse_header_rejects_multibyte_token_start() {
+        // A token opening with a two-byte UTF-8 character used to be
+        // sliced inside that character.
+        let line = b"YUV4MPEG2 \xde\xbd H4 W6 F30:1";
+        assert!(matches!(parse_header(line), Err(Error::InvalidData(_))));
     }
 
     #[test]

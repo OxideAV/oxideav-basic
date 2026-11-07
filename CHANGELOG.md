@@ -38,6 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - PCM factories reject zero channels / a zero sample rate; encoder
   frame-size arithmetic and the `rawvideo` stride check no longer
   overflow on hostile sizes.
+- Y4M header parsing no longer panics on a token that starts with a
+  multi-byte UTF-8 character (headers must be ASCII); a mutation sweep
+  over WAV / RF64 (every parsed metadata chunk) / `.sln` / Y4M into the
+  decoders now guards against panics.
 
 ## [0.0.11](https://github.com/OxideAV/oxideav-basic/compare/v0.0.10...v0.0.11) - 2026-10-04
 
