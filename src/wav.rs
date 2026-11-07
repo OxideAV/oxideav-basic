@@ -1690,7 +1690,8 @@ fn parse_plst_chunk(buf: &[u8], out: &mut Vec<(String, String)>) {
 /// `sample_offset` carries the sample position of the cue point
 /// relative to the start of the `data` chunk (RIFF MCI §3 "Examples of
 /// File Position Values", row "Within PCM data").
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct CuePoint {
     /// `dwName` — unique identifier; `plst`/`adtl` records reference a
     /// cue point by this value.
@@ -1710,6 +1711,44 @@ pub struct CuePoint {
     /// `dwSampleOffset` — sample offset of the cue point relative to
     /// the start of the block.
     pub sample_offset: u32,
+}
+
+impl CuePoint {
+    /// Set `name`.
+    pub fn with_name(mut self, v: u32) -> Self {
+        self.name = v;
+        self
+    }
+
+    /// Set `position`.
+    pub fn with_position(mut self, v: u32) -> Self {
+        self.position = v;
+        self
+    }
+
+    /// Set `fcc_chunk`.
+    pub fn with_fcc_chunk(mut self, v: [u8; 4]) -> Self {
+        self.fcc_chunk = v;
+        self
+    }
+
+    /// Set `chunk_start`.
+    pub fn with_chunk_start(mut self, v: u32) -> Self {
+        self.chunk_start = v;
+        self
+    }
+
+    /// Set `block_start`.
+    pub fn with_block_start(mut self, v: u32) -> Self {
+        self.block_start = v;
+        self
+    }
+
+    /// Set `sample_offset`.
+    pub fn with_sample_offset(mut self, v: u32) -> Self {
+        self.sample_offset = v;
+        self
+    }
 }
 
 impl CuePoint {
@@ -1769,9 +1808,18 @@ impl CuePoint {
 /// (RIFF MCI §3 "Cue-Points Chunk"). The body is `4 + N*24` bytes,
 /// always even, so the muxer never needs a word-alignment pad byte.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CueChunk {
     /// The cue-point table, in file order.
     pub points: Vec<CuePoint>,
+}
+
+impl CueChunk {
+    /// Set `points`.
+    pub fn with_points(mut self, v: Vec<CuePoint>) -> Self {
+        self.points = v;
+        self
+    }
 }
 
 impl CueChunk {
@@ -1832,7 +1880,8 @@ impl CueChunk {
 ///     DWORD dwLoops;  // play count
 /// }
 /// ```
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct PlaylistSegment {
     /// `dwName` — the cue-point id this segment plays from; must match
     /// a [`CuePoint::name`] in the file's `cue ` table.
@@ -1841,6 +1890,17 @@ pub struct PlaylistSegment {
     pub length: u32,
     /// `dwLoops` — number of times to play the section.
     pub loops: u32,
+}
+
+impl PlaylistSegment {
+    /// Build a [`PlaylistSegment`] from its fields.
+    pub fn new(cue_id: u32, length: u32, loops: u32) -> Self {
+        Self {
+            cue_id,
+            length,
+            loops,
+        }
+    }
 }
 
 impl PlaylistSegment {
@@ -1879,9 +1939,18 @@ impl PlaylistSegment {
 /// records (RIFF MCI §3 "Playlist Chunk"). The body is `4 + N*12`
 /// bytes, always even.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PlaylistChunk {
     /// The play-segment table, in file order.
     pub segments: Vec<PlaylistSegment>,
+}
+
+impl PlaylistChunk {
+    /// Set `segments`.
+    pub fn with_segments(mut self, v: Vec<PlaylistSegment>) -> Self {
+        self.segments = v;
+        self
+    }
 }
 
 impl PlaylistChunk {
@@ -1942,6 +2011,7 @@ impl PlaylistChunk {
 ///   `dwSampleLength`-sample segment, qualified by the CSET-style
 ///   country / language / dialect / code-page fields.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AdtlEntry {
     /// `labl` — a label/title for a cue point.
     Label {
@@ -2083,9 +2153,18 @@ impl AdtlEntry {
 /// the metadata path but is not represented as a typed [`AdtlEntry`]
 /// variant (its payload is opaque to this layer).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AdtlChunk {
     /// The associated-data entries, in file order.
     pub entries: Vec<AdtlEntry>,
+}
+
+impl AdtlChunk {
+    /// Set `entries`.
+    pub fn with_entries(mut self, v: Vec<AdtlEntry>) -> Self {
+        self.entries = v;
+        self
+    }
 }
 
 impl AdtlChunk {
@@ -2293,6 +2372,7 @@ fn parse_inst_chunk(buf: &[u8], out: &mut Vec<(String, String)>) -> Option<InstC
 /// metadata; `fine_tune` (cents) and `gain` (dB) are signed 8-bit, the
 /// note / velocity fields are unsigned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct InstChunk {
     /// MIDI note the unmodified sample plays at (0..=127).
     pub unshifted_note: u8,
@@ -2308,6 +2388,50 @@ pub struct InstChunk {
     pub low_velocity: u8,
     /// Highest MIDI velocity this sample maps to (1..=127).
     pub high_velocity: u8,
+}
+
+impl InstChunk {
+    /// Set `unshifted_note`.
+    pub fn with_unshifted_note(mut self, v: u8) -> Self {
+        self.unshifted_note = v;
+        self
+    }
+
+    /// Set `fine_tune`.
+    pub fn with_fine_tune(mut self, v: i8) -> Self {
+        self.fine_tune = v;
+        self
+    }
+
+    /// Set `gain`.
+    pub fn with_gain(mut self, v: i8) -> Self {
+        self.gain = v;
+        self
+    }
+
+    /// Set `low_note`.
+    pub fn with_low_note(mut self, v: u8) -> Self {
+        self.low_note = v;
+        self
+    }
+
+    /// Set `high_note`.
+    pub fn with_high_note(mut self, v: u8) -> Self {
+        self.high_note = v;
+        self
+    }
+
+    /// Set `low_velocity`.
+    pub fn with_low_velocity(mut self, v: u8) -> Self {
+        self.low_velocity = v;
+        self
+    }
+
+    /// Set `high_velocity`.
+    pub fn with_high_velocity(mut self, v: u8) -> Self {
+        self.high_velocity = v;
+        self
+    }
 }
 
 impl InstChunk {
@@ -2348,6 +2472,7 @@ impl InstChunk {
 /// A single `smpl` (Sampler) chunk loop record (24-byte fixed layout
 /// per RIFF MCI §3 "Sample Loops"). All fields are little-endian u32.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct SampleLoop {
     /// The cue-point id this loop is anchored to.
     pub cue_point_id: u32,
@@ -2361,6 +2486,44 @@ pub struct SampleLoop {
     pub fraction: u32,
     /// Loop play count (0 = infinite).
     pub play_count: u32,
+}
+
+impl SampleLoop {
+    /// Set `cue_point_id`.
+    pub fn with_cue_point_id(mut self, v: u32) -> Self {
+        self.cue_point_id = v;
+        self
+    }
+
+    /// Set `loop_type`.
+    pub fn with_loop_type(mut self, v: u32) -> Self {
+        self.loop_type = v;
+        self
+    }
+
+    /// Set `start`.
+    pub fn with_start(mut self, v: u32) -> Self {
+        self.start = v;
+        self
+    }
+
+    /// Set `end`.
+    pub fn with_end(mut self, v: u32) -> Self {
+        self.end = v;
+        self
+    }
+
+    /// Set `fraction`.
+    pub fn with_fraction(mut self, v: u32) -> Self {
+        self.fraction = v;
+        self
+    }
+
+    /// Set `play_count`.
+    pub fn with_play_count(mut self, v: u32) -> Self {
+        self.play_count = v;
+        self
+    }
 }
 
 impl SampleLoop {
@@ -2385,6 +2548,7 @@ impl SampleLoop {
 /// optional vendor `sampler_data` tail. All multi-byte integers are
 /// little-endian.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct SmplChunk {
     /// MIDI Manufacturer's Association id (0 = unspecified).
     pub manufacturer: u32,
@@ -2408,6 +2572,68 @@ pub struct SmplChunk {
     /// `sampler_data_len` but the on-wire bytes win for lossless
     /// round-trip).
     pub sampler_data: Vec<u8>,
+}
+
+impl SmplChunk {
+    /// Set `manufacturer`.
+    pub fn with_manufacturer(mut self, v: u32) -> Self {
+        self.manufacturer = v;
+        self
+    }
+
+    /// Set `product`.
+    pub fn with_product(mut self, v: u32) -> Self {
+        self.product = v;
+        self
+    }
+
+    /// Set `sample_period`.
+    pub fn with_sample_period(mut self, v: u32) -> Self {
+        self.sample_period = v;
+        self
+    }
+
+    /// Set `midi_unity_note`.
+    pub fn with_midi_unity_note(mut self, v: u32) -> Self {
+        self.midi_unity_note = v;
+        self
+    }
+
+    /// Set `midi_pitch_fraction`.
+    pub fn with_midi_pitch_fraction(mut self, v: u32) -> Self {
+        self.midi_pitch_fraction = v;
+        self
+    }
+
+    /// Set `smpte_format`.
+    pub fn with_smpte_format(mut self, v: u32) -> Self {
+        self.smpte_format = v;
+        self
+    }
+
+    /// Set `smpte_offset`.
+    pub fn with_smpte_offset(mut self, v: u32) -> Self {
+        self.smpte_offset = v;
+        self
+    }
+
+    /// Set `sampler_data_len`.
+    pub fn with_sampler_data_len(mut self, v: u32) -> Self {
+        self.sampler_data_len = v;
+        self
+    }
+
+    /// Set `loops`.
+    pub fn with_loops(mut self, v: Vec<SampleLoop>) -> Self {
+        self.loops = v;
+        self
+    }
+
+    /// Set `sampler_data`.
+    pub fn with_sampler_data(mut self, v: Vec<u8>) -> Self {
+        self.sampler_data = v;
+        self
+    }
 }
 
 impl SmplChunk {
@@ -2522,7 +2748,8 @@ pub const ACID_FLAG_HIGH_OCTAVE: u32 = 1 << 4;
 /// 20, interpreted as an IEEE-754 little-endian beats-per-minute
 /// value (the only 32-bit reading under which musically plausible
 /// tempos are representable with fractional precision).
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+#[non_exhaustive]
 pub struct AcidChunk {
     /// Bit-field at offset 0 — see the `ACID_FLAG_*` constants.
     pub flags: u32,
@@ -2539,6 +2766,44 @@ pub struct AcidChunk {
     pub meter: u32,
     /// Tempo in beats per minute (offset 20).
     pub tempo: f32,
+}
+
+impl AcidChunk {
+    /// Set `flags`.
+    pub fn with_flags(mut self, v: u32) -> Self {
+        self.flags = v;
+        self
+    }
+
+    /// Set `root_note`.
+    pub fn with_root_note(mut self, v: u16) -> Self {
+        self.root_note = v;
+        self
+    }
+
+    /// Set `reserved`.
+    pub fn with_reserved(mut self, v: [u8; 6]) -> Self {
+        self.reserved = v;
+        self
+    }
+
+    /// Set `num_beats`.
+    pub fn with_num_beats(mut self, v: u32) -> Self {
+        self.num_beats = v;
+        self
+    }
+
+    /// Set `meter`.
+    pub fn with_meter(mut self, v: u32) -> Self {
+        self.meter = v;
+        self
+    }
+
+    /// Set `tempo`.
+    pub fn with_tempo(mut self, v: f32) -> Self {
+        self.tempo = v;
+        self
+    }
 }
 
 impl AcidChunk {
@@ -2692,7 +2957,8 @@ fn parse_acid_chunk(buf: &[u8], out: &mut Vec<(String, String)>) -> Option<AcidC
 ///
 /// The character-array fields are fixed-width, **not** NUL-terminated
 /// ASCII (§1.1); unused records (`track_index == 0`) zero every field.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct AudioId {
     /// `trackIndex` (off 0) — 1-based index of the track in the `data`
     /// chunk interleave. `0` marks an unused (spare) record.
@@ -2712,6 +2978,38 @@ pub struct AudioId {
     pub pad: u8,
 }
 
+impl AudioId {
+    /// Set `track_index`.
+    pub fn with_track_index(mut self, v: u16) -> Self {
+        self.track_index = v;
+        self
+    }
+
+    /// Set `uid`.
+    pub fn with_uid(mut self, v: [u8; 12]) -> Self {
+        self.uid = v;
+        self
+    }
+
+    /// Set `track_ref`.
+    pub fn with_track_ref(mut self, v: [u8; 14]) -> Self {
+        self.track_ref = v;
+        self
+    }
+
+    /// Set `pack_ref`.
+    pub fn with_pack_ref(mut self, v: [u8; 11]) -> Self {
+        self.pack_ref = v;
+        self
+    }
+
+    /// Set `pad`.
+    pub fn with_pad(mut self, v: u8) -> Self {
+        self.pad = v;
+        self
+    }
+}
+
 /// Which ADM identifier an `audioID` reference field names, derived from
 /// the fixed ASCII prefix the BS.2088-2 §8.2 ID formats use:
 ///
@@ -2725,6 +3023,7 @@ pub struct AudioId {
 /// four documented prefixes (e.g. an all-NUL spare field, or a malformed
 /// writer's output).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AdmRefKind {
     /// `ATU_` — an `audioTrackUID`.
     TrackUid,
@@ -2928,7 +3227,8 @@ fn audio_id_text(field: &[u8]) -> Option<String> {
 /// later in-place editing (§1.3); the spare records have
 /// `track_index == 0` and are carried verbatim so a read→write pass is
 /// byte-lossless.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct ChnaChunk {
     /// `numTracks` (off 0) — number of tracks used in the file. A track
     /// carrying multiple ID sets still counts as one (§1.1).
@@ -2941,6 +3241,26 @@ pub struct ChnaChunk {
     /// Includes any spare (`track_index == 0`) records so the chunk
     /// round-trips byte-for-byte.
     pub ids: Vec<AudioId>,
+}
+
+impl ChnaChunk {
+    /// Set `num_tracks`.
+    pub fn with_num_tracks(mut self, v: u16) -> Self {
+        self.num_tracks = v;
+        self
+    }
+
+    /// Set `num_uids`.
+    pub fn with_num_uids(mut self, v: u16) -> Self {
+        self.num_uids = v;
+        self
+    }
+
+    /// Set `ids`.
+    pub fn with_ids(mut self, v: Vec<AudioId>) -> Self {
+        self.ids = v;
+        self
+    }
 }
 
 impl ChnaChunk {
@@ -3097,7 +3417,8 @@ fn parse_chna_chunk(buf: &[u8], out: &mut Vec<(String, String)>) -> Option<ChnaC
 /// associated with the SubXMLChunk". The `xml_data` bytes are carried
 /// verbatim; whether they are gzip-compressed is governed by the parent
 /// chunk's `fmt_type` (§7.2), not interpreted here.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct SubXmlChunk {
     /// `nSamplesSubDataChunk` — audio samples per channel this record
     /// applies to (a run contiguous with the adjacent SubXMLChunks).
@@ -3106,6 +3427,16 @@ pub struct SubXmlChunk {
     /// carried verbatim. Its length equals the on-wire
     /// `subXMLChunkSize`.
     pub xml_data: Vec<u8>,
+}
+
+impl SubXmlChunk {
+    /// Build a [`SubXmlChunk`] from its fields.
+    pub fn new(n_samples: u32, xml_data: Vec<u8>) -> Self {
+        Self {
+            n_samples,
+            xml_data,
+        }
+    }
 }
 
 impl SubXmlChunk {
@@ -3148,7 +3479,8 @@ impl SubXmlChunk {
 /// timestamp is "expressed in audio samples per channel from the
 /// beginning of the `<data>` chunk". Both are 64-bit, stored as a pair
 /// of little-endian DWORDs (`0xHHHHLLLL`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct AlignmentPoint {
     /// `subXMLChunkByteOffset` — 64-bit byte offset of a SubXMLChunk
     /// from the start of the `<sxml>` data section.
@@ -3156,6 +3488,16 @@ pub struct AlignmentPoint {
     /// `nSamplesAlignPoint` — 64-bit timestamp in audio samples per
     /// channel from the start of the `<data>` chunk.
     pub n_samples: u64,
+}
+
+impl AlignmentPoint {
+    /// Build a [`AlignmentPoint`] from its fields.
+    pub fn new(byte_offset: u64, n_samples: u64) -> Self {
+        Self {
+            byte_offset,
+            n_samples,
+        }
+    }
 }
 
 impl AlignmentPoint {
@@ -3222,7 +3564,8 @@ impl AlignmentPoint {
 /// padded/over-provisioned value; [`Self::computed_sub_table_byte_size`]
 /// returns the size implied by the parsed records for writers that want
 /// the canonical value.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct SxmlChunk {
     /// `fmtType` — compression of the `SubXMLChunk` payloads
     /// (`0x0000` = uncompressed, `0x0001` = gzip per RFC 1952, §7.2).
@@ -3236,6 +3579,32 @@ pub struct SxmlChunk {
     /// The optional `AlignmentPoint table[]` records
     /// (`nAlignmentPoints` entries; may be empty, §7.1).
     pub alignment_points: Vec<AlignmentPoint>,
+}
+
+impl SxmlChunk {
+    /// Set `fmt_type`.
+    pub fn with_fmt_type(mut self, v: u16) -> Self {
+        self.fmt_type = v;
+        self
+    }
+
+    /// Set `sub_table_byte_size`.
+    pub fn with_sub_table_byte_size(mut self, v: u64) -> Self {
+        self.sub_table_byte_size = v;
+        self
+    }
+
+    /// Set `sub_chunks`.
+    pub fn with_sub_chunks(mut self, v: Vec<SubXmlChunk>) -> Self {
+        self.sub_chunks = v;
+        self
+    }
+
+    /// Set `alignment_points`.
+    pub fn with_alignment_points(mut self, v: Vec<AlignmentPoint>) -> Self {
+        self.alignment_points = v;
+        self
+    }
 }
 
 impl SxmlChunk {
@@ -3728,12 +4097,20 @@ pub const CF_TEXT: u32 = 1;
 /// pass is byte-lossless regardless of clipboard format; the
 /// convenience [`Self::text`] constructor builds the common `CF_TEXT`
 /// form (a NUL-terminated title) and [`Self::title`] decodes it back.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct DispChunk {
     /// Windows clipboard-format type (`CF_TEXT == 1`, `CF_DIB == 8`, …).
     pub cf_type: u32,
     /// Payload bytes in the clipboard format named by [`Self::cf_type`].
     pub data: Vec<u8>,
+}
+
+impl DispChunk {
+    /// Build a [`DispChunk`] from its fields.
+    pub fn new(cf_type: u32, data: Vec<u8>) -> Self {
+        Self { cf_type, data }
+    }
 }
 
 impl DispChunk {
@@ -4383,12 +4760,20 @@ fn info_id_to_key(id: &[u8; 4]) -> Option<&'static str> {
 /// the raw FOURCC (rather than the snake_case key) makes the writer
 /// fully general — any documented or vendor sub-ID round-trips, not just
 /// the ones [`info_id_to_key`] maps to a friendly key.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct InfoEntry {
     /// The 4-byte INFO sub-ID FOURCC (`*b"INAM"`, `*b"IART"`, …).
     pub id: [u8; 4],
     /// The text value (stored NUL-terminated + word-aligned on the wire).
     pub value: String,
+}
+
+impl InfoEntry {
+    /// Build a [`InfoEntry`] from its fields.
+    pub fn new(id: [u8; 4], value: String) -> Self {
+        Self { id, value }
+    }
 }
 
 /// Typed view of a `LIST INFO` chunk (RIFF MCI §3 "INFO List Chunk") —
@@ -4498,6 +4883,7 @@ const BEXT_FIXED_LEN: usize = 602;
 /// ([`Self::to_bytes`]) each is re-emitted into its fixed-width slot,
 /// truncated to fit and NUL-padded to the field width per §2.3.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct BextChunk {
     /// `Description[256]` — free ASCII description of the sequence.
     pub description: String,
@@ -4530,6 +4916,92 @@ pub struct BextChunk {
     /// `CodingHistory` — variable-length ASCII tail (CR/LF-separated
     /// `A=…,F=…,…` lines per §2.3 / EBU R98). Empty when absent.
     pub coding_history: String,
+}
+
+impl BextChunk {
+    /// Set `description`.
+    pub fn with_description(mut self, v: String) -> Self {
+        self.description = v;
+        self
+    }
+
+    /// Set `originator`.
+    pub fn with_originator(mut self, v: String) -> Self {
+        self.originator = v;
+        self
+    }
+
+    /// Set `originator_reference`.
+    pub fn with_originator_reference(mut self, v: String) -> Self {
+        self.originator_reference = v;
+        self
+    }
+
+    /// Set `origination_date`.
+    pub fn with_origination_date(mut self, v: String) -> Self {
+        self.origination_date = v;
+        self
+    }
+
+    /// Set `origination_time`.
+    pub fn with_origination_time(mut self, v: String) -> Self {
+        self.origination_time = v;
+        self
+    }
+
+    /// Set `time_reference`.
+    pub fn with_time_reference(mut self, v: u64) -> Self {
+        self.time_reference = v;
+        self
+    }
+
+    /// Set `version`.
+    pub fn with_version(mut self, v: u16) -> Self {
+        self.version = v;
+        self
+    }
+
+    /// Set `umid`.
+    pub fn with_umid(mut self, v: [u8; 64]) -> Self {
+        self.umid = v;
+        self
+    }
+
+    /// Set `loudness_value`.
+    pub fn with_loudness_value(mut self, v: i16) -> Self {
+        self.loudness_value = v;
+        self
+    }
+
+    /// Set `loudness_range`.
+    pub fn with_loudness_range(mut self, v: i16) -> Self {
+        self.loudness_range = v;
+        self
+    }
+
+    /// Set `max_true_peak_level`.
+    pub fn with_max_true_peak_level(mut self, v: i16) -> Self {
+        self.max_true_peak_level = v;
+        self
+    }
+
+    /// Set `max_momentary_loudness`.
+    pub fn with_max_momentary_loudness(mut self, v: i16) -> Self {
+        self.max_momentary_loudness = v;
+        self
+    }
+
+    /// Set `max_short_term_loudness`.
+    pub fn with_max_short_term_loudness(mut self, v: i16) -> Self {
+        self.max_short_term_loudness = v;
+        self
+    }
+
+    /// Set `coding_history`.
+    pub fn with_coding_history(mut self, v: String) -> Self {
+        self.coding_history = v;
+        self
+    }
 }
 
 impl Default for BextChunk {
@@ -5364,6 +5836,7 @@ pub struct WavMuxOptions {
 /// (`WAVE`). The top-level magic also changes from `RIFF` to `RF64`
 /// (or `BW64` when an ADM `chna` chunk is present — ITU-R BS.2088).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Rf64Mode {
     /// Plain 32-bit `RIFF`/`WAVE`. `write_trailer` errors if the
     /// payload would overflow a 32-bit size field. This is the

@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Default` on the WAV chunk records `CuePoint`, `PlaylistSegment`,
+  `AcidChunk`, `AudioId`, `ChnaChunk`, `SubXmlChunk`, `AlignmentPoint`,
+  `SxmlChunk`, `DispChunk` and `InfoEntry`; constructors
+  `PlaylistSegment::new`, `SubXmlChunk::new`, `AlignmentPoint::new`,
+  `DispChunk::new`, `InfoEntry::new`; and `with_*` setters for every
+  field of `CuePoint`, `CueChunk`, `PlaylistChunk`, `AdtlChunk`,
+  `InstChunk`, `SampleLoop`, `SmplChunk`, `AcidChunk`, `AudioId`,
+  `ChnaChunk`, `SxmlChunk` and `BextChunk`.
+
+### Changed
+
+- API hygiene: `#[non_exhaustive]` on the enums `AdtlEntry`,
+  `AdmRefKind` and `Rf64Mode`, and on the WAV chunk records `CuePoint`,
+  `CueChunk`, `PlaylistSegment`, `PlaylistChunk`, `AdtlChunk`,
+  `InstChunk`, `SampleLoop`, `SmplChunk`, `AcidChunk`, `AudioId`,
+  `ChnaChunk`, `SubXmlChunk`, `AlignmentPoint`, `SxmlChunk`,
+  `DispChunk`, `InfoEntry` and `BextChunk`. Build them through `Default`
+  / the constructors. No behaviour change.
+
 ## [0.0.12](https://github.com/OxideAV/oxideav-basic/compare/v0.0.11...v0.0.12) - 2026-11-07
 
 ### Other

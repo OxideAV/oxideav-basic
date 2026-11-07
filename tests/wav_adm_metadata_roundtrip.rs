@@ -46,13 +46,12 @@ fn padded<const N: usize>(s: &str) -> [u8; N] {
 }
 
 fn audio_id(track_index: u16, uid: &str, track_ref: &str, pack_ref: &str) -> AudioId {
-    AudioId {
-        track_index,
-        uid: padded::<12>(uid),
-        track_ref: padded::<14>(track_ref),
-        pack_ref: padded::<11>(pack_ref),
-        pad: 0,
-    }
+    AudioId::default()
+        .with_track_index(track_index)
+        .with_uid(padded::<12>(uid))
+        .with_track_ref(padded::<14>(track_ref))
+        .with_pack_ref(padded::<11>(pack_ref))
+        .with_pad(0)
 }
 
 #[test]
@@ -71,27 +70,25 @@ fn wav_with_acid_and_chna_round_trips() {
 
     // Acidizer loop metadata: a 4-beat stretched loop at 138 BPM with a
     // valid root note (flag bits: loop=0, root-set=0x02, stretch=0x04).
-    let acid = AcidChunk {
-        flags: 0x02 | 0x04,
-        root_note: 60, // middle / High C
-        reserved: [0; 6],
-        num_beats: 4,
-        meter: 4,
-        tempo: 138.0,
-    };
+    let acid = AcidChunk::default()
+        .with_flags(0x02 | 0x04)
+        .with_root_note(60) // middle / High C
+        .with_reserved([0; 6])
+        .with_num_beats(4)
+        .with_meter(4)
+        .with_tempo(138.0);
 
     // ADM channel allocation: a stereo pair where the two tracks
     // reference *common* BS.2094 channel definitions (trailing four hex
     // digits <= 0x0FFF) belonging to one *custom* pack (>= 0x1000). Track
     // refs use the `AC_` audioChannelFormat form (linear-PCM essence).
-    let chna = ChnaChunk {
-        num_tracks: 2,
-        num_uids: 2,
-        ids: vec![
+    let chna = ChnaChunk::default()
+        .with_num_tracks(2)
+        .with_num_uids(2)
+        .with_ids(vec![
             audio_id(1, "ATU_00000001", "AC_00010001_00", "AP_00011002"),
             audio_id(2, "ATU_00000002", "AC_00010002_00", "AP_00011002"),
-        ],
-    };
+        ]);
 
     // Mux through the public muxer with both chunks opted in.
     let opts = WavMuxOptions::default()
